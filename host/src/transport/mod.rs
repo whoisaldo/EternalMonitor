@@ -103,12 +103,21 @@ pub async fn start_sender(
                 // Fragment and send.
                 let total_bytes = fb_bytes.len();
                 let chunks: Vec<&[u8]> = fb_bytes.chunks(MAX_PAYLOAD_SIZE).collect();
-                let fragment_count = chunks.len().min(255) as u8;
+                if chunks.len() > u16::MAX as usize {
+                    warn!(
+                        seq,
+                        total_bytes,
+                        fragments = chunks.len(),
+                        "Dropping oversized frame that exceeds transport fragment limit"
+                    );
+                    continue;
+                }
+                let fragment_count = chunks.len() as u16;
 
                 for (i, chunk) in chunks.iter().enumerate() {
                     let header = FragmentHeader {
                         seq,
-                        fragment_index: i as u8,
+                        fragment_index: i as u16,
                         fragment_count,
                         payload_len: chunk.len() as u32,
                     };
