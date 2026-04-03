@@ -1,3 +1,7 @@
 .claude/
+.cargo/
 .cargo-home/
 .rustup-home/
+target/
+tools/downloads/
+tools/ffmpeg-7.1/

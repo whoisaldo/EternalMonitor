@@ -27,6 +27,18 @@ proto/    Shared protocol definitions (FlatBuffers)
 
 Requires Rust stable with the MSVC toolchain on Windows.
 
+The host encoder path also requires:
+- FFmpeg 7.1 shared build on Windows
+- LLVM/libclang available for `bindgen`
+
+Example setup:
+
+```powershell
+$env:FFMPEG_DIR = "C:\path\to\ffmpeg-n7.1.x-win64-gpl-shared-7.1"
+$env:LIBCLANG_PATH = "C:\Program Files\LLVM\bin"
+cargo run -p eternal-host
+```
+
 ```
 cargo run -p eternal-host
 ```
