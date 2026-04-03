@@ -1,1 +1,2 @@
-// EternalMonitor protocol definitions — placeholder for Phase 3 (FlatBuffers).
+pub mod control;
+pub mod frame;
