@@ -45,6 +45,10 @@ struct ConnectView: View {
 
                         inputSection
 
+                        if isConnecting || connectionManager.connectionError != nil || !connectionManager.diagnostics.isEmpty {
+                            diagnosticsSection
+                        }
+
                         // Connect / Cancel buttons
                         if isConnecting {
                             connectingSection
@@ -72,7 +76,9 @@ struct ConnectView: View {
                     }
                     .padding(.horizontal, 32)
                 }
+                .scrollDismissesKeyboard(.interactively)
             }
+            .ignoresSafeArea(.keyboard, edges: .bottom)
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .topBarTrailing) {
@@ -254,6 +260,47 @@ struct ConnectView: View {
         }
         .disabled(normalizedHostIP.isEmpty || parsedPort == nil)
         .opacity(normalizedHostIP.isEmpty || parsedPort == nil ? 0.5 : 1)
+    }
+
+    private var diagnosticsSection: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Text("DIAGNOSTICS")
+                .font(.custom("JetBrainsMono-Medium", size: 11))
+                .foregroundColor(.white.opacity(0.4))
+
+            let entries = Array(connectionManager.diagnostics.suffix(8).reversed())
+            ForEach(entries) { entry in
+                HStack(alignment: .top, spacing: 10) {
+                    Text(entry.level.rawValue)
+                        .font(.custom("JetBrainsMono-Medium", size: 10))
+                        .foregroundColor(color(for: entry.level))
+                        .frame(width: 40, alignment: .leading)
+
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text(entry.category.uppercased())
+                            .font(.custom("JetBrainsMono-Medium", size: 10))
+                            .foregroundColor(.white.opacity(0.35))
+
+                        Text(entry.message)
+                            .font(.custom("JetBrainsMono-Regular", size: 11))
+                            .foregroundColor(.white.opacity(0.72))
+                            .textSelection(.enabled)
+                    }
+
+                    Spacer(minLength: 0)
+                }
+                .padding(.horizontal, 14)
+                .padding(.vertical, 10)
+                .background(
+                    RoundedRectangle(cornerRadius: 12)
+                        .fill(Color.white.opacity(0.04))
+                        .overlay(
+                            RoundedRectangle(cornerRadius: 12)
+                                .strokeBorder(Color.white.opacity(0.08), lineWidth: 1)
+                        )
+                )
+            }
+        }
     }
 
     // MARK: - Connecting state (spinner + cancel)
@@ -494,6 +541,17 @@ struct ConnectView: View {
         }
         .ignoresSafeArea()
         .allowsHitTesting(false)
+    }
+
+    private func color(for level: DiagnosticLevel) -> Color {
+        switch level {
+        case .info:
+            return Color(hex: 0x1D9E75)
+        case .warning:
+            return .orange
+        case .error:
+            return .red
+        }
     }
 }
 

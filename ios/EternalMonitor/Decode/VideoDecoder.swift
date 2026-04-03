@@ -6,6 +6,7 @@ import CoreMedia
 /// Parses NAL units, extracts SPS/PPS, converts Annex B → AVCC, decodes to CVPixelBuffer.
 final class VideoDecoder {
     var onFrameDecoded: ((_ pixelBuffer: CVPixelBuffer, _ timestampUs: UInt64) -> Void)?
+    var onEvent: ((String) -> Void)?
 
     private var formatDescription: CMVideoFormatDescription?
     private var decompressionSession: VTDecompressionSession?
@@ -127,6 +128,7 @@ final class VideoDecoder {
 
         guard status == noErr, let newFormat else {
             print("[VideoDecoder] Failed to create format description: \(status)")
+            onEvent?("Failed to create H.264 format description status=\(status)")
             return
         }
 
@@ -136,6 +138,7 @@ final class VideoDecoder {
         }
 
         formatDescription = newFormat
+        onEvent?("Updated format description SPS=\(sps.count)B PPS=\(pps.count)B")
         createDecompressionSession()
     }
 
@@ -180,17 +183,22 @@ final class VideoDecoder {
 
         guard status == noErr, let session else {
             print("[VideoDecoder] Failed to create decompression session: \(status)")
+            onEvent?("Failed to create VideoToolbox session status=\(status)")
             return
         }
 
         VTSessionSetProperty(session, key: kVTDecompressionPropertyKey_RealTime, value: kCFBooleanTrue)
         decompressionSession = session
+        onEvent?("VideoToolbox session ready")
     }
 
     // MARK: - Decode a slice NAL unit
 
     private func decodeSlice(_ nalData: Data, timestampUs: UInt64) {
-        guard let session = decompressionSession, let formatDescription else { return }
+        guard let session = decompressionSession, let formatDescription else {
+            onEvent?("Dropped slice bytes=\(nalData.count) timestampUs=\(timestampUs) because decoder is not ready")
+            return
+        }
 
         // Convert Annex B NAL to AVCC: prepend 4-byte big-endian length
         var nalLength = UInt32(nalData.count).bigEndian
@@ -223,7 +231,10 @@ final class VideoDecoder {
             }
         }
 
-        guard let blockBuffer else { return }
+        guard let blockBuffer else {
+            onEvent?("Failed to allocate block buffer for slice bytes=\(nalData.count)")
+            return
+        }
 
         // Create CMSampleBuffer
         var sampleBuffer: CMSampleBuffer?
@@ -240,19 +251,25 @@ final class VideoDecoder {
             sampleBufferOut: &sampleBuffer
         )
 
-        guard let sampleBuffer else { return }
+        guard let sampleBuffer else {
+            onEvent?("Failed to create sample buffer for slice bytes=\(nalData.count)")
+            return
+        }
 
         // Pass timestampUs through frameReferenceContext so the callback can retrieve it
         let frameRef = UnsafeMutableRawPointer(bitPattern: UInt(truncatingIfNeeded: timestampUs))
 
         var infoFlags = VTDecodeInfoFlags()
-        VTDecompressionSessionDecodeFrame(
+        let status = VTDecompressionSessionDecodeFrame(
             session,
             sampleBuffer: sampleBuffer,
             flags: [._EnableAsynchronousDecompression],
             frameRefcon: frameRef,
             infoFlagsOut: &infoFlags
         )
+        if status != noErr {
+            onEvent?("VTDecodeFrame failed status=\(status) bytes=\(nalData.count)")
+        }
     }
 }
 
@@ -267,11 +284,14 @@ private func decompressionCallback(
     presentationTimeStamp: CMTime,
     presentationDuration: CMTime
 ) {
-    guard status == noErr,
-          let refCon = decompressionOutputRefCon,
-          let pixelBuffer = imageBuffer else { return }
+    guard let refCon = decompressionOutputRefCon else { return }
 
     let decoder = Unmanaged<VideoDecoder>.fromOpaque(refCon).takeUnretainedValue()
+    guard status == noErr, let pixelBuffer = imageBuffer else {
+        decoder.onEvent?("Decoder callback status=\(status) imageBufferMissing=\(imageBuffer == nil)")
+        return
+    }
+
     let timestampUs = UInt64(UInt(bitPattern: sourceFrameRefCon))
     decoder.onFrameDecoded?(pixelBuffer, timestampUs)
 }

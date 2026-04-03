@@ -8,6 +8,11 @@ final class UDPReceiver {
     var assembler: FrameAssembler?
     var onConnectionEstablished: (() -> Void)?
     var onError: ((String) -> Void)?
+    var onListenerReady: ((UInt16) -> Void)?
+    var onHelloAttempt: ((Int, Int, String, UInt16) -> Void)?
+    var onHelloFailure: ((String) -> Void)?
+    var onDatagramReceived: ((Int) -> Void)?
+    var onDatagramIgnored: ((String) -> Void)?
 
     private var listener: NWListener?
     private var activeConnection: NWConnection?
@@ -48,6 +53,7 @@ final class UDPReceiver {
             case .ready:
                 let actualPort = self.listener?.port?.rawValue ?? self.port
                 print("[UDPReceiver] Listening on port \(actualPort)")
+                self.onListenerReady?(actualPort)
                 // Send HELLO to the host so it knows our address
                 self.sendHello(to: host)
             case .failed(let error):
@@ -107,12 +113,15 @@ final class UDPReceiver {
             guard let self else { return }
             if case .ready = state {
                 // Send HELLO a few times to be safe
-                for i in 0..<3 {
+                let attempts = 3
+                for i in 0..<attempts {
                     let delay = DispatchTime.now() + .milliseconds(i * 200)
                     self.queue.asyncAfter(deadline: delay) {
+                        self.onHelloAttempt?(i + 1, attempts, host, self.port)
                         conn.send(content: payload, completion: .contentProcessed { error in
                             if let error {
                                 print("[UDPReceiver] HELLO send error: \(error)")
+                                self.onHelloFailure?(error.localizedDescription)
                             } else {
                                 print("[UDPReceiver] HELLO sent to \(host):\(self.port)")
                             }
@@ -144,11 +153,15 @@ final class UDPReceiver {
 
             if let error {
                 print("[UDPReceiver] Receive error: \(error)")
+                self.onError?("UDP receive error: \(error.localizedDescription)")
                 return
             }
 
             if let data = content, data.count >= FragmentHeader.size {
+                self.onDatagramReceived?(data.count)
                 self.handleDatagram(data)
+            } else if let data = content {
+                self.onDatagramIgnored?("Ignored short UDP datagram (\(data.count) bytes)")
             }
 
             // Continue receiving
