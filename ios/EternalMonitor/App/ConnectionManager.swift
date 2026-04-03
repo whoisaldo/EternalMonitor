@@ -1,5 +1,5 @@
 import Foundation
-import CoreVideo
+@preconcurrency import CoreVideo
 import QuartzCore
 import Combine
 import os

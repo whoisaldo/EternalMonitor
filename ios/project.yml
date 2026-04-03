@@ -2,7 +2,7 @@ name: EternalMonitor
 options:
   bundleIdPrefix: com.eternal
   deploymentTarget:
-    iOS: "16.0"
+    iOS: "17.0"
   generateEmptyDirectories: true
   groupSortPosition: top
 
@@ -16,16 +16,6 @@ targets:
     platform: iOS
     sources:
       - path: EternalMonitor
-        excludes:
-          - "Resources/Fonts/**"
-    resources:
-      - path: EternalMonitor/Resources/Assets.xcassets
-      - path: EternalMonitor/Resources/Fonts/Syne-Variable.ttf
-        buildPhase: resources
-      - path: EternalMonitor/Resources/Fonts/JetBrainsMono-Regular.ttf
-        buildPhase: resources
-      - path: EternalMonitor/Resources/Fonts/JetBrainsMono-Medium.ttf
-        buildPhase: resources
     settings:
       base:
         INFOPLIST_FILE: EternalMonitor/Info.plist
