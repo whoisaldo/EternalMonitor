@@ -1,4 +1,6 @@
 .claude/
+CLAUDE.md
+ROADMAP.md
 .cargo/
 .cargo-home/
 .rustup-home/
