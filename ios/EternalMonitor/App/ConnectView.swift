@@ -18,6 +18,14 @@ struct ConnectView: View {
         connectionManager.state == .connecting
     }
 
+    private var normalizedHostIP: String {
+        hostIP.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private var parsedPort: UInt16? {
+        UInt16(port.trimmingCharacters(in: .whitespacesAndNewlines))
+    }
+
     var body: some View {
         NavigationStack {
             ZStack {
@@ -45,6 +53,10 @@ struct ConnectView: View {
                         }
 
                         scanButton
+
+                        if !scanner.statusMessage.isEmpty && scanner.hosts.isEmpty {
+                            scanStatusMessage
+                        }
 
                         // Discovered hosts
                         if !scanner.hosts.isEmpty {
@@ -206,6 +218,13 @@ struct ConnectView: View {
                     .focused($focusedField, equals: .port)
                     .disabled(isConnecting)
             }
+
+            if !port.isEmpty && parsedPort == nil {
+                Text("Enter a valid UDP port between 1 and 65535.")
+                    .font(.custom("JetBrainsMono-Regular", size: 11))
+                    .foregroundColor(.orange.opacity(0.8))
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
         }
         .opacity(isConnecting ? 0.5 : 1)
     }
@@ -215,9 +234,9 @@ struct ConnectView: View {
     private var connectButton: some View {
         Button {
             focusedField = nil
-            let p = UInt16(port) ?? 9876
+            guard let p = parsedPort else { return }
             withAnimation(.easeInOut(duration: 0.2)) {
-                connectionManager.connect(host: hostIP, port: p)
+                connectionManager.connect(host: normalizedHostIP, port: p)
             }
         } label: {
             HStack(spacing: 8) {
@@ -233,8 +252,8 @@ struct ConnectView: View {
                     .fill(Color(hex: 0xe8ff47))
             )
         }
-        .disabled(hostIP.isEmpty)
-        .opacity(hostIP.isEmpty ? 0.5 : 1)
+        .disabled(normalizedHostIP.isEmpty || parsedPort == nil)
+        .opacity(normalizedHostIP.isEmpty || parsedPort == nil ? 0.5 : 1)
     }
 
     // MARK: - Connecting state (spinner + cancel)
@@ -245,7 +264,7 @@ struct ConnectView: View {
             HStack(spacing: 10) {
                 ProgressView()
                     .tint(Color(hex: 0xe8ff47))
-                Text("Connecting to \(hostIP)...")
+                Text("Waiting for frames from \(normalizedHostIP)...")
                     .font(.custom("JetBrainsMono-Regular", size: 14))
                     .foregroundColor(.white.opacity(0.7))
             }
@@ -381,6 +400,13 @@ struct ConnectView: View {
             }
         }
         .transition(.opacity.combined(with: .move(edge: .bottom)))
+    }
+
+    private var scanStatusMessage: some View {
+        Text(scanner.statusMessage)
+            .font(.custom("JetBrainsMono-Regular", size: 11))
+            .foregroundColor(.white.opacity(0.45))
+            .frame(maxWidth: .infinity, alignment: .leading)
     }
 
     // MARK: - Recent connections

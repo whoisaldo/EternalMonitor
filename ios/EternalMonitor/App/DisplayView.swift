@@ -49,6 +49,9 @@ struct DisplayView: View {
         .onAppear {
             scheduleHUDDismiss()
         }
+        .onDisappear {
+            hudDismissTask?.cancel()
+        }
     }
 
     // MARK: - HUD overlay

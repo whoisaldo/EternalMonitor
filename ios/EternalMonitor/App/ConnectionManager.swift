@@ -38,6 +38,9 @@ final class ConnectionManager: ObservableObject {
 
     func connect(host: String, port: UInt16) {
         guard state == .disconnected else { return }
+        let normalizedHost = host.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !normalizedHost.isEmpty else { return }
+
         state = .connecting
         connectionError = nil
 
@@ -69,8 +72,18 @@ final class ConnectionManager: ObservableObject {
         receiver.assembler = assembler
         receiver.onConnectionEstablished = { [weak self] in
             Task { @MainActor in
-                self?.timeoutTask?.cancel()
-                self?.state = .connected
+                guard let self else { return }
+                self.timeoutTask?.cancel()
+                self.state = .connected
+                self.transportMode = "WiFi"
+                RecentConnectionStore.shared.add(host: normalizedHost, port: port, isUSB: false)
+            }
+        }
+        receiver.onError = { [weak self] message in
+            Task { @MainActor in
+                guard let self, self.state == .connecting else { return }
+                self.connectionError = message
+                self.disconnect()
             }
         }
 
@@ -78,18 +91,20 @@ final class ConnectionManager: ObservableObject {
         self.frameAssembler = assembler
         self.udpReceiver = receiver
 
-        receiver.start(host: host)
+        guard receiver.start(host: normalizedHost) else {
+            connectionError = "Failed to start the receiver."
+            disconnect()
+            return
+        }
 
         // Timeout after N seconds
         timeoutTask = Task { @MainActor in
             try? await Task.sleep(nanoseconds: Self.connectionTimeoutSeconds * 1_000_000_000)
             if !Task.isCancelled && self.state == .connecting {
-                self.connectionError = "Connection timed out. Make sure the host is running and both devices are on the same network."
+                self.connectionError = "Timed out waiting for frames from the selected host. Make sure it is running and on the same network."
                 self.disconnect()
             }
         }
-
-        RecentConnectionStore.shared.add(host: host, port: port, isUSB: false)
     }
 
     func cancel() {
