@@ -1,4 +1,5 @@
 .claude/
+.cargo/
 .cargo-home/
 .rustup-home/
 target/
