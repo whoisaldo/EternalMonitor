@@ -23,7 +23,7 @@ struct MetalView: UIViewRepresentable {
 
         let renderer = MetalRenderer(device: device, view: view)
         context.coordinator.renderer = renderer
-        context.coordinator.connectionManager = connectionManager
+        context.coordinator.frameSlot = connectionManager.frameSlot
         view.delegate = context.coordinator
 
         return view
@@ -43,13 +43,14 @@ struct MetalView: UIViewRepresentable {
 
     class Coordinator: NSObject, MTKViewDelegate {
         var renderer: MetalRenderer?
-        weak var connectionManager: ConnectionManager?
+        /// Direct reference to the shared FrameSlot — avoids crossing @MainActor boundary on the render thread.
+        var frameSlot: FrameSlot?
 
         func mtkView(_ view: MTKView, drawableSizeWillChange size: CGSize) {}
 
         func draw(in view: MTKView) {
-            guard let renderer, let manager = connectionManager else { return }
-            let pixelBuffer = manager.latestFrame
+            guard let renderer else { return }
+            let pixelBuffer = frameSlot?.take()
             renderer.draw(in: view, pixelBuffer: pixelBuffer)
         }
     }
