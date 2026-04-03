@@ -135,15 +135,20 @@ final class ConnectionManager: ObservableObject {
 // unchecked-Sendable box so the lock-protected slot can be shared across
 // queues safely (the lock serialises all access).
 
-struct SendablePixelBuffer: @unchecked Sendable {
+final class PixelBufferBox: @unchecked Sendable {
     let buffer: CVPixelBuffer
+
+    init(_ buffer: CVPixelBuffer) {
+        self.buffer = buffer
+    }
 }
 
 final class FrameSlot: @unchecked Sendable {
-    private let lock = os.OSAllocatedUnfairLock<SendablePixelBuffer?>(initialState: nil)
+    private let lock = os.OSAllocatedUnfairLock<PixelBufferBox?>(initialState: nil)
 
     func set(_ buffer: CVPixelBuffer) {
-        lock.withLock { $0 = SendablePixelBuffer(buffer: buffer) }
+        let box = PixelBufferBox(buffer)
+        lock.withLock { $0 = box }
     }
 
     func take() -> CVPixelBuffer? {
