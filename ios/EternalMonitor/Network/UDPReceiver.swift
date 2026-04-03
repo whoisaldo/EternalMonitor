@@ -29,6 +29,10 @@ final class UDPReceiver {
 
         let params = NWParameters.udp
         params.allowLocalEndpointReuse = true
+        params.requiredLocalEndpoint = NWEndpoint.hostPort(
+            host: .ipv4(.any),
+            port: NWEndpoint.Port(rawValue: port)!
+        )
 
         do {
             listener = try NWListener(using: params)
@@ -82,9 +86,18 @@ final class UDPReceiver {
 
     private static let helloMagic = "ETERNALHELLO".data(using: .utf8)!
 
+    /// Build HELLO payload: magic bytes + 2-byte LE listening port.
+    private func helloPayload() -> Data {
+        var data = Self.helloMagic
+        var lePort = port.littleEndian
+        data.append(Data(bytes: &lePort, count: 2))
+        return data
+    }
+
     /// Send a HELLO registration packet to the host so it streams frames to us.
     /// Sends multiple times to handle packet loss.
     private func sendHello(to host: String) {
+        let payload = helloPayload()
         let endpoint = NWEndpoint.hostPort(
             host: NWEndpoint.Host(host),
             port: NWEndpoint.Port(rawValue: port)!
@@ -97,7 +110,7 @@ final class UDPReceiver {
                 for i in 0..<3 {
                     let delay = DispatchTime.now() + .milliseconds(i * 200)
                     self.queue.asyncAfter(deadline: delay) {
-                        conn.send(content: Self.helloMagic, completion: .contentProcessed { error in
+                        conn.send(content: payload, completion: .contentProcessed { error in
                             if let error {
                                 print("[UDPReceiver] HELLO send error: \(error)")
                             } else {

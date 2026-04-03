@@ -49,10 +49,18 @@ pub async fn start_sender(
                 match result {
                     Ok((len, src)) => {
                         if len >= HELLO_MAGIC.len() && &hello_buf[..HELLO_MAGIC.len()] == HELLO_MAGIC {
-                            if client_addr.as_ref() != Some(&src) {
-                                info!(%src, "iPad registered as receiver");
-                                client_addr = Some(src);
-                                PIPELINE_STATS.lock().target_addr = src.to_string();
+                            // HELLO payload: "ETERNALHELLO" + optional 2-byte LE listen port
+                            let listen_port = if len >= HELLO_MAGIC.len() + 2 {
+                                let offset = HELLO_MAGIC.len();
+                                u16::from_le_bytes([hello_buf[offset], hello_buf[offset + 1]])
+                            } else {
+                                src.port()
+                            };
+                            let target = SocketAddr::new(src.ip(), listen_port);
+                            if client_addr.as_ref() != Some(&target) {
+                                info!(%target, "iPad registered as receiver");
+                                client_addr = Some(target);
+                                PIPELINE_STATS.lock().target_addr = target.to_string();
                             }
                         }
                     }
