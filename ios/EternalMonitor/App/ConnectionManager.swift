@@ -10,6 +10,56 @@ enum ConnectionState: Equatable {
     case connected
 }
 
+enum DiagnosticLevel: String {
+    case info = "INFO"
+    case warning = "WARN"
+    case error = "ERROR"
+}
+
+struct DiagnosticEntry: Identifiable {
+    let id = UUID()
+    let timestamp = Date()
+    let level: DiagnosticLevel
+    let category: String
+    let message: String
+}
+
+private struct ConnectionDebugState {
+    var host = ""
+    var port: UInt16 = 0
+    var listenerReadyPort: UInt16?
+    var helloAttempts = 0
+    var datagramsReceived = 0
+    var datagramBytesReceived = 0
+    var assembledFrames = 0
+    var assembledFrameBytes = 0
+    var decodePackets = 0
+    var decodedFrames = 0
+    var lastDecodedTimestampUs: UInt64 = 0
+
+    var timeoutSummary: String {
+        if listenerReadyPort == nil {
+            return "UDP listener never became ready."
+        }
+        if helloAttempts == 0 {
+            return "Listener came up, but HELLO registration never sent."
+        }
+        if datagramsReceived == 0 {
+            return "HELLO sent \(helloAttempts)x to \(host):\(port), but no UDP datagrams came back."
+        }
+        if assembledFrames == 0 {
+            return "Received \(datagramsReceived) UDP datagrams (\(datagramBytesReceived) bytes), but no complete frame was reassembled."
+        }
+        if decodePackets == 0 {
+            return "Reassembled \(assembledFrames) frame payloads, but none could be parsed as FramePacket."
+        }
+        if decodedFrames == 0 {
+            return "Parsed \(decodePackets) packets and assembled \(assembledFrames) payloads, but VideoToolbox produced no frames."
+        }
+        return "Received \(decodedFrames) decoded frames, but the connection did not transition cleanly."
+    }
+}
+
 @MainActor
 final class ConnectionManager: ObservableObject {
     @Published var state: ConnectionState = .disconnected
@@ -17,11 +67,13 @@ final class ConnectionManager: ObservableObject {
     @Published var lagMs: Double = 0
     @Published var transportMode: String = "WiFi"
     @Published var connectionError: String?
+    @Published private(set) var diagnostics: [DiagnosticEntry] = []
 
     private var udpReceiver: UDPReceiver?
     private var frameAssembler: FrameAssembler?
     private var videoDecoder: VideoDecoder?
     private var timeoutTask: Task<Void, Never>?
+    private var debugState = ConnectionDebugState()
 
     let frameSlot = FrameSlot()
     private var fpsCounter = FPSCounter()
@@ -43,6 +95,9 @@ final class ConnectionManager: ObservableObject {
 
         state = .connecting
         connectionError = nil
+        diagnostics.removeAll()
+        debugState = ConnectionDebugState(host: normalizedHost, port: port)
+        record(.info, "connection", "Starting connection to \(normalizedHost):\(port)")
 
         let decoder = VideoDecoder()
         let assembler = FrameAssembler()
@@ -55,6 +110,15 @@ final class ConnectionManager: ObservableObject {
             // Capture only the scalar we need — avoids sending CVPixelBuffer across boundary
             let ts = timestampUs
             Task { @MainActor in
+                self.debugState.decodedFrames += 1
+                self.debugState.lastDecodedTimestampUs = ts
+                if self.debugState.decodedFrames == 1 {
+                    self.record(.info, "decode", "First frame decoded successfully")
+                    self.timeoutTask?.cancel()
+                    self.state = .connected
+                    self.transportMode = "WiFi"
+                    RecentConnectionStore.shared.add(host: normalizedHost, port: port, isUSB: false)
+                }
                 self.fpsCounter.tick()
                 self.fps = self.fpsCounter.currentFPS
                 let nowUs = UInt64(ProcessInfo.processInfo.systemUptime * 1_000_000)
@@ -64,24 +128,82 @@ final class ConnectionManager: ObservableObject {
             }
         }
 
-        assembler.onFrameAssembled = { [weak decoder] data in
-            guard let decoder, let packet = FramePacket.deserialize(from: data) else { return }
+        decoder.onEvent = { [weak self] message in
+            Task { @MainActor in
+                self?.record(.info, "decode", message)
+            }
+        }
+
+        assembler.onFrameAssembled = { [weak self, weak decoder] data in
+            guard let self else { return }
+            Task { @MainActor in
+                self.debugState.assembledFrames += 1
+                self.debugState.assembledFrameBytes += data.count
+                if self.debugState.assembledFrames == 1 || self.debugState.assembledFrames % 30 == 0 {
+                    self.record(.info, "assembly", "Assembled frame payload #\(self.debugState.assembledFrames) (\(data.count) bytes)")
+                }
+            }
+
+            guard let decoder else { return }
+            guard let packet = FramePacket.deserialize(from: data) else {
+                Task { @MainActor in
+                    self.record(.warning, "proto", "Failed to parse reassembled payload (\(data.count) bytes) as FramePacket")
+                }
+                return
+            }
+            Task { @MainActor in
+                self.debugState.decodePackets += 1
+                if self.debugState.decodePackets == 1 || self.debugState.decodePackets % 30 == 0 {
+                    self.record(.info, "proto", "Parsed FramePacket seq=\(packet.seq) bytes=\(packet.data.count) keyframe=\(packet.isKeyframe)")
+                }
+            }
             decoder.decode(packet: packet)
         }
 
         receiver.assembler = assembler
-        receiver.onConnectionEstablished = { [weak self] in
+        receiver.onListenerReady = { [weak self] actualPort in
+            Task { @MainActor in
+                self?.debugState.listenerReadyPort = actualPort
+                self?.record(.info, "udp", "Listener ready on port \(actualPort)")
+            }
+        }
+        receiver.onHelloAttempt = { [weak self] attempt, total, host, port in
+            Task { @MainActor in
+                self?.debugState.helloAttempts = attempt
+                self?.record(.info, "udp", "HELLO attempt \(attempt)/\(total) to \(host):\(port)")
+            }
+        }
+        receiver.onHelloFailure = { [weak self] message in
+            Task { @MainActor in
+                self?.record(.warning, "udp", "HELLO send failed: \(message)")
+            }
+        }
+        receiver.onDatagramReceived = { [weak self] byteCount in
             Task { @MainActor in
                 guard let self else { return }
-                self.timeoutTask?.cancel()
-                self.state = .connected
-                self.transportMode = "WiFi"
-                RecentConnectionStore.shared.add(host: normalizedHost, port: port, isUSB: false)
+                self.debugState.datagramsReceived += 1
+                self.debugState.datagramBytesReceived += byteCount
+                if self.debugState.datagramsReceived == 1 {
+                    self.record(.info, "udp", "First UDP datagram received (\(byteCount) bytes)")
+                } else if self.debugState.datagramsReceived % 50 == 0 {
+                    self.record(.info, "udp", "Received \(self.debugState.datagramsReceived) UDP datagrams so far")
+                }
+            }
+        }
+        receiver.onDatagramIgnored = { [weak self] message in
+            Task { @MainActor in
+                self?.record(.warning, "udp", message)
+            }
+        }
+        receiver.onConnectionEstablished = { [weak self] in
+            Task { @MainActor in
+                self?.record(.info, "udp", "Accepted UDP stream from selected host")
             }
         }
         receiver.onError = { [weak self] message in
             Task { @MainActor in
                 guard let self, self.state == .connecting else { return }
+                self.record(.error, "udp", message)
                 self.connectionError = message
                 self.disconnect()
             }
@@ -93,6 +215,7 @@ final class ConnectionManager: ObservableObject {
 
         guard receiver.start(host: normalizedHost) else {
             connectionError = "Failed to start the receiver."
+            record(.error, "connection", "Receiver failed to start")
             disconnect()
             return
         }
@@ -101,7 +224,9 @@ final class ConnectionManager: ObservableObject {
         timeoutTask = Task { @MainActor in
             try? await Task.sleep(nanoseconds: Self.connectionTimeoutSeconds * 1_000_000_000)
             if !Task.isCancelled && self.state == .connecting {
-                self.connectionError = "Timed out waiting for frames from the selected host. Make sure it is running and on the same network."
+                let summary = self.debugState.timeoutSummary
+                self.record(.error, "timeout", summary)
+                self.connectionError = "Timed out waiting for frames. \(summary)"
                 self.disconnect()
             }
         }
@@ -127,6 +252,28 @@ final class ConnectionManager: ObservableObject {
         state = .disconnected
         fps = 0
         lagMs = 0
+    }
+
+    private func record(_ level: DiagnosticLevel, _ category: String, _ message: String) {
+        diagnostics.append(DiagnosticEntry(level: level, category: category, message: message))
+        if diagnostics.count > 80 {
+            diagnostics.removeFirst(diagnostics.count - 80)
+        }
+        Logger(subsystem: "com.eternal.monitor", category: category)
+            .log(level: level.osLogType, "\(message, privacy: .public)")
+    }
+}
+
+private extension DiagnosticLevel {
+    var osLogType: OSLogType {
+        switch self {
+        case .info:
+            return .info
+        case .warning:
+            return .default
+        case .error:
+            return .error
+        }
     }
 }
 
