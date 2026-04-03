@@ -16,13 +16,17 @@ final class ConnectionManager: ObservableObject {
     @Published var fps: Double = 0
     @Published var lagMs: Double = 0
     @Published var transportMode: String = "WiFi"
+    @Published var connectionError: String?
 
     private var udpReceiver: UDPReceiver?
     private var frameAssembler: FrameAssembler?
     private var videoDecoder: VideoDecoder?
+    private var timeoutTask: Task<Void, Never>?
 
-    private let frameSlot = FrameSlot()
+    let frameSlot = FrameSlot()
     private var fpsCounter = FPSCounter()
+
+    static let connectionTimeoutSeconds: UInt64 = 10
 
     // MARK: - Frame slot (thread-safe single-slot)
 
@@ -35,6 +39,7 @@ final class ConnectionManager: ObservableObject {
     func connect(host: String, port: UInt16) {
         guard state == .disconnected else { return }
         state = .connecting
+        connectionError = nil
 
         let decoder = VideoDecoder()
         let assembler = FrameAssembler()
@@ -42,14 +47,16 @@ final class ConnectionManager: ObservableObject {
 
         decoder.onFrameDecoded = { [weak self] pixelBuffer, timestampUs in
             guard let self else { return }
+            // Store frame in lock-protected slot (no Sendable boundary crossed)
             self.frameSlot.set(pixelBuffer)
+            // Capture only the scalar we need — avoids sending CVPixelBuffer across boundary
+            let ts = timestampUs
             Task { @MainActor in
                 self.fpsCounter.tick()
                 self.fps = self.fpsCounter.currentFPS
                 let nowUs = UInt64(ProcessInfo.processInfo.systemUptime * 1_000_000)
-                if timestampUs > 0 {
-                    // lag is approximate — host and iPad clocks are not synced
-                    self.lagMs = Double(nowUs &- timestampUs) / 1000.0
+                if ts > 0 {
+                    self.lagMs = Double(nowUs &- ts) / 1000.0
                 }
             }
         }
@@ -62,6 +69,7 @@ final class ConnectionManager: ObservableObject {
         receiver.assembler = assembler
         receiver.onConnectionEstablished = { [weak self] in
             Task { @MainActor in
+                self?.timeoutTask?.cancel()
                 self?.state = .connected
             }
         }
@@ -72,10 +80,27 @@ final class ConnectionManager: ObservableObject {
 
         receiver.start(host: host)
 
+        // Timeout after N seconds
+        timeoutTask = Task { @MainActor in
+            try? await Task.sleep(nanoseconds: Self.connectionTimeoutSeconds * 1_000_000_000)
+            if !Task.isCancelled && self.state == .connecting {
+                self.connectionError = "Connection timed out. Make sure the host is running and both devices are on the same network."
+                self.disconnect()
+            }
+        }
+
         RecentConnectionStore.shared.add(host: host, port: port, isUSB: false)
     }
 
+    func cancel() {
+        timeoutTask?.cancel()
+        disconnect()
+    }
+
     func disconnect() {
+        timeoutTask?.cancel()
+        timeoutTask = nil
+
         udpReceiver?.stop()
         videoDecoder?.invalidate()
         frameAssembler?.reset()
@@ -91,19 +116,26 @@ final class ConnectionManager: ObservableObject {
 }
 
 // MARK: - Thread-safe single-slot pixel buffer
+// CVPixelBuffer is not Sendable in strict concurrency. We wrap it in an
+// unchecked-Sendable box so the lock-protected slot can be shared across
+// queues safely (the lock serialises all access).
+
+struct SendablePixelBuffer: @unchecked Sendable {
+    let buffer: CVPixelBuffer
+}
 
 final class FrameSlot: @unchecked Sendable {
-    private let lock = os.OSAllocatedUnfairLock<CVPixelBuffer?>(initialState: nil)
+    private let lock = os.OSAllocatedUnfairLock<SendablePixelBuffer?>(initialState: nil)
 
     func set(_ buffer: CVPixelBuffer) {
-        lock.withLock { $0 = buffer }
+        lock.withLock { $0 = SendablePixelBuffer(buffer: buffer) }
     }
 
     func take() -> CVPixelBuffer? {
         lock.withLock { current in
-            let frame = current
+            let wrapped = current
             current = nil
-            return frame
+            return wrapped?.buffer
         }
     }
 }
@@ -117,7 +149,6 @@ struct FPSCounter {
     mutating func tick() {
         let now = CACurrentMediaTime()
         timestamps.append(now)
-        // Keep last 1 second of timestamps
         timestamps.removeAll { now - $0 > 1.0 }
         currentFPS = Double(timestamps.count)
     }
