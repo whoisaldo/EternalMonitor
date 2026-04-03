@@ -11,6 +11,7 @@ final class UDPReceiver {
 
     private var listener: NWListener?
     private var activeConnection: NWConnection?
+    private var helloConnection: NWConnection?
     private let queue = DispatchQueue(label: "com.eternal.udp", qos: .userInteractive)
     private var expectedRemoteHost: String?
     private var didEstablishConnection = false
@@ -19,7 +20,8 @@ final class UDPReceiver {
         self.port = port
     }
 
-    /// Start listening for UDP datagrams and optionally filter them to a specific sender.
+    /// Start listening for UDP datagrams from `host` and send a HELLO registration
+    /// so the host knows where to stream frames.
     @discardableResult
     func start(host: String) -> Bool {
         expectedRemoteHost = Self.normalizeHost(host)
@@ -27,10 +29,6 @@ final class UDPReceiver {
 
         let params = NWParameters.udp
         params.allowLocalEndpointReuse = true
-        params.requiredLocalEndpoint = NWEndpoint.hostPort(
-            host: .ipv4(.any),
-            port: NWEndpoint.Port(rawValue: port)!
-        )
 
         do {
             listener = try NWListener(using: params)
@@ -40,10 +38,14 @@ final class UDPReceiver {
             return false
         }
 
-        listener?.stateUpdateHandler = { state in
+        listener?.stateUpdateHandler = { [weak self] state in
+            guard let self else { return }
             switch state {
             case .ready:
-                print("[UDPReceiver] Listening on port \(self.port)")
+                let actualPort = self.listener?.port?.rawValue ?? self.port
+                print("[UDPReceiver] Listening on port \(actualPort)")
+                // Send HELLO to the host so it knows our address
+                self.sendHello(to: host)
             case .failed(let error):
                 print("[UDPReceiver] Listener failed: \(error)")
                 self.onError?("UDP listener failed: \(error.localizedDescription)")
@@ -78,7 +80,41 @@ final class UDPReceiver {
         return true
     }
 
+    private static let helloMagic = "ETERNALHELLO".data(using: .utf8)!
+
+    /// Send a HELLO registration packet to the host so it streams frames to us.
+    /// Sends multiple times to handle packet loss.
+    private func sendHello(to host: String) {
+        let endpoint = NWEndpoint.hostPort(
+            host: NWEndpoint.Host(host),
+            port: NWEndpoint.Port(rawValue: port)!
+        )
+        let conn = NWConnection(to: endpoint, using: .udp)
+        conn.stateUpdateHandler = { [weak self] state in
+            guard let self else { return }
+            if case .ready = state {
+                // Send HELLO a few times to be safe
+                for i in 0..<3 {
+                    let delay = DispatchTime.now() + .milliseconds(i * 200)
+                    self.queue.asyncAfter(deadline: delay) {
+                        conn.send(content: Self.helloMagic, completion: .contentProcessed { error in
+                            if let error {
+                                print("[UDPReceiver] HELLO send error: \(error)")
+                            } else {
+                                print("[UDPReceiver] HELLO sent to \(host):\(self.port)")
+                            }
+                        })
+                    }
+                }
+            }
+        }
+        conn.start(queue: queue)
+        helloConnection = conn
+    }
+
     func stop() {
+        helloConnection?.cancel()
+        helloConnection = nil
         activeConnection?.cancel()
         activeConnection = nil
         listener?.cancel()

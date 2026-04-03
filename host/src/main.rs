@@ -5,7 +5,6 @@ mod gui;
 mod stats;
 mod transport;
 
-use std::net::SocketAddr;
 use std::time::Instant;
 
 use tracing::{error, info};
@@ -19,12 +18,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with_target(false)
         .init();
 
-    let target_addr: SocketAddr = std::env::args()
+    let listen_port: u16 = std::env::args()
         .nth(1)
         .and_then(|s| s.parse().ok())
-        .unwrap_or_else(|| "192.168.1.255:9876".parse().unwrap());
+        .unwrap_or(9876);
 
-    info!(%target_addr, "EternalMonitor host starting");
+    info!(listen_port, "EternalMonitor host starting");
 
     // Mark pipeline as running
     {
@@ -37,12 +36,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     std::thread::spawn(move || {
         let rt = tokio::runtime::Runtime::new().expect("Failed to create tokio runtime");
         rt.block_on(async move {
-            run_pipeline(target_addr).await;
+            run_pipeline(listen_port).await;
         });
     });
 
     // Advertise via mDNS so iOS scanner can find us (keep handle alive)
-    let _mdns = discovery::advertise_service(target_addr);
+    let _mdns = discovery::advertise_service(listen_port);
 
     // Run the GUI on the main thread (blocks until window is closed)
     if let Err(e) = gui::run_gui() {
@@ -53,7 +52,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-async fn run_pipeline(target_addr: SocketAddr) {
+async fn run_pipeline(listen_port: u16) {
     if let Err(e) = ffmpeg_next::init() {
         error!(error = %e, "FFmpeg init failed");
         stats::PIPELINE_STATS.lock().pipeline_running = false;
@@ -64,7 +63,7 @@ async fn run_pipeline(target_addr: SocketAddr) {
     let capture_rx = capture::start_capture();
     let nal_rx = encoder::start_encoder(capture_rx, 1920, 1080);
 
-    if let Err(e) = transport::start_sender(nal_rx, target_addr, pipeline_epoch).await {
+    if let Err(e) = transport::start_sender(nal_rx, listen_port, pipeline_epoch).await {
         error!(error = %e, "Transport sender exited with error");
     }
 
