@@ -109,7 +109,7 @@ struct ConnectView: View {
             } else {
                 // Fallback if image asset isn't found
                 Text("E")
-                    .font(.custom("Syne-Bold", size: 48))
+                    .font(.appDisplayBold(size: 48))
                     .foregroundColor(Color(hex: 0xe8ff47))
                     .frame(width: 80, height: 80)
                     .background(
@@ -119,11 +119,11 @@ struct ConnectView: View {
             }
 
             Text("EternalMonitor")
-                .font(.custom("Syne-Bold", size: 28))
+                .font(.appDisplayBold(size: 28))
                 .foregroundColor(.white)
 
             Text("Windows display streaming")
-                .font(.custom("JetBrainsMono-Regular", size: 13))
+                .font(.appMonoRegular(size: 13))
                 .foregroundColor(.white.opacity(0.4))
         }
     }
@@ -137,7 +137,7 @@ struct ConnectView: View {
                 .font(.system(size: 16))
 
             Text(message)
-                .font(.custom("JetBrainsMono-Regular", size: 12))
+                .font(.appMonoRegular(size: 12))
                 .foregroundColor(.white.opacity(0.8))
                 .multilineTextAlignment(.leading)
 
@@ -169,11 +169,11 @@ struct ConnectView: View {
         VStack(spacing: 14) {
             VStack(alignment: .leading, spacing: 6) {
                 Text("HOST IP")
-                    .font(.custom("JetBrainsMono-Medium", size: 11))
+                    .font(.appMonoMedium(size: 11))
                     .foregroundColor(.white.opacity(0.4))
 
                 TextField("e.g. 10.0.0.45", text: $hostIP)
-                    .font(.custom("JetBrainsMono-Regular", size: 16))
+                    .font(.appMonoRegular(size: 16))
                     .foregroundColor(.white)
                     .padding(.horizontal, 16)
                     .padding(.vertical, 14)
@@ -199,11 +199,11 @@ struct ConnectView: View {
 
             VStack(alignment: .leading, spacing: 6) {
                 Text("PORT")
-                    .font(.custom("JetBrainsMono-Medium", size: 11))
+                    .font(.appMonoMedium(size: 11))
                     .foregroundColor(.white.opacity(0.4))
 
                 TextField("9876", text: $port)
-                    .font(.custom("JetBrainsMono-Regular", size: 16))
+                    .font(.appMonoRegular(size: 16))
                     .foregroundColor(.white)
                     .padding(.horizontal, 16)
                     .padding(.vertical, 14)
@@ -227,7 +227,7 @@ struct ConnectView: View {
 
             if !port.isEmpty && parsedPort == nil {
                 Text("Enter a valid UDP port between 1 and 65535.")
-                    .font(.custom("JetBrainsMono-Regular", size: 11))
+                    .font(.appMonoRegular(size: 11))
                     .foregroundColor(.orange.opacity(0.8))
                     .frame(maxWidth: .infinity, alignment: .leading)
             }
@@ -248,7 +248,7 @@ struct ConnectView: View {
             HStack(spacing: 8) {
                 Image(systemName: "link")
                 Text("Connect")
-                    .font(.custom("Syne-Bold", size: 16))
+                    .font(.appDisplayBold(size: 16))
             }
             .foregroundColor(Color(hex: 0x080808))
             .frame(maxWidth: .infinity)
@@ -265,24 +265,24 @@ struct ConnectView: View {
     private var diagnosticsSection: some View {
         VStack(alignment: .leading, spacing: 10) {
             Text("DIAGNOSTICS")
-                .font(.custom("JetBrainsMono-Medium", size: 11))
+                .font(.appMonoMedium(size: 11))
                 .foregroundColor(.white.opacity(0.4))
 
             let entries = Array(connectionManager.diagnostics.suffix(8).reversed())
             ForEach(entries) { entry in
                 HStack(alignment: .top, spacing: 10) {
                     Text(entry.level.rawValue)
-                        .font(.custom("JetBrainsMono-Medium", size: 10))
+                        .font(.appMonoMedium(size: 10))
                         .foregroundColor(color(for: entry.level))
                         .frame(width: 40, alignment: .leading)
 
                     VStack(alignment: .leading, spacing: 4) {
                         Text(entry.category.uppercased())
-                            .font(.custom("JetBrainsMono-Medium", size: 10))
+                            .font(.appMonoMedium(size: 10))
                             .foregroundColor(.white.opacity(0.35))
 
                         Text(entry.message)
-                            .font(.custom("JetBrainsMono-Regular", size: 11))
+                            .font(.appMonoRegular(size: 11))
                             .foregroundColor(.white.opacity(0.72))
                             .textSelection(.enabled)
                     }
@@ -312,7 +312,7 @@ struct ConnectView: View {
                 ProgressView()
                     .tint(Color(hex: 0xe8ff47))
                 Text("Waiting for frames from \(normalizedHostIP)...")
-                    .font(.custom("JetBrainsMono-Regular", size: 14))
+                    .font(.appMonoRegular(size: 14))
                     .foregroundColor(.white.opacity(0.7))
             }
             .frame(maxWidth: .infinity)
@@ -333,7 +333,7 @@ struct ConnectView: View {
                 }
             } label: {
                 Text("Cancel")
-                    .font(.custom("Syne-Bold", size: 16))
+                    .font(.appDisplayBold(size: 16))
                     .foregroundColor(Color(hex: 0xe8ff47))
                     .frame(maxWidth: .infinity)
                     .padding(.vertical, 14)
@@ -365,7 +365,7 @@ struct ConnectView: View {
                     Image(systemName: "antenna.radiowaves.left.and.right")
                 }
                 Text(scanner.isScanning ? "Scanning..." : "Scan network")
-                    .font(.custom("JetBrainsMono-Regular", size: 14))
+                    .font(.appMonoRegular(size: 14))
             }
             .foregroundColor(.white.opacity(0.6))
             .frame(maxWidth: .infinity)
@@ -390,14 +390,14 @@ struct ConnectView: View {
         VStack(alignment: .leading, spacing: 10) {
             HStack {
                 Text("FOUND ON NETWORK")
-                    .font(.custom("JetBrainsMono-Medium", size: 11))
+                    .font(.appMonoMedium(size: 11))
                     .foregroundColor(.white.opacity(0.4))
 
                 Spacer()
 
                 if !scanner.statusMessage.isEmpty {
                     Text(scanner.statusMessage)
-                        .font(.custom("JetBrainsMono-Regular", size: 10))
+                        .font(.appMonoRegular(size: 10))
                         .foregroundColor(Color(hex: 0x1D9E75).opacity(0.8))
                 }
             }
@@ -414,11 +414,11 @@ struct ConnectView: View {
 
                         VStack(alignment: .leading, spacing: 2) {
                             Text(host.address)
-                                .font(.custom("JetBrainsMono-Regular", size: 15))
+                                .font(.appMonoRegular(size: 15))
                                 .foregroundColor(.white)
                             if host.name != host.address {
                                 Text(host.name)
-                                    .font(.custom("JetBrainsMono-Regular", size: 11))
+                                    .font(.appMonoRegular(size: 11))
                                     .foregroundColor(.white.opacity(0.3))
                             }
                         }
@@ -426,7 +426,7 @@ struct ConnectView: View {
                         Spacer()
 
                         Text(":\(String(host.port))")
-                            .font(.custom("JetBrainsMono-Regular", size: 12))
+                            .font(.appMonoRegular(size: 12))
                             .foregroundColor(.white.opacity(0.3))
 
                         Image(systemName: "arrow.right.circle.fill")
@@ -451,7 +451,7 @@ struct ConnectView: View {
 
     private var scanStatusMessage: some View {
         Text(scanner.statusMessage)
-            .font(.custom("JetBrainsMono-Regular", size: 11))
+            .font(.appMonoRegular(size: 11))
             .foregroundColor(.white.opacity(0.45))
             .frame(maxWidth: .infinity, alignment: .leading)
     }
@@ -461,7 +461,7 @@ struct ConnectView: View {
     private var recentSection: some View {
         VStack(alignment: .leading, spacing: 10) {
             Text("RECENT")
-                .font(.custom("JetBrainsMono-Medium", size: 11))
+                .font(.appMonoMedium(size: 11))
                 .foregroundColor(.white.opacity(0.4))
 
             ForEach(recentStore.connections) { conn in
@@ -472,17 +472,17 @@ struct ConnectView: View {
                     HStack {
                         VStack(alignment: .leading, spacing: 4) {
                             Text(conn.host)
-                                .font(.custom("JetBrainsMono-Regular", size: 15))
+                                .font(.appMonoRegular(size: 15))
                                 .foregroundColor(.white)
                             Text(":\(String(conn.port))")
-                                .font(.custom("JetBrainsMono-Regular", size: 12))
+                                .font(.appMonoRegular(size: 12))
                                 .foregroundColor(.white.opacity(0.3))
                         }
 
                         Spacer()
 
                         Text(conn.isUSB ? "USB" : "WiFi")
-                            .font(.custom("JetBrainsMono-Medium", size: 10))
+                            .font(.appMonoMedium(size: 10))
                             .foregroundColor(conn.isUSB ? Color(hex: 0xe8ff47) : Color(hex: 0x1D9E75))
                             .padding(.horizontal, 8)
                             .padding(.vertical, 4)

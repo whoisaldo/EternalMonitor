@@ -13,7 +13,7 @@ struct SettingsView: View {
                         Label("Resolution", systemImage: "rectangle.on.rectangle")
                         Spacer()
                         Text("1920 × 1080")
-                            .font(.custom("JetBrainsMono-Regular", size: 13))
+                            .font(.appMonoRegular(size: 13))
                             .foregroundColor(.secondary)
                     }
 
@@ -37,7 +37,7 @@ struct SettingsView: View {
                         Label("Codec", systemImage: "cpu")
                         Spacer()
                         Text("H.264 Baseline")
-                            .font(.custom("JetBrainsMono-Regular", size: 13))
+                            .font(.appMonoRegular(size: 13))
                             .foregroundColor(.secondary)
                     }
 
@@ -45,7 +45,7 @@ struct SettingsView: View {
                         Label("Quality", systemImage: "slider.horizontal.3")
                         Spacer()
                         Text("15 Mbps CBR")
-                            .font(.custom("JetBrainsMono-Regular", size: 13))
+                            .font(.appMonoRegular(size: 13))
                             .foregroundColor(.secondary)
                     }
                 } header: {
@@ -75,7 +75,7 @@ struct SettingsView: View {
                         Text("Version")
                         Spacer()
                         Text("0.1.0")
-                            .font(.custom("JetBrainsMono-Regular", size: 13))
+                            .font(.appMonoRegular(size: 13))
                             .foregroundColor(.secondary)
                     }
                 } header: {
@@ -98,7 +98,7 @@ struct SettingsView: View {
 
     private func sectionHeader(_ title: String) -> some View {
         Text(title)
-            .font(.custom("JetBrainsMono-Medium", size: 11))
+            .font(.appMonoMedium(size: 11))
             .foregroundColor(.white.opacity(0.4))
     }
 }
