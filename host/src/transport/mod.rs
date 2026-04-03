@@ -8,6 +8,7 @@ use tokio::sync::mpsc;
 use tracing::{info, warn};
 
 use crate::encoder::NALUnit;
+use crate::stats::PIPELINE_STATS;
 use fragment::{FragmentHeader, HEADER_SIZE, MAX_PAYLOAD_SIZE};
 
 /// Consumes NAL units from the encoder, serializes each as a FlatBuffer FramePacket,
@@ -23,26 +24,32 @@ pub async fn start_sender(
     socket.set_broadcast(true)?;
 
     let local_addr = socket.local_addr()?;
+    PIPELINE_STATS.lock().target_addr = target_addr.to_string();
     info!(%local_addr, %target_addr, "UDP transport sender started");
 
     while let Some(nal) = nal_rx.recv().await {
         let send_start = Instant::now();
 
-        let timestamp_us = nal
-            .timestamp
-            .duration_since(pipeline_epoch)
-            .as_micros() as u64;
+        let timestamp_us = nal.timestamp.duration_since(pipeline_epoch).as_micros() as u64;
 
         let seq = nal.sequence as u32;
+
+        // Detect IDR (keyframe) by scanning for NAL unit type 5 in Annex B stream
+        let is_keyframe = detect_idr(&nal.data);
+
+        // Use actual capture resolution from stats
+        let (w, h) = PIPELINE_STATS.lock().capture_resolution;
+        let width = if w > 0 { w } else { 1920 };
+        let height = if h > 0 { h } else { 1080 };
 
         // Serialize NAL unit as FlatBuffer FramePacket.
         let fb_bytes = eternal_proto::frame::serialize_frame_packet(
             seq,
             timestamp_us,
             &nal.data,
-            1920,
-            1080,
-            false, // TODO: detect keyframes from NAL unit type
+            width,
+            height,
+            is_keyframe,
         );
 
         // Fragment and send.
@@ -67,6 +74,10 @@ pub async fn start_sender(
             }
         }
 
+        PIPELINE_STATS
+            .lock()
+            .record_transport(total_bytes as u64, fragment_count as u64);
+
         let send_us = send_start.elapsed().as_micros();
         info!(
             seq,
@@ -79,4 +90,32 @@ pub async fn start_sender(
 
     info!("NAL channel closed, transport sender shutting down");
     Ok(())
+}
+
+/// Scan an Annex B NAL bitstream for IDR slice (NAL type 5) indicating a keyframe.
+fn detect_idr(data: &[u8]) -> bool {
+    let mut i = 0;
+    while i + 3 < data.len() {
+        // Look for start code (0x00 0x00 0x01) or (0x00 0x00 0x00 0x01)
+        if data[i] == 0 && data[i + 1] == 0 {
+            let (nal_start, _) = if data[i + 2] == 1 {
+                (i + 3, 3)
+            } else if i + 3 < data.len() && data[i + 2] == 0 && data[i + 3] == 1 {
+                (i + 4, 4)
+            } else {
+                i += 1;
+                continue;
+            };
+            if nal_start < data.len() {
+                let nal_type = data[nal_start] & 0x1F;
+                if nal_type == 5 {
+                    return true;
+                }
+            }
+            i = nal_start;
+        } else {
+            i += 1;
+        }
+    }
+    false
 }

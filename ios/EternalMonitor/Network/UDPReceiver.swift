@@ -7,17 +7,24 @@ final class UDPReceiver {
     let port: UInt16
     var assembler: FrameAssembler?
     var onConnectionEstablished: (() -> Void)?
+    var onError: ((String) -> Void)?
 
     private var listener: NWListener?
     private var activeConnection: NWConnection?
     private let queue = DispatchQueue(label: "com.eternal.udp", qos: .userInteractive)
+    private var expectedRemoteHost: String?
+    private var didEstablishConnection = false
 
     init(port: UInt16) {
         self.port = port
     }
 
-    /// Start listening for UDP datagrams. `host` is informational only — we listen on all interfaces.
-    func start(host: String) {
+    /// Start listening for UDP datagrams and optionally filter them to a specific sender.
+    @discardableResult
+    func start(host: String) -> Bool {
+        expectedRemoteHost = Self.normalizeHost(host)
+        didEstablishConnection = false
+
         let params = NWParameters.udp
         params.allowLocalEndpointReuse = true
         params.requiredLocalEndpoint = NWEndpoint.hostPort(
@@ -29,7 +36,8 @@ final class UDPReceiver {
             listener = try NWListener(using: params)
         } catch {
             print("[UDPReceiver] Failed to create listener: \(error)")
-            return
+            onError?("Failed to start UDP listener: \(error.localizedDescription)")
+            return false
         }
 
         listener?.stateUpdateHandler = { state in
@@ -38,6 +46,7 @@ final class UDPReceiver {
                 print("[UDPReceiver] Listening on port \(self.port)")
             case .failed(let error):
                 print("[UDPReceiver] Listener failed: \(error)")
+                self.onError?("UDP listener failed: \(error.localizedDescription)")
                 self.listener?.cancel()
             default:
                 break
@@ -46,13 +55,17 @@ final class UDPReceiver {
 
         listener?.newConnectionHandler = { [weak self] connection in
             guard let self else { return }
-            // Accept the first connection (the Windows host)
-            // Cancel any previous connection
+            guard self.shouldAccept(connection: connection) else {
+                connection.cancel()
+                return
+            }
+
             self.activeConnection?.cancel()
             self.activeConnection = connection
 
             connection.stateUpdateHandler = { state in
-                if case .ready = state {
+                if case .ready = state, !self.didEstablishConnection {
+                    self.didEstablishConnection = true
                     self.onConnectionEstablished?()
                 }
             }
@@ -62,6 +75,7 @@ final class UDPReceiver {
         }
 
         listener?.start(queue: queue)
+        return true
     }
 
     func stop() {
@@ -69,6 +83,8 @@ final class UDPReceiver {
         activeConnection = nil
         listener?.cancel()
         listener = nil
+        expectedRemoteHost = nil
+        didEstablishConnection = false
     }
 
     // MARK: - Receive loop
@@ -104,6 +120,18 @@ final class UDPReceiver {
             count: header.fragmentCount,
             payload: payload
         )
+    }
+
+    private func shouldAccept(connection: NWConnection) -> Bool {
+        guard let expectedRemoteHost else { return true }
+        guard case .hostPort(let host, _) = connection.endpoint else { return false }
+        return Self.normalizeHost(host.debugDescription) == expectedRemoteHost
+    }
+
+    private static func normalizeHost(_ host: String) -> String {
+        host.trimmingCharacters(in: CharacterSet(charactersIn: "[]"))
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
     }
 }
 

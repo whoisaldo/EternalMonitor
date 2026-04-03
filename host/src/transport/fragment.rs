@@ -29,6 +29,7 @@ impl FragmentHeader {
         buf
     }
 
+    #[allow(dead_code)]
     pub fn from_bytes(buf: &[u8; HEADER_SIZE]) -> Self {
         Self {
             seq: u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]),

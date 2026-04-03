@@ -1,36 +1,40 @@
 import Foundation
-import Network
 
 /// Discovered host on the local network.
 struct DiscoveredHost: Identifiable, Equatable {
-    var id: String { address }
+    var id: String { "\(name)|\(address)|\(port)" }
     let name: String
     let address: String
     let port: UInt16
 }
 
 /// Scans the local network for EternalMonitor hosts using Bonjour service discovery.
-/// The desktop sender does not currently advertise this service, so scanning fails
-/// safely instead of guessing across the subnet and returning false positives.
 @MainActor
-final class NetworkScanner: ObservableObject {
+final class NetworkScanner: NSObject, ObservableObject {
     @Published var hosts: [DiscoveredHost] = []
     @Published var isScanning = false
     @Published var statusMessage: String = ""
 
-    private var browser: NWBrowser?
+    private let browser = NetServiceBrowser()
+    private var resolvingServices: [String: NetService] = [:]
     private var scanTask: Task<Void, Never>?
+
+    override init() {
+        super.init()
+        browser.delegate = self
+    }
 
     func startScan() {
         guard !isScanning else { return }
         isScanning = true
         hosts = []
+        resolvingServices.removeAll()
         statusMessage = "Scanning network..."
 
-        startBonjourBrowse()
+        browser.searchForServices(ofType: "_eternaldisplay._udp.", inDomain: "local.")
 
         scanTask = Task { @MainActor in
-            try? await Task.sleep(nanoseconds: 3_000_000_000)
+            try? await Task.sleep(nanoseconds: 5_000_000_000)
             if !Task.isCancelled {
                 stopScan()
             }
@@ -38,58 +42,146 @@ final class NetworkScanner: ObservableObject {
     }
 
     func stopScan() {
-        browser?.cancel()
-        browser = nil
+        browser.stop()
+        resolvingServices.values.forEach { service in
+            service.stop()
+            service.delegate = nil
+        }
+        resolvingServices.removeAll()
         scanTask?.cancel()
         scanTask = nil
         isScanning = false
 
         if hosts.isEmpty {
-            statusMessage = "Auto-discovery unavailable until the host advertises itself. Enter the host IP manually."
+            statusMessage = "No hosts found. Make sure the Windows host is running on the same network."
         } else {
             statusMessage = "Found \(hosts.count) host\(hosts.count == 1 ? "" : "s")"
         }
     }
+}
 
-    // MARK: - Bonjour
+extension NetworkScanner: NetServiceBrowserDelegate, NetServiceDelegate {
+    nonisolated func netServiceBrowser(
+        _ browser: NetServiceBrowser,
+        didFind service: NetService,
+        moreComing: Bool
+    ) {
+        Task { @MainActor in
+            let key = Self.serviceKey(service)
+            guard resolvingServices[key] == nil else { return }
 
-    private func startBonjourBrowse() {
-        let descriptor = NWBrowser.Descriptor.bonjour(type: "_eternaldisplay._udp", domain: nil)
-        let browser = NWBrowser(for: descriptor, using: .udp)
+            service.delegate = self
+            resolvingServices[key] = service
+            service.resolve(withTimeout: 4)
 
-        browser.browseResultsChangedHandler = { [weak self] results, _ in
-            Task { @MainActor in
-                guard let self else { return }
-                self.hosts = results.compactMap(Self.discoveredHost(from:))
-                if !self.hosts.isEmpty {
-                    self.statusMessage = "Found \(self.hosts.count) host\(self.hosts.count == 1 ? "" : "s")"
-                }
+            if !moreComing {
+                statusMessage = "Resolving hosts..."
             }
         }
-
-        browser.stateUpdateHandler = { [weak self] state in
-            guard let self else { return }
-            if case .failed(let error) = state {
-                Task { @MainActor in
-                    self.statusMessage = "Scan failed: \(error.localizedDescription)"
-                    self.stopScan()
-                }
-            }
-        }
-
-        browser.start(queue: .main)
-        self.browser = browser
     }
 
-    private static func discoveredHost(from result: NWBrowser.Result) -> DiscoveredHost? {
-        switch result.endpoint {
-        case .service(let name, _, _, _):
-            return DiscoveredHost(name: name, address: name, port: 9876)
-        case .hostPort(let host, let port):
-            let address = host.debugDescription
-            return DiscoveredHost(name: address, address: address, port: port.rawValue)
-        default:
-            return nil
+    nonisolated func netServiceBrowser(
+        _ browser: NetServiceBrowser,
+        didRemove service: NetService,
+        moreComing: Bool
+    ) {
+        Task { @MainActor in
+            let key = Self.serviceKey(service)
+            resolvingServices.removeValue(forKey: key)
+            hosts.removeAll { $0.name == service.name }
+
+            if !moreComing {
+                statusMessage = hosts.isEmpty
+                    ? "No hosts found. Make sure the Windows host is running on the same network."
+                    : "Found \(hosts.count) host\(hosts.count == 1 ? "" : "s")"
+            }
+        }
+    }
+
+    nonisolated func netServiceBrowser(
+        _ browser: NetServiceBrowser,
+        didNotSearch errorDict: [String: NSNumber]
+    ) {
+        Task { @MainActor in
+            statusMessage = "Scan failed. Local network permission may be blocked."
+            stopScan()
+        }
+    }
+
+    nonisolated func netServiceDidResolveAddress(_ sender: NetService) {
+        Task { @MainActor in
+            let key = Self.serviceKey(sender)
+            defer { resolvingServices.removeValue(forKey: key) }
+
+            guard let host = Self.discoveredHost(from: sender) else { return }
+            hosts.removeAll { $0.name == host.name || $0.address == host.address }
+            hosts.append(host)
+            hosts.sort { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
+            statusMessage = "Found \(hosts.count) host\(hosts.count == 1 ? "" : "s")"
+        }
+    }
+
+    nonisolated func netService(_ sender: NetService, didNotResolve errorDict: [String: NSNumber]) {
+        Task { @MainActor in
+            resolvingServices.removeValue(forKey: Self.serviceKey(sender))
+            if hosts.isEmpty {
+                statusMessage = "Resolving hosts..."
+            }
+        }
+    }
+
+    private static func serviceKey(_ service: NetService) -> String {
+        "\(service.name)|\(service.type)|\(service.domain)"
+    }
+
+    private static func discoveredHost(from service: NetService) -> DiscoveredHost? {
+        guard let addresses = service.addresses else { return nil }
+
+        for data in addresses {
+            if let address = ipAddress(from: data, family: AF_INET) {
+                let port = service.port > 0 ? UInt16(service.port) : 9876
+                return DiscoveredHost(name: service.name, address: address, port: port)
+            }
+        }
+
+        for data in addresses {
+            if let address = ipAddress(from: data) {
+                let port = service.port > 0 ? UInt16(service.port) : 9876
+                return DiscoveredHost(name: service.name, address: address, port: port)
+            }
+        }
+
+        return nil
+    }
+
+    private static func ipAddress(from data: Data, family expectedFamily: Int32? = nil) -> String? {
+        data.withUnsafeBytes { rawBuffer in
+            guard let base = rawBuffer.baseAddress else { return nil }
+            let sockaddr = base.assumingMemoryBound(to: sockaddr.self)
+            let family = Int32(sockaddr.pointee.sa_family)
+
+            if let expectedFamily, family != expectedFamily {
+                return nil
+            }
+
+            switch family {
+            case AF_INET:
+                var addr = base.assumingMemoryBound(to: sockaddr_in.self).pointee.sin_addr
+                var buffer = [CChar](repeating: 0, count: Int(INET_ADDRSTRLEN))
+                guard inet_ntop(AF_INET, &addr, &buffer, socklen_t(buffer.count)) != nil else {
+                    return nil
+                }
+                return String(cString: buffer)
+            case AF_INET6:
+                var addr = base.assumingMemoryBound(to: sockaddr_in6.self).pointee.sin6_addr
+                var buffer = [CChar](repeating: 0, count: Int(INET6_ADDRSTRLEN))
+                guard inet_ntop(AF_INET6, &addr, &buffer, socklen_t(buffer.count)) != nil else {
+                    return nil
+                }
+                return String(cString: buffer)
+            default:
+                return nil
+            }
         }
     }
 }

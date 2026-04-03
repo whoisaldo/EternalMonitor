@@ -4,21 +4,20 @@ use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 use windows::core::Interface;
+
+use crate::stats::PIPELINE_STATS;
 use windows::Win32::Foundation::RECT;
 use windows::Win32::Graphics::Direct3D::D3D_DRIVER_TYPE_UNKNOWN;
 use windows::Win32::Graphics::Direct3D11::{
-    D3D11CreateDevice, ID3D11Device, ID3D11DeviceContext, ID3D11Texture2D,
-    D3D11_CPU_ACCESS_READ, D3D11_CREATE_DEVICE_BGRA_SUPPORT,
-    D3D11_MAP_READ, D3D11_MAPPED_SUBRESOURCE, D3D11_SDK_VERSION, D3D11_TEXTURE2D_DESC,
-    D3D11_USAGE_STAGING,
+    D3D11CreateDevice, ID3D11Device, ID3D11DeviceContext, ID3D11Texture2D, D3D11_CPU_ACCESS_READ,
+    D3D11_CREATE_DEVICE_BGRA_SUPPORT, D3D11_MAPPED_SUBRESOURCE, D3D11_MAP_READ, D3D11_SDK_VERSION,
+    D3D11_TEXTURE2D_DESC, D3D11_USAGE_STAGING,
 };
+use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_SAMPLE_DESC};
 use windows::Win32::Graphics::Dxgi::{
     CreateDXGIFactory1, IDXGIAdapter1, IDXGIFactory1, IDXGIOutput, IDXGIOutput1,
     IDXGIOutputDuplication, IDXGIResource, DXGI_ERROR_ACCESS_LOST, DXGI_ERROR_WAIT_TIMEOUT,
     DXGI_OUTDUPL_FRAME_INFO,
-};
-use windows::Win32::Graphics::Dxgi::Common::{
-    DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_SAMPLE_DESC,
 };
 
 const TARGET_FPS: u64 = 60;
@@ -28,6 +27,7 @@ const FPS_WINDOW: usize = 60;
 
 /// Frame data sent downstream for encoding/transport.
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct RawFrame {
     pub frame_number: u64,
     pub timestamp: Instant,
@@ -104,7 +104,11 @@ fn run_capture_loop(
     let dupl_desc = unsafe { duplication.GetDesc() };
     let tex_width = dupl_desc.ModeDesc.Width;
     let tex_height = dupl_desc.ModeDesc.Height;
-    info!(width = tex_width, height = tex_height, "Desktop duplication dimensions");
+    info!(
+        width = tex_width,
+        height = tex_height,
+        "Desktop duplication dimensions"
+    );
 
     // --- Create staging texture for CPU readback (reused every frame) ---
     let staging_desc = D3D11_TEXTURE2D_DESC {
@@ -155,11 +159,8 @@ fn run_capture_loop(
                 frame_number += 1;
 
                 // --- Get dirty rect count ---
-                let dirty_count = get_dirty_rect_count(
-                    &duplication,
-                    &frame_info,
-                    &mut dirty_rect_buf,
-                );
+                let dirty_count =
+                    get_dirty_rect_count(&duplication, &frame_info, &mut dirty_rect_buf);
 
                 // --- Rolling FPS (60-frame window) ---
                 let now = Instant::now();
@@ -199,7 +200,9 @@ fn run_capture_loop(
                             }
 
                             // Release acquired frame — staging texture has its own copy
-                            unsafe { duplication.ReleaseFrame()?; }
+                            unsafe {
+                                duplication.ReleaseFrame()?;
+                            }
 
                             // Map staging texture for CPU read
                             let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
@@ -228,20 +231,29 @@ fn run_capture_loop(
                                 }
                             }
 
-                            unsafe { device_context.Unmap(&staging_texture, 0); }
+                            unsafe {
+                                device_context.Unmap(&staging_texture, 0);
+                            }
 
                             pixel_buf.clone()
                         }
                         Err(e) => {
                             warn!(error = %e, "Failed to cast IDXGIResource to ID3D11Texture2D");
-                            unsafe { duplication.ReleaseFrame()?; }
+                            unsafe {
+                                duplication.ReleaseFrame()?;
+                            }
                             Vec::new()
                         }
                     }
                 } else {
-                    unsafe { duplication.ReleaseFrame()?; }
+                    unsafe {
+                        duplication.ReleaseFrame()?;
+                    }
                     Vec::new()
                 };
+
+                // Record stats
+                PIPELINE_STATS.lock().record_capture(tex_width, tex_height);
 
                 // Send downstream
                 let raw_frame = RawFrame {
