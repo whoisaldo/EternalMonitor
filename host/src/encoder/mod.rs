@@ -4,12 +4,14 @@ use tokio::sync::mpsc;
 use tracing::{error, info, warn};
 
 use crate::capture::RawFrame;
+use crate::stats::PIPELINE_STATS;
 
 const CHANNEL_CAPACITY: usize = 4;
 const DEFAULT_BITRATE: usize = 15_000_000; // 15 Mbps
 
 /// Encoded H.264 NAL unit ready for transport.
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct NALUnit {
     pub data: Vec<u8>,
     pub sequence: u64,
@@ -65,7 +67,12 @@ fn run_encode_loop(
     opts.set("rc", "cbr");
 
     let mut encoder = encoder.open_with(opts)?;
-    info!(width, height, bitrate = DEFAULT_BITRATE, "NVENC encoder opened");
+    info!(
+        width,
+        height,
+        bitrate = DEFAULT_BITRATE,
+        "NVENC encoder opened"
+    );
 
     // --- swscale BGRA → YUV420P ---
     let mut scaler = ffmpeg_next::software::scaling::Context::get(
@@ -80,15 +87,20 @@ fn run_encode_loop(
     info!("swscale BGRA->YUV420P context created");
 
     // --- Reusable frames and packet ---
-    let mut bgra_frame = ffmpeg_next::frame::Video::new(ffmpeg_next::format::Pixel::BGRA, width, height);
-    let mut frame = ffmpeg_next::frame::Video::new(ffmpeg_next::format::Pixel::YUV420P, width, height);
+    let mut bgra_frame =
+        ffmpeg_next::frame::Video::new(ffmpeg_next::format::Pixel::BGRA, width, height);
+    let mut frame =
+        ffmpeg_next::frame::Video::new(ffmpeg_next::format::Pixel::YUV420P, width, height);
     let mut packet = ffmpeg_next::Packet::empty();
 
     // --- Blocking receive loop ---
     let mut rx = rx;
     while let Some(raw_frame) = rx.blocking_recv() {
         if raw_frame.data.is_empty() {
-            warn!(frame = raw_frame.frame_number, "Skipping frame with empty data");
+            warn!(
+                frame = raw_frame.frame_number,
+                "Skipping frame with empty data"
+            );
             continue;
         }
 
@@ -115,10 +127,11 @@ fn run_encode_loop(
             match encoder.receive_packet(&mut packet) {
                 Ok(()) => {
                     let encode_us = encode_start.elapsed().as_micros();
-                    let nal_data = packet
-                        .data()
-                        .map(|d| d.to_vec())
-                        .unwrap_or_default();
+                    let nal_data = packet.data().map(|d| d.to_vec()).unwrap_or_default();
+
+                    PIPELINE_STATS
+                        .lock()
+                        .record_encode(encode_us, nal_data.len());
 
                     info!(
                         frame = raw_frame.frame_number,
