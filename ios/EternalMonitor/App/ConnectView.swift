@@ -64,19 +64,12 @@ struct ConnectView: View {
 
     private var logoSection: some View {
         VStack(spacing: 12) {
-            // E lettermark
-            Text("E")
-                .font(.custom("Syne-Bold", size: 64))
-                .foregroundColor(Color(hex: 0xe8ff47))
+            // App logo
+            Image("LogoImage")
+                .resizable()
+                .aspectRatio(contentMode: .fit)
                 .frame(width: 88, height: 88)
-                .background(
-                    RoundedRectangle(cornerRadius: 20)
-                        .fill(Color(hex: 0xe8ff47).opacity(0.1))
-                        .overlay(
-                            RoundedRectangle(cornerRadius: 20)
-                                .strokeBorder(Color(hex: 0xe8ff47).opacity(0.3), lineWidth: 1)
-                        )
-                )
+                .clipShape(RoundedRectangle(cornerRadius: 20))
 
             Text("EternalMonitor")
                 .font(.custom("Syne-Bold", size: 32))
