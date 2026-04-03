@@ -1,5 +1,3 @@
-use std::net::SocketAddr;
-
 use mdns_sd::{ServiceDaemon, ServiceInfo};
 use tracing::{error, info};
 
@@ -12,8 +10,7 @@ const INSTANCE_NAME: &str = "EternalMonitor";
 /// so the iOS app's NetworkScanner (NWBrowser) can discover it.
 ///
 /// Returns the `ServiceDaemon` handle — dropping it unregisters the service.
-pub fn advertise_service(target_addr: SocketAddr) -> Option<ServiceDaemon> {
-    let port = target_addr.port();
+pub fn advertise_service(port: u16) -> Option<ServiceDaemon> {
 
     let mdns = match ServiceDaemon::new() {
         Ok(d) => d,
