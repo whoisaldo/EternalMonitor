@@ -378,7 +378,7 @@ struct ConnectView: View {
 
                         Spacer()
 
-                        Text(":\(host.port)")
+                        Text(":\(String(host.port))")
                             .font(.custom("JetBrainsMono-Regular", size: 12))
                             .foregroundColor(.white.opacity(0.3))
 
@@ -427,7 +427,7 @@ struct ConnectView: View {
                             Text(conn.host)
                                 .font(.custom("JetBrainsMono-Regular", size: 15))
                                 .foregroundColor(.white)
-                            Text(":\(conn.port)")
+                            Text(":\(String(conn.port))")
                                 .font(.custom("JetBrainsMono-Regular", size: 12))
                                 .foregroundColor(.white.opacity(0.3))
                         }
