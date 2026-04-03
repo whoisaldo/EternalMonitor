@@ -1,6 +1,11 @@
 mod capture;
+mod encoder;
+mod transport;
 
-use tracing::info;
+use std::net::SocketAddr;
+use std::time::Instant;
+
+use tracing::{error, info};
 use tracing_subscriber::EnvFilter;
 
 #[tokio::main]
@@ -12,16 +17,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with_target(false)
         .init();
 
-    info!("EternalMonitor host starting");
+    let target_addr: SocketAddr = std::env::args()
+        .nth(1)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or_else(|| "192.168.1.255:9876".parse().unwrap());
 
-    // Run the blocking DXGI capture loop on a dedicated thread.
-    let capture_handle = tokio::task::spawn_blocking(|| {
-        if let Err(e) = capture::run_capture_loop() {
-            tracing::error!(error = %e, "Capture loop exited with error");
-        }
-    });
+    info!(%target_addr, "EternalMonitor host starting");
 
-    capture_handle.await?;
+    ffmpeg_next::init()?;
 
+    let pipeline_epoch = Instant::now();
+    let capture_rx = capture::start_capture();
+    let nal_rx = encoder::start_encoder(capture_rx, 1920, 1080);
+
+    let sender_handle = tokio::spawn(
+        transport::start_sender(nal_rx, target_addr, pipeline_epoch),
+    );
+
+    if let Err(e) = sender_handle.await? {
+        error!(error = %e, "Transport sender exited with error");
+    }
+
+    info!("Pipeline ended");
     Ok(())
 }
