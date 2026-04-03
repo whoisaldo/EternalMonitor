@@ -45,9 +45,18 @@ cargo run -p eternal-host
 
 Set `RUST_LOG=debug` for per-frame stats.
 
+The iOS app is defined with XcodeGen:
+
+```bash
+cd ios
+xcodegen generate
+```
+
+Then open the generated Xcode project on macOS and run the `EternalMonitor` target.
+
 ## Status
 
-Phase 1 — DXGI capture loop is implemented. Encoding, transport, driver, and iPad app are not built yet. See [ROADMAP.md](ROADMAP.md) for the full plan.
+The Windows host now has capture, encode, and UDP transport scaffolding, and the iOS app includes receiver, reassembly, decode, and rendering scaffolding. Driver integration and end-to-end production hardening are still in progress. See [ROADMAP.md](ROADMAP.md) for the full plan.
 
 ## License
 
