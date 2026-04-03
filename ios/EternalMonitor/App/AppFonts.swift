@@ -1,5 +1,6 @@
 import SwiftUI
 import CoreText
+import CoreFoundation
 import os
 
 enum AppFontStyle {
@@ -58,7 +59,13 @@ final class FontRegistry: @unchecked Sendable {
             if CTFontManagerRegisterFontsForURL(url as CFURL, .process, &error) {
                 logger.info("Registered bundled font at \(url.lastPathComponent, privacy: .public)")
             } else if let error {
-                logger.error("Font registration failed for \(url.lastPathComponent, privacy: .public): \(error.takeRetainedValue().localizedDescription, privacy: .public)")
+                let resolvedError = error.takeRetainedValue()
+                let code = CFErrorGetCode(resolvedError)
+                if code == CTFontManagerError.alreadyRegistered.rawValue {
+                    logger.info("Font already registered at \(url.lastPathComponent, privacy: .public)")
+                } else {
+                    logger.error("Font registration failed for \(url.lastPathComponent, privacy: .public): \(resolvedError.localizedDescription, privacy: .public)")
+                }
             }
 
             if let descriptors = CTFontManagerCreateFontDescriptorsFromURL(url as CFURL) as? [CTFontDescriptor] {

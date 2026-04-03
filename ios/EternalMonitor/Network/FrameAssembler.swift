@@ -4,14 +4,15 @@ import Foundation
 /// Called exclusively from the UDP receiver's serial queue — no locking needed.
 final class FrameAssembler {
     var onFrameAssembled: ((Data) -> Void)?
+    var onDiagnostic: ((String) -> Void)?
 
     private var pending: [UInt32: PendingFrame] = [:]
     private var latestCompletedSeq: UInt32 = 0
     private var cleanupCounter: UInt32 = 0
 
     struct PendingFrame {
-        let fragmentCount: UInt8
-        var fragments: [UInt8: Data]
+        let fragmentCount: UInt16
+        var fragments: [UInt16: Data]
         let createdAt: UInt64  // mach_absolute_time
 
         var isComplete: Bool {
@@ -19,14 +20,30 @@ final class FrameAssembler {
         }
     }
 
-    func addFragment(seq: UInt32, index: UInt8, count: UInt8, payload: Data) {
+    func addFragment(seq: UInt32, index: UInt16, count: UInt16, payload: Data) {
         // Drop stale fragments (seq older than latest completed)
         if seq <= latestCompletedSeq && latestCompletedSeq > 0 {
             return
         }
 
+        guard count > 0 else {
+            onDiagnostic?("Dropped fragment for seq=\(seq) with zero fragment count")
+            return
+        }
+        guard index < count else {
+            onDiagnostic?("Dropped fragment for seq=\(seq) with out-of-range index \(index)/\(count)")
+            return
+        }
+
         // Get or create pending frame
         if pending[seq] == nil {
+            pending[seq] = PendingFrame(
+                fragmentCount: count,
+                fragments: [:],
+                createdAt: mach_absolute_time()
+            )
+        } else if pending[seq]?.fragmentCount != count {
+            onDiagnostic?("Reset reassembly for seq=\(seq) because fragment count changed from \(pending[seq]!.fragmentCount) to \(count)")
             pending[seq] = PendingFrame(
                 fragmentCount: count,
                 fragments: [:],
@@ -43,6 +60,10 @@ final class FrameAssembler {
             for i in 0..<frame.fragmentCount {
                 if let fragment = frame.fragments[i] {
                     assembled.append(fragment)
+                } else {
+                    onDiagnostic?("Reassembly gap for seq=\(seq) at fragment \(i)")
+                    pending.removeValue(forKey: seq)
+                    return
                 }
             }
 

@@ -165,26 +165,25 @@ final class UDPReceiver {
 
 // MARK: - FragmentHeader
 
-/// Wire format (little-endian, 12 bytes):
+/// Wire format (little-endian, 16 bytes):
 ///   [0..4]  seq: u32
-///   [4]     fragment_index: u8
-///   [5]     fragment_count: u8
-///   [6..8]  reserved (zero)
+///   [4..6]  fragment_index: u16
+///   [6..8]  fragment_count: u16
 ///   [8..12] payload_len: u32
+///   [12..16] reserved (zero)
 struct FragmentHeader {
-    static let size = 12
+    static let size = 16
 
     let seq: UInt32
-    let fragmentIndex: UInt8
-    let fragmentCount: UInt8
+    let fragmentIndex: UInt16
+    let fragmentCount: UInt16
     let payloadLen: UInt32
 
     init?(data: Data) {
         guard data.count >= Self.size else { return nil }
         seq = data.withUnsafeBytes { $0.loadUnaligned(fromByteOffset: 0, as: UInt32.self).littleEndian }
-        fragmentIndex = data[4]
-        fragmentCount = data[5]
-        // bytes 6-7 reserved
+        fragmentIndex = data.withUnsafeBytes { $0.loadUnaligned(fromByteOffset: 4, as: UInt16.self).littleEndian }
+        fragmentCount = data.withUnsafeBytes { $0.loadUnaligned(fromByteOffset: 6, as: UInt16.self).littleEndian }
         payloadLen = data.withUnsafeBytes { $0.loadUnaligned(fromByteOffset: 8, as: UInt32.self).littleEndian }
     }
 }
