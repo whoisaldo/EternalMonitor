@@ -1,110 +1,125 @@
 # EternalMonitor — Architecture
 
-## Pipeline overview
+## Current pipeline
 
-```
+```text
 [Windows desktop]
-      │
-      ▼
-┌─────────────────────────────────────────────┐
-│              host/  (Rust daemon)            │
-│                                             │
-│  DXGI Desktop Duplication                  │
-│    └─ dirty-rect frame pull (GPU surface)  │
-│         │                                  │
-│  ffmpeg-next encoder (NVENC / H.264 / H.265) │
-│    └─ GPU encode ~1–2ms per frame          │
-│         │                                  │
-│  tokio async transport                     │
-│    ├─ UDP socket  (WiFi path)              │
-│    └─ libusb bulk (USB path)              │
-│                                             │
-│  Connection broker                          │
-│    ├─ mDNS discovery                       │
-│    ├─ auth handshake                       │
-│    └─ reconnect logic                      │
-└─────────────────────────────────────────────┘
-      │                        ▲
-      │  encoded frames        │  HID input events
-      ▼                        │
-┌─────────────────────────────────────────────┐
-│              ios/  (Swift app)               │
-│                                             │
-│  Receiver                                  │
-│    ├─ Network Extension (WiFi)             │
-│    └─ USB CDC / usbmuxd (USB)             │
-│         │                                  │
-│  VideoToolbox decoder                      │
-│    └─ HW H.264/H.265 decode ~0.5ms        │
-│         │                                  │
-│  Metal renderer                            │
-│    └─ CADisplayLink @ 120Hz               │
-│         │                                  │
-│  Input relay                               │
-│    └─ touch/pencil → HID events → host    │
-└─────────────────────────────────────────────┘
+      |
+      v
++---------------------------------------------+
+| host/ (Rust Windows app)                    |
+|                                             |
+| DXGI Desktop Duplication                    |
+|   -> primary display capture                |
+|   -> CPU-readable BGRA frame                |
+|                                             |
+| ffmpeg-next + NVENC                         |
+|   -> BGRA to YUV420P                        |
+|   -> H.264 encode                           |
+|                                             |
+| UDP transport                               |
+|   -> FlatBuffer FramePacket                 |
+|   -> custom fragmentation header            |
+|   -> mDNS advertisement                     |
++---------------------------------------------+
+      |
+      v
++---------------------------------------------+
+| ios/ (Swift iPad app)                       |
+|                                             |
+| Connect UI                                  |
+|   -> manual IP entry                        |
+|   -> Bonjour scan attempt                   |
+|                                             |
+| UDP receiver                                |
+|   -> fragment reassembly                    |
+|   -> FramePacket parse                      |
+|                                             |
+| VideoToolbox                                |
+|   -> H.264 decode                           |
+|                                             |
+| Metal MTKView                               |
+|   -> render latest decoded frame            |
++---------------------------------------------+
 ```
 
-## Virtual display driver (driver/)
+## What is implemented
 
-- Based on **IddCx** (Indirect Display Driver) Windows DDI
-- Windows sees a real monitor — not a mirror
-- Reports EDID matching iPad Pro resolution (2732×2048 or 1668×2388)
-- Fork starting point: `usbmmidd` open-source IddCx driver
-- Installed once; persists across reboots
+### Capture
 
-## Capture (host/capture)
+- API: DXGI Desktop Duplication
+- Current behavior: captures the primary output and copies it into a CPU-readable staging texture
+- Output format passed downstream: BGRA frame buffer plus frame metadata
 
-- **API:** DXGI Desktop Duplication (`IDXGIOutputDuplication`)
-- Pulls frames as GPU textures — never touches CPU memory
-- Dirty-rect metadata used to skip encoding unchanged regions
-- Target: <1ms frame acquisition
+This is functional but not yet the final zero-copy path described in earlier docs.
 
-## Encoder (host/encoder)
+### Encode
 
-- **Crate:** `ffmpeg-next` with NVENC backend (NVIDIA GPU)
-- Primary: H.264 Baseline (universal decode on iPad)
-- Secondary: H.265 Main (higher quality mode, slightly higher decode cost)
-- 1 frame of encode latency max — no B-frames, no lookahead
-- Bitrate: adaptive, ~8–20 Mbps depending on content
+- Crate: `ffmpeg-next`
+- Codec path: `h264_nvenc`
+- Current codec settings:
+  - H.264
+  - `baseline` profile
+  - `gop=30`
+  - `max_b_frames=0`
+  - `zerolatency=1`
+  - `rc=cbr`
 
-## Transport (host/transport)
+The encoder emits Annex B H.264 byte streams that are wrapped in `FramePacket`.
 
-### WiFi (UDP)
-- Raw UDP datagrams, MTU-aware fragmentation
-- Lightweight reliability: selective NACK, no head-of-line blocking
-- Estimated latency: 16–30ms glass-to-glass
+### Transport
 
-### USB (bulk transfer)
-- `libusb` on Windows host
-- iPad side: custom USB CDC class or usbmuxd tunnel
-- Estimated latency: 4–8ms glass-to-glass
-- Automatically preferred when USB detected
+- Current transport: WiFi/local-network UDP only
+- Registration handshake: iPad sends `ETERNALHELLO` plus its listen port
+- Packetization:
+  - each encoded frame becomes one FlatBuffer `FramePacket`
+  - payload is fragmented into MTU-sized UDP datagrams
+  - fragment header is currently `16` bytes
+  - fragment index and fragment count are `u16`
 
-## Protocol (proto/)
+The `u16` fragment-count change is important. Older host and iPad builds are not wire-compatible with the current transport fix.
 
-- **Format:** FlatBuffers (zero-copy, no parse overhead)
-- Message types:
-  - `FramePacket` — encoded video chunk + sequence number + timestamp
-  - `InputEvent` — touch/pencil coords, pressure, HID keycode
-  - `ControlMsg` — connect/disconnect/ping/display-config
-  - `DisplayConfig` — resolution, refresh rate, HDR flag
+### Discovery
 
-## iPad app (ios/)
+- Host side: advertises `_eternaldisplay._udp.local.` over mDNS/DNS-SD
+- iPad side: scans via `NetServiceBrowser`
 
-- **Language:** Swift
-- **Decoder:** `VideoToolbox` VTDecompressionSession, async callback
-- **Renderer:** Metal `MTKView` with `CADisplayLink` locked to 120Hz ProMotion
-- **Buffer strategy:** 1-frame jitter buffer max; drop rather than queue
-- **Input:** UITouch + Apple Pencil → serialize → send back on same socket
+This exists in code, but it is not reliable enough to treat as finished. Direct IP connect is the known-good path.
 
-## Latency budget (USB target: <20ms)
+### iPad receive/decode/render
 
-| Stage | Budget |
-|-------|--------|
-| DXGI frame pull | ~0.5ms |
-| NVENC H.264 encode | ~1.5ms |
-| USB bulk transfer | ~4ms |
-| VideoToolbox decode | ~0.5ms |
-| Metal render + display | ~8ms (1 frame @ 120Hz) |
-| **Total** | **~14.5ms** |
+- UDP datagrams are received with `NWConnection`
+- Fragments are reassembled by sequence number
+- `FramePacket` is parsed manually from FlatBuffers
+- H.264 is decoded with `VTDecompressionSession`
+- Frames are rendered with `MTKView`
+
+The renderer currently keeps the latest available decoded texture and draws that.
+
+## Protocol
+
+Implemented message shape in active use:
+
+- `FramePacket`
+  - `seq`
+  - `timestamp_us`
+  - `data`
+  - `width`
+  - `height`
+  - `is_keyframe`
+
+Not all planned protocol families are implemented yet. `InputEvent`, richer control messages, and display configuration exchange are still roadmap items.
+
+## Known-good state
+
+- Working end-to-end UDP stream: commit `bc44770`
+- Manual IP connect works
+- Network scan/discovery may still fail even when streaming works
+
+## Not implemented yet
+
+- Virtual display driver path
+- USB transport
+- Reverse input channel
+- Reliability controls such as selective NACK
+- Dynamic transport switching
