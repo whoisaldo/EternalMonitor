@@ -34,8 +34,7 @@ enum AppFontStyle {
     }
 }
 
-@MainActor
-final class FontRegistry {
+final class FontRegistry: @unchecked Sendable {
     static let shared = FontRegistry()
 
     private(set) var availablePostScriptNames: Set<String> = []
@@ -71,7 +70,8 @@ final class FontRegistry {
             }
         }
 
-        logger.info("Available app fonts: \(self.availablePostScriptNames.sorted().joined(separator: \", \"), privacy: .public)")
+        let fontList = self.availablePostScriptNames.sorted().joined(separator: ", ")
+        logger.info("Available app fonts: \(fontList, privacy: .public)")
     }
 
     private func bundledFontURLs() -> [URL] {

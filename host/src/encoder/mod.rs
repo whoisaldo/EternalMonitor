@@ -58,6 +58,7 @@ fn run_encode_loop(
     encoder.set_time_base(ffmpeg_next::Rational(1, 60));
     encoder.set_max_b_frames(0);
     encoder.set_bit_rate(DEFAULT_BITRATE);
+    encoder.set_gop(30); // IDR every 30 frames (~0.5s) so new clients can start decoding quickly
 
     let mut opts = ffmpeg_next::Dictionary::new();
     opts.set("preset", "p1");
