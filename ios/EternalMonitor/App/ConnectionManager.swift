@@ -103,6 +103,12 @@ final class ConnectionManager: ObservableObject {
         let assembler = FrameAssembler()
         let receiver = UDPReceiver(port: port)
 
+        assembler.onDiagnostic = { [weak self] message in
+            Task { @MainActor in
+                self?.record(.warning, "assembly", message)
+            }
+        }
+
         decoder.onFrameDecoded = { [weak self] pixelBuffer, timestampUs in
             guard let self else { return }
             // Store frame in lock-protected slot (no Sendable boundary crossed)
