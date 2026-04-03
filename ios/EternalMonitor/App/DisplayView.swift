@@ -76,11 +76,11 @@ struct DisplayView: View {
     private func statLabel(_ value: String, unit: String) -> some View {
         HStack(spacing: 3) {
             Text(value)
-                .font(.custom("JetBrainsMono-Medium", size: 12))
+                .font(.appMonoMedium(size: 12))
                 .foregroundColor(.white)
             if !unit.isEmpty {
                 Text(unit)
-                    .font(.custom("JetBrainsMono-Regular", size: 10))
+                    .font(.appMonoRegular(size: 10))
                     .foregroundColor(.white.opacity(0.5))
             }
         }
@@ -103,14 +103,14 @@ struct DisplayView: View {
                     .frame(width: 8, height: 8)
 
                 Text("Connected")
-                    .font(.custom("JetBrainsMono-Regular", size: 12))
+                    .font(.appMonoRegular(size: 12))
                     .foregroundColor(.white.opacity(0.7))
 
                 Text("·")
                     .foregroundColor(.white.opacity(0.3))
 
                 Text(connectionManager.transportMode)
-                    .font(.custom("JetBrainsMono-Medium", size: 12))
+                    .font(.appMonoMedium(size: 12))
                     .foregroundColor(Color(hex: 0x1D9E75))
             }
             .padding(.horizontal, 14)
@@ -131,7 +131,7 @@ struct DisplayView: View {
                 connectionManager.disconnect()
             } label: {
                 Text("Disconnect")
-                    .font(.custom("JetBrainsMono-Medium", size: 12))
+                    .font(.appMonoMedium(size: 12))
                     .foregroundColor(Color(hex: 0xe8ff47))
                     .padding(.horizontal, 14)
                     .padding(.vertical, 8)

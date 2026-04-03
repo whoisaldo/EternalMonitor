@@ -2,7 +2,8 @@ import Foundation
 import Network
 
 /// Receives UDP datagrams on a specified port, parses FragmentHeader, and feeds fragments
-/// to the FrameAssembler. Uses Network.framework NWListener for UDP.
+/// to the FrameAssembler. Uses a single UDP connection bound to the local listening port
+/// so HELLO registration and frame reception happen on the same socket.
 final class UDPReceiver {
     let port: UInt16
     var assembler: FrameAssembler?
@@ -14,9 +15,7 @@ final class UDPReceiver {
     var onDatagramReceived: ((Int) -> Void)?
     var onDatagramIgnored: ((String) -> Void)?
 
-    private var listener: NWListener?
-    private var activeConnection: NWConnection?
-    private var helloConnection: NWConnection?
+    private var connection: NWConnection?
     private let queue = DispatchQueue(label: "com.eternal.udp", qos: .userInteractive)
     private var expectedRemoteHost: String?
     private var didEstablishConnection = false
@@ -39,54 +38,38 @@ final class UDPReceiver {
             port: NWEndpoint.Port(rawValue: port)!
         )
 
-        do {
-            listener = try NWListener(using: params)
-        } catch {
-            print("[UDPReceiver] Failed to create listener: \(error)")
-            onError?("Failed to start UDP listener: \(error.localizedDescription)")
-            return false
-        }
+        let endpoint = NWEndpoint.hostPort(
+            host: NWEndpoint.Host(host),
+            port: NWEndpoint.Port(rawValue: port)!
+        )
 
-        listener?.stateUpdateHandler = { [weak self] state in
+        let connection = NWConnection(to: endpoint, using: params)
+        connection.stateUpdateHandler = { [weak self] state in
             guard let self else { return }
             switch state {
             case .ready:
-                let actualPort = self.listener?.port?.rawValue ?? self.port
+                let actualPort = self.port
                 print("[UDPReceiver] Listening on port \(actualPort)")
                 self.onListenerReady?(actualPort)
-                // Send HELLO to the host so it knows our address
                 self.sendHello(to: host)
+                if !self.didEstablishConnection {
+                    self.didEstablishConnection = true
+                    self.onConnectionEstablished?()
+                }
+                self.receiveLoop()
             case .failed(let error):
-                print("[UDPReceiver] Listener failed: \(error)")
-                self.onError?("UDP listener failed: \(error.localizedDescription)")
-                self.listener?.cancel()
+                print("[UDPReceiver] Connection failed: \(error)")
+                self.onError?("UDP connection failed: \(error.localizedDescription)")
+                connection.cancel()
+            case .cancelled:
+                break
             default:
                 break
             }
         }
 
-        listener?.newConnectionHandler = { [weak self] connection in
-            guard let self else { return }
-            guard self.shouldAccept(connection: connection) else {
-                connection.cancel()
-                return
-            }
-
-            self.activeConnection?.cancel()
-            self.activeConnection = connection
-
-            connection.stateUpdateHandler = { state in
-                if case .ready = state, !self.didEstablishConnection {
-                    self.didEstablishConnection = true
-                    self.onConnectionEstablished?()
-                }
-            }
-
-            connection.start(queue: self.queue)
-            self.receiveLoop(on: connection)
-        }
-
-        listener?.start(queue: queue)
+        self.connection = connection
+        connection.start(queue: queue)
         return true
     }
 
@@ -103,51 +86,40 @@ final class UDPReceiver {
     /// Send a HELLO registration packet to the host so it streams frames to us.
     /// Sends multiple times to handle packet loss.
     private func sendHello(to host: String) {
+        guard let connection else {
+            onHelloFailure?("UDP connection not available")
+            return
+        }
         let payload = helloPayload()
-        let endpoint = NWEndpoint.hostPort(
-            host: NWEndpoint.Host(host),
-            port: NWEndpoint.Port(rawValue: port)!
-        )
-        let conn = NWConnection(to: endpoint, using: .udp)
-        conn.stateUpdateHandler = { [weak self] state in
-            guard let self else { return }
-            if case .ready = state {
-                // Send HELLO a few times to be safe
-                let attempts = 3
-                for i in 0..<attempts {
-                    let delay = DispatchTime.now() + .milliseconds(i * 200)
-                    self.queue.asyncAfter(deadline: delay) {
-                        self.onHelloAttempt?(i + 1, attempts, host, self.port)
-                        conn.send(content: payload, completion: .contentProcessed { error in
-                            if let error {
-                                print("[UDPReceiver] HELLO send error: \(error)")
-                                self.onHelloFailure?(error.localizedDescription)
-                            } else {
-                                print("[UDPReceiver] HELLO sent to \(host):\(self.port)")
-                            }
-                        })
+        let attempts = 3
+        for i in 0..<attempts {
+            let delay = DispatchTime.now() + .milliseconds(i * 200)
+            queue.asyncAfter(deadline: delay) { [weak self] in
+                guard let self else { return }
+                self.onHelloAttempt?(i + 1, attempts, host, self.port)
+                connection.send(content: payload, completion: .contentProcessed { error in
+                    if let error {
+                        print("[UDPReceiver] HELLO send error: \(error)")
+                        self.onHelloFailure?(error.localizedDescription)
+                    } else {
+                        print("[UDPReceiver] HELLO sent to \(host):\(self.port)")
                     }
-                }
+                })
             }
         }
-        conn.start(queue: queue)
-        helloConnection = conn
     }
 
     func stop() {
-        helloConnection?.cancel()
-        helloConnection = nil
-        activeConnection?.cancel()
-        activeConnection = nil
-        listener?.cancel()
-        listener = nil
+        connection?.cancel()
+        connection = nil
         expectedRemoteHost = nil
         didEstablishConnection = false
     }
 
     // MARK: - Receive loop
 
-    private func receiveLoop(on connection: NWConnection) {
+    private func receiveLoop() {
+        guard let connection else { return }
         connection.receiveMessage { [weak self] content, _, isComplete, error in
             guard let self else { return }
 
@@ -165,7 +137,7 @@ final class UDPReceiver {
             }
 
             // Continue receiving
-            self.receiveLoop(on: connection)
+            self.receiveLoop()
         }
     }
 
@@ -182,12 +154,6 @@ final class UDPReceiver {
             count: header.fragmentCount,
             payload: payload
         )
-    }
-
-    private func shouldAccept(connection: NWConnection) -> Bool {
-        guard let expectedRemoteHost else { return true }
-        guard case .hostPort(let host, _) = connection.endpoint else { return false }
-        return Self.normalizeHost(host.debugDescription) == expectedRemoteHost
     }
 
     private static func normalizeHost(_ host: String) -> String {

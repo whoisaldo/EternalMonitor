@@ -20,7 +20,11 @@ targets:
           - "Resources/Fonts/**"
     resources:
       - path: EternalMonitor/Resources/Assets.xcassets
-      - path: EternalMonitor/Resources/Fonts
+      - path: EternalMonitor/Resources/Fonts/Syne-Variable.ttf
+        buildPhase: resources
+      - path: EternalMonitor/Resources/Fonts/JetBrainsMono-Regular.ttf
+        buildPhase: resources
+      - path: EternalMonitor/Resources/Fonts/JetBrainsMono-Medium.ttf
         buildPhase: resources
     settings:
       base:
