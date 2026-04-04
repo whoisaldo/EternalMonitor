@@ -5,6 +5,7 @@ ROADMAP.md
 .cargo-home/
 .rustup-home/
 target/
+dist/
 tools/downloads/
 tools/ffmpeg-7.1/
 EternalMonitor.png

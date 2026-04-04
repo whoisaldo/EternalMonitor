@@ -1,5 +1,7 @@
 # EternalMonitor
 
+[![Version](https://img.shields.io/badge/version-v0.1.0--mirror-e8ff47?style=flat&labelColor=111)](https://github.com/whoisaldo/EternalMonitor/releases/tag/v0.1.0-mirror)
+[![Download](https://img.shields.io/badge/download-windows-blue?style=flat&labelColor=111)](https://github.com/whoisaldo/EternalMonitor/releases/download/v0.1.0-mirror/EternalMonitor-v0.1.0-mirror-windows.zip)
 [![Website](https://img.shields.io/badge/website-eternalmonitor.dev-e8ff47?style=flat&labelColor=111)](https://eternalmonitor.dev)
 
 **Website:** [eternalmonitor.dev](https://eternalmonitor.dev)
