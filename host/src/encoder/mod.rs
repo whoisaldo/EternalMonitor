@@ -103,15 +103,6 @@ fn run_encode_loop(
             .run(&encoder.bgra_frame, &mut encoder.frame)?;
         encoder.frame.set_pts(Some(raw_frame.frame_number as i64));
 
-        // Force IDR frames only for AMF. NVENC is already working and should
-        // keep its existing behavior.
-        if is_amf_encoder(&gpu.encoder_name) && encoder.frame_count % encoder.gop_interval == 0 {
-            encoder.frame.set_kind(ffmpeg_next::picture::Type::I);
-        } else {
-            encoder.frame.set_kind(ffmpeg_next::picture::Type::None);
-        }
-        encoder.frame_count += 1;
-
         let encode_start = Instant::now();
         encoder.encoder.send_frame(&encoder.frame)?;
 
@@ -179,8 +170,6 @@ struct EncoderState {
     frame: ffmpeg_next::frame::Video,
     packet: ffmpeg_next::Packet,
     h264: H264BitstreamState,
-    gop_interval: u64,
-    frame_count: u64,
 }
 
 impl EncoderState {
@@ -243,8 +232,6 @@ impl EncoderState {
             ),
             packet: ffmpeg_next::Packet::empty(),
             h264,
-            gop_interval: 30,
-            frame_count: 0,
         })
     }
 }
@@ -306,6 +293,9 @@ struct H264BitstreamState {
     logged_first_packet: bool,
     warned_missing_parameter_sets: bool,
     amf_packet_logs: usize,
+    /// Counts packets through normalize; used to periodically inject SPS/PPS
+    /// for encoders (AMF) that never produce IDR frames.
+    packet_count: u64,
 }
 
 impl H264BitstreamState {
@@ -411,7 +401,18 @@ fn normalize_h264_payload(
     let contains_idr = parsed.units.iter().any(|unit| nal_type(unit) == Some(5));
     let has_sps = parsed.units.iter().any(|unit| nal_type(unit) == Some(7));
     let has_pps = parsed.units.iter().any(|unit| nal_type(unit) == Some(8));
-    let should_prefix_parameter_sets = (packet_is_key || contains_idr) && (!has_sps || !has_pps);
+
+    // AMF in ultralowlatency mode never produces IDR frames (NAL type 5),
+    // so the decoder never receives SPS/PPS and can never initialize.
+    // Force SPS/PPS injection on the first packet and every 30 packets.
+    let amf_periodic_inject = is_amf_encoder(encoder_name)
+        && !has_sps
+        && !has_pps
+        && (state.packet_count == 0 || state.packet_count % 30 == 0);
+    state.packet_count += 1;
+
+    let should_prefix_parameter_sets =
+        ((packet_is_key || contains_idr) && (!has_sps || !has_pps)) || amf_periodic_inject;
 
     let mut output = Vec::with_capacity(data.len() + 128);
     if should_prefix_parameter_sets {
