@@ -18,6 +18,7 @@ final class VideoDecoder {
     private var hasLoggedEmptyPayload = false
     private var hasLoggedFirstPacketPrefix = false
     private var hasLoggedFirstNALPrefix = false
+    private var hasLoggedFirstPacketHex = false
 
     private let decodeQueue = DispatchQueue(label: "com.eternal.decode", qos: .userInteractive)
 
@@ -47,6 +48,11 @@ final class VideoDecoder {
     // MARK: - Internal
 
     private func decodeOnQueue(packet: FramePacket) {
+        if !hasLoggedFirstPacketHex {
+            hasLoggedFirstPacketHex = true
+            let hex = packet.data.prefix(16).map { String(format: "%02X", $0) }.joined(separator: " ")
+            print("[VideoDecoder] First packet hex (\(packet.data.count) bytes): \(hex)")
+        }
         let parsed = parseNALUnits(from: packet.data)
         logPacketPrefixIfNeeded(packet.data)
         if loggedPacketizations.insert(parsed.packetization).inserted {
@@ -343,6 +349,10 @@ final class VideoDecoder {
         // Pass timestampUs through frameReferenceContext so the callback can retrieve it
         let frameRef = UnsafeMutableRawPointer(bitPattern: UInt(truncatingIfNeeded: timestampUs))
 
+        let nalCount = nalUnits.count
+        let isKeyframe = nalUnits.contains { ($0[0] & 0x1F) == 5 }
+        print("[VT] Submitting sample: size=\(totalLen) isKeyframe=\(isKeyframe) nalCount=\(nalCount)")
+
         var infoFlags = VTDecodeInfoFlags()
         let status = VTDecompressionSessionDecodeFrame(
             session,
@@ -426,6 +436,11 @@ private func decompressionCallback(
     presentationDuration: CMTime
 ) {
     guard let refCon = decompressionOutputRefCon else { return }
+
+    print("[VT] Output callback fired: status=\(status) flags=\(infoFlags)")
+    if status != noErr {
+        print("[VT] Decode error: \(status)")
+    }
 
     let decoder = Unmanaged<VideoDecoder>.fromOpaque(refCon).takeUnretainedValue()
     guard status == noErr, let pixelBuffer = imageBuffer else {

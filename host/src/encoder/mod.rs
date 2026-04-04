@@ -103,6 +103,16 @@ fn run_encode_loop(
             .run(&encoder.bgra_frame, &mut encoder.frame)?;
         encoder.frame.set_pts(Some(raw_frame.frame_number as i64));
 
+        // Force IDR frames at GOP interval — AMF in ultralowlatency mode
+        // ignores the GOP setting and only produces P-frames unless we
+        // explicitly request keyframes via picture type.
+        if encoder.frame_count % encoder.gop_interval == 0 {
+            encoder.frame.set_kind(ffmpeg_next::picture::Type::I);
+        } else {
+            encoder.frame.set_kind(ffmpeg_next::picture::Type::None);
+        }
+        encoder.frame_count += 1;
+
         let encode_start = Instant::now();
         encoder.encoder.send_frame(&encoder.frame)?;
 
@@ -170,6 +180,8 @@ struct EncoderState {
     frame: ffmpeg_next::frame::Video,
     packet: ffmpeg_next::Packet,
     h264: H264BitstreamState,
+    gop_interval: u64,
+    frame_count: u64,
 }
 
 impl EncoderState {
@@ -232,6 +244,8 @@ impl EncoderState {
             ),
             packet: ffmpeg_next::Packet::empty(),
             h264,
+            gop_interval: 30,
+            frame_count: 0,
         })
     }
 }
