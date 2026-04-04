@@ -103,10 +103,9 @@ fn run_encode_loop(
             .run(&encoder.bgra_frame, &mut encoder.frame)?;
         encoder.frame.set_pts(Some(raw_frame.frame_number as i64));
 
-        // Force IDR frames at GOP interval — AMF in ultralowlatency mode
-        // ignores the GOP setting and only produces P-frames unless we
-        // explicitly request keyframes via picture type.
-        if encoder.frame_count % encoder.gop_interval == 0 {
+        // Force IDR frames only for AMF. NVENC is already working and should
+        // keep its existing behavior.
+        if is_amf_encoder(&gpu.encoder_name) && encoder.frame_count % encoder.gop_interval == 0 {
             encoder.frame.set_kind(ffmpeg_next::picture::Type::I);
         } else {
             encoder.frame.set_kind(ffmpeg_next::picture::Type::None);
