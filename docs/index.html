@@ -1,0 +1,209 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>EternalMonitor — Your iPad as a second display</title>
+  <meta name="description" content="Use your iPad as a second monitor for Windows. Free, open source, low-latency. No subscription, no dongle.">
+  <meta property="og:title" content="EternalMonitor">
+  <meta property="og:description" content="Use your iPad as a second monitor for Windows. Free, open source, low-latency.">
+  <meta property="og:url" content="https://eternalmonitor.dev">
+  <meta property="og:image" content="https://eternalmonitor.dev/assets/icon.png">
+  <meta name="twitter:card" content="summary_large_image">
+  <meta name="twitter:title" content="EternalMonitor">
+  <meta name="twitter:description" content="Use your iPad as a second monitor for Windows. Free, open source.">
+  <meta name="twitter:image" content="https://eternalmonitor.dev/assets/icon.png">
+  <link rel="canonical" href="https://eternalmonitor.dev">
+  <meta http-equiv="Content-Security-Policy" content="upgrade-insecure-requests">
+  <meta name="theme-color" content="#080808">
+  <link rel="icon" type="image/png" href="assets/icon.png">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Syne:wght@400;600;700;800&family=JetBrains+Mono:wght@400&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+  <!-- ===== Nav (shared) ===== -->
+  <nav class="nav">
+    <div class="container nav-inner">
+      <a href="index.html" class="nav-brand">
+        <div class="logo-mark"><span></span><span></span><span></span></div>
+        <span>EternalMonitor</span>
+      </a>
+      <div class="nav-links">
+        <a href="download.html" class="btn-primary btn-sm">Download</a>
+        <a href="https://github.com/whoisaldo/EternalMonitor" target="_blank" rel="noopener" class="nav-link">
+          GitHub
+          <svg viewBox="0 0 16 16" fill="currentColor"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27s1.36.09 2 .27c1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0 0 16 8c0-4.42-3.58-8-8-8z"/></svg>
+        </a>
+      </div>
+    </div>
+  </nav>
+
+  <!-- ===== Hero ===== -->
+  <section class="hero">
+    <div class="hero-content">
+      <p class="hero-eyebrow">Open source &middot; Free forever</p>
+      <h1>Your iPad.<br>A second monitor.</h1>
+      <p class="hero-subtitle">Low-latency wireless display for Windows.<br>No subscription, no dongle.</p>
+      <div class="hero-actions">
+        <a href="download.html" class="btn-primary btn-lg">Download for Windows</a>
+        <a href="https://github.com/whoisaldo/EternalMonitor" target="_blank" rel="noopener" class="btn-ghost">View on GitHub</a>
+      </div>
+      <div class="hero-trust">
+        <span class="trust-signal">60fps</span>
+        <span class="trust-signal">H.264 NVENC</span>
+        <span class="trust-signal">120Hz ProMotion</span>
+      </div>
+    </div>
+  </section>
+
+  <!-- ===== Stats Bar ===== -->
+  <section class="stats-bar reveal">
+    <div class="container stats-grid">
+      <div class="stat">
+        <span class="stat-value">&lt;20ms</span>
+        <span class="stat-label">latency</span>
+      </div>
+      <div class="stat">
+        <span class="stat-value">60fps</span>
+        <span class="stat-label">stream</span>
+      </div>
+      <div class="stat">
+        <span class="stat-value">$0</span>
+        <span class="stat-label">cost</span>
+      </div>
+      <div class="stat">
+        <span class="stat-value">100%</span>
+        <span class="stat-label">open source</span>
+      </div>
+    </div>
+  </section>
+
+  <!-- ===== How It Works ===== -->
+  <section class="how-it-works">
+    <div class="container">
+      <div class="section-header reveal">
+        <h2>How it works</h2>
+        <p>Three steps. No drivers to install, no account to create.</p>
+      </div>
+      <div class="steps-grid reveal">
+        <div class="step">
+          <div class="step-number">1</div>
+          <h3>Run the host</h3>
+          <p>Launch EternalMonitor on your Windows PC. It captures your display with DXGI and encodes with NVENC.</p>
+        </div>
+        <div class="step">
+          <div class="step-number">2</div>
+          <h3>Connect your iPad</h3>
+          <p>Open the iPad app and enter your PC's IP address. Both devices must be on the same WiFi network.</p>
+        </div>
+        <div class="step">
+          <div class="step-number">3</div>
+          <h3>Start streaming</h3>
+          <p>Your iPad is now a second display. Frames are streamed over UDP, decoded with VideoToolbox, and rendered with Metal.</p>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ===== Requirements ===== -->
+  <section class="requirements">
+    <div class="container">
+      <div class="section-header reveal">
+        <h2>Requirements</h2>
+      </div>
+      <div class="requirements-grid reveal">
+        <div class="req-card card">
+          <h3>
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="3" width="20" height="14" rx="2"/><path d="M8 21h8"/><path d="M12 17v4"/></svg>
+            Windows
+          </h3>
+          <ul class="req-list">
+            <li>Windows 10/11 64-bit</li>
+            <li>NVIDIA RTX GPU</li>
+            <li>Same WiFi network as iPad</li>
+          </ul>
+        </div>
+        <div class="req-card card">
+          <h3>
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="4" y="2" width="16" height="20" rx="3"/><circle cx="12" cy="18" r="1"/></svg>
+            iPad
+          </h3>
+          <ul class="req-list">
+            <li>iPadOS 16 or later</li>
+            <li>iPad Pro / Air / mini</li>
+            <li>120Hz ProMotion supported</li>
+          </ul>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ===== Limitations Banner ===== -->
+  <section class="limitations reveal">
+    <div class="container">
+      <div class="limitations-card">
+        <span class="limitations-badge">v0.1.0 Preview</span>
+        <p>v0.1.0 is a mirror-only early release. Extended display, USB transport, and touch input are on the roadmap.</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- ===== Roadmap ===== -->
+  <section class="roadmap">
+    <div class="container">
+      <div class="section-header reveal">
+        <h2>Roadmap</h2>
+      </div>
+      <div class="roadmap-track reveal">
+        <div class="milestone milestone--done">
+          <div class="milestone-info">
+            <span class="milestone-version">v0.1.0</span>
+            <span class="milestone-name">Mirror</span>
+          </div>
+          <span class="badge badge-green">Done</span>
+        </div>
+        <div class="milestone">
+          <div class="milestone-info">
+            <span class="milestone-version">v0.2.0</span>
+            <span class="milestone-name">Extend + USB</span>
+          </div>
+          <span class="badge badge-muted">Upcoming</span>
+        </div>
+        <div class="milestone">
+          <div class="milestone-info">
+            <span class="milestone-version">v0.3.0</span>
+            <span class="milestone-name">Touch input</span>
+          </div>
+          <span class="badge badge-muted">Upcoming</span>
+        </div>
+        <div class="milestone">
+          <div class="milestone-info">
+            <span class="milestone-version">v1.0.0</span>
+            <span class="milestone-name">Full release</span>
+          </div>
+          <span class="badge badge-muted">Upcoming</span>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ===== Footer (shared) ===== -->
+  <footer class="footer">
+    <div class="container footer-inner">
+      <div class="footer-brand">
+        <div class="logo-mark"><span></span><span></span><span></span></div>
+        <span>EternalMonitor</span>
+      </div>
+      <p class="footer-copy">Built by whoisaldo &middot; Open source under MIT</p>
+      <div class="footer-links">
+        <a href="https://github.com/whoisaldo/EternalMonitor" target="_blank" rel="noopener">GitHub</a>
+      </div>
+    </div>
+  </footer>
+
+  <script src="script.js"></script>
+</body>
+</html>

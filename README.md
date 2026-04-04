@@ -1,5 +1,9 @@
 # EternalMonitor
 
+[![Website](https://img.shields.io/badge/website-eternalmonitor.dev-e8ff47?style=flat&labelColor=111)](https://eternalmonitor.dev)
+
+**Website:** [eternalmonitor.dev](https://eternalmonitor.dev)
+
 Use your iPad as a low-latency Windows display receiver over local-network UDP.
 
 This repo currently contains a working Windows host capture/encode/transport path and a working iPad receive/decode/render path. The known-good stream state is commit `bc44770` on branch `feature/rust-workspace-bootstrap`.

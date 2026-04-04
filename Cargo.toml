@@ -1,3 +1,4 @@
+# docs/ contains the static website (GitHub Pages). Never write build output here.
 [workspace]
 members = ["host", "proto"]
 resolver = "2"

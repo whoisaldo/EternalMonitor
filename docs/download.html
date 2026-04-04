@@ -1,0 +1,135 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Download — EternalMonitor</title>
+  <meta name="description" content="Use your iPad as a second monitor for Windows. Free, open source, low-latency. No subscription, no dongle.">
+  <meta property="og:title" content="EternalMonitor">
+  <meta property="og:description" content="Use your iPad as a second monitor for Windows. Free, open source, low-latency.">
+  <meta property="og:url" content="https://eternalmonitor.dev">
+  <meta property="og:image" content="https://eternalmonitor.dev/assets/icon.png">
+  <meta name="twitter:card" content="summary_large_image">
+  <meta name="twitter:title" content="EternalMonitor">
+  <meta name="twitter:description" content="Use your iPad as a second monitor for Windows. Free, open source.">
+  <meta name="twitter:image" content="https://eternalmonitor.dev/assets/icon.png">
+  <link rel="canonical" href="https://eternalmonitor.dev">
+  <meta http-equiv="Content-Security-Policy" content="upgrade-insecure-requests">
+  <meta name="theme-color" content="#080808">
+  <link rel="icon" type="image/png" href="assets/icon.png">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Syne:wght@400;600;700;800&family=JetBrains+Mono:wght@400&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+  <!-- ===== Nav (shared) ===== -->
+  <nav class="nav">
+    <div class="container nav-inner">
+      <a href="index.html" class="nav-brand">
+        <div class="logo-mark"><span></span><span></span><span></span></div>
+        <span>EternalMonitor</span>
+      </a>
+      <div class="nav-links">
+        <a href="download.html" class="btn-primary btn-sm">Download</a>
+        <a href="https://github.com/whoisaldo/EternalMonitor" target="_blank" rel="noopener" class="nav-link">
+          GitHub
+          <svg viewBox="0 0 16 16" fill="currentColor"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27s1.36.09 2 .27c1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0 0 16 8c0-4.42-3.58-8-8-8z"/></svg>
+        </a>
+      </div>
+    </div>
+  </nav>
+
+  <!-- ===== Download Hero ===== -->
+  <section class="download-hero">
+    <div class="container">
+      <h1>Download EternalMonitor</h1>
+      <p>Windows host + iPad app &middot; v0.1.0-mirror</p>
+    </div>
+  </section>
+
+  <!-- ===== Download Cards ===== -->
+  <section>
+    <div class="container download-grid">
+
+      <!-- Windows Host Card -->
+      <div class="download-card download-card--primary">
+        <div class="download-card-header">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="3" width="20" height="14" rx="2"/><path d="M8 21h8"/><path d="M12 17v4"/></svg>
+          <h2>Windows Host</h2>
+          <span class="badge badge-green" id="release-version">v0.1.0</span>
+        </div>
+        <p>Runs on your PC. Captures and streams your display.</p>
+        <div class="download-requirements">
+          <span class="pill">NVIDIA RTX &middot; Windows 10/11</span>
+        </div>
+        <div class="download-btn-wrap">
+          <a href="https://github.com/whoisaldo/EternalMonitor/releases" id="download-btn" class="btn-primary btn-lg" target="_blank" rel="noopener">Download .zip</a>
+          <p class="download-meta" id="release-meta">Fetching latest release&hellip;</p>
+        </div>
+        <div class="sha256">
+          <span class="sha256-label">SHA-256</span>
+          <code id="sha256-value">Available on release page</code>
+        </div>
+      </div>
+
+      <!-- iPad App Card -->
+      <div class="download-card">
+        <div class="download-card-header">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="4" y="2" width="16" height="20" rx="3"/><circle cx="12" cy="18" r="1"/></svg>
+          <h2>iPad App</h2>
+          <span class="badge badge-muted">Sideload</span>
+        </div>
+        <p>Sideload via Xcode. Physical device required.</p>
+        <div class="download-btn-wrap">
+          <a href="https://github.com/whoisaldo/EternalMonitor/tree/main/ios" class="btn-ghost" target="_blank" rel="noopener">View Source on GitHub</a>
+        </div>
+        <p class="download-note">App Store release planned for v1.0.0</p>
+      </div>
+
+    </div>
+  </section>
+
+  <!-- ===== Build from Source ===== -->
+  <section class="build-section">
+    <div class="container">
+      <details class="build-details">
+        <summary>Build from source</summary>
+        <div class="build-content">
+          <h3>Requirements</h3>
+          <ul class="build-reqs">
+            <li>Rust stable MSVC</li>
+            <li>FFmpeg 7.1</li>
+            <li>NVIDIA GPU with NVENC support</li>
+          </ul>
+          <h3>Windows Host</h3>
+          <pre><code>git clone https://github.com/whoisaldo/EternalMonitor
+cd EternalMonitor
+cargo build --release -p eternal-host</code></pre>
+          <h3>iPad App</h3>
+          <pre><code>cd ios
+xcodegen generate
+# Open in Xcode, build for physical device</code></pre>
+        </div>
+      </details>
+    </div>
+  </section>
+
+  <!-- ===== Footer (shared) ===== -->
+  <footer class="footer">
+    <div class="container footer-inner">
+      <div class="footer-brand">
+        <div class="logo-mark"><span></span><span></span><span></span></div>
+        <span>EternalMonitor</span>
+      </div>
+      <p class="footer-copy">Built by whoisaldo &middot; Open source under MIT</p>
+      <div class="footer-links">
+        <a href="https://github.com/whoisaldo/EternalMonitor" target="_blank" rel="noopener">GitHub</a>
+      </div>
+    </div>
+  </footer>
+
+  <script src="script.js"></script>
+</body>
+</html>
