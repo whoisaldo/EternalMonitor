@@ -207,7 +207,7 @@ fn encoder_options(encoder_name: &str) -> ffmpeg_next::Dictionary<'_> {
         "h264_amf" => {
             opts.set("usage", "ultralowlatency");
             opts.set("quality", "speed");
-            opts.set("profile", "baseline");
+            opts.set("profile", "constrained_baseline");
             opts.set("rc", "cbr");
         }
         "h264_qsv" => {
