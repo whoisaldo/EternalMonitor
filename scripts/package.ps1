@@ -1,7 +1,7 @@
 # EternalMonitor release packaging script
 # Usage: .\scripts\package.ps1
 
-$version = "v0.1.0-mirror"
+$version = "v0.1.1-mirror"
 $distDir = "dist"
 $zipName = "EternalMonitor-$version-windows.zip"
 
@@ -15,7 +15,15 @@ New-Item -ItemType Directory -Path $distDir | Out-Null
 
 Write-Host "[3/5] Copying files..."
 Copy-Item "target\release\eternal-host.exe" "$distDir\EternalMonitor-host.exe"
-$ffmpegBin = (Select-String -Path ".cargo\config.toml" -Pattern 'FFMPEG_DIR\s*=\s*"(.+)"').Matches[0].Groups[1].Value + "\bin"
+$cargoConfig = Get-Content -Raw ".cargo\config.toml"
+$ffmpegMatch = [regex]::Match($cargoConfig, 'FFMPEG_DIR\s*=\s*\{\s*value\s*=\s*"([^"]+)"')
+if (-not $ffmpegMatch.Success) {
+    $ffmpegMatch = [regex]::Match($cargoConfig, 'FFMPEG_DIR\s*=\s*"([^"]+)"')
+}
+if (-not $ffmpegMatch.Success) {
+    throw "Could not resolve FFMPEG_DIR from .cargo/config.toml"
+}
+$ffmpegBin = (Join-Path $ffmpegMatch.Groups[1].Value "bin")
 Copy-Item "$ffmpegBin\*.dll" "$distDir\"
 Copy-Item "README.md" "$distDir\"
 Copy-Item "LICENSE" "$distDir\"

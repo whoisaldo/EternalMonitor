@@ -83,6 +83,7 @@ Then open the generated Xcode project on macOS, build the `EternalMonitor` targe
 
 - If the iPad says no complete frame was reassembled, make sure both the Windows host and the iPad app were rebuilt from the same revision. The UDP fragment header changed in the working transport fix.
 - If scan finds nothing, try direct IP connect first. Discovery failure does not necessarily mean streaming is broken.
+- If you're testing on AMD, use the updated `v0.1.1-mirror` host build. The AMF path now includes an April 4, 2026 H.264/VideoToolbox compatibility fix and extra diagnostics for first-packet format mismatches.
 - If the host binary fails to rebuild on Windows with access denied for `eternal-host.exe`, close the running GUI process first.
 
 ## Reference docs

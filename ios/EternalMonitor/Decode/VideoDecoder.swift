@@ -16,6 +16,8 @@ final class VideoDecoder {
     private var loggedPacketizations = Set<String>()
     private var loggedNALTypes = Set<UInt8>()
     private var hasLoggedEmptyPayload = false
+    private var hasLoggedFirstPacketPrefix = false
+    private var hasLoggedFirstNALPrefix = false
 
     private let decodeQueue = DispatchQueue(label: "com.eternal.decode", qos: .userInteractive)
 
@@ -46,12 +48,22 @@ final class VideoDecoder {
 
     private func decodeOnQueue(packet: FramePacket) {
         let parsed = parseNALUnits(from: packet.data)
+        logPacketPrefixIfNeeded(packet.data)
         if loggedPacketizations.insert(parsed.packetization).inserted {
             onEvent?("Detected \(parsed.packetization) H.264 packetization")
         }
 
         let nalUnits = parsed.units
         guard !nalUnits.isEmpty else {
+            if let parameterSets = parseAVCCConfigurationRecord(packet.data) {
+                sps = parameterSets.sps
+                pps = parameterSets.pps
+                onEvent?(
+                    "Parsed AVCC configuration record SPS=\(parameterSets.sps.count)B PPS=\(parameterSets.pps.count)B"
+                )
+                tryCreateFormatDescription()
+                return
+            }
             if !hasLoggedEmptyPayload {
                 onEvent?("No H.264 NAL units parsed from packet bytes=\(packet.data.count)")
                 hasLoggedEmptyPayload = true
@@ -60,6 +72,10 @@ final class VideoDecoder {
         }
         hasLoggedEmptyPayload = false
 
+        logFirstNALPrefixIfNeeded(nalUnits[0])
+
+        var accessUnitNALs: [Data] = []
+        var hasSliceNAL = false
         for nal in nalUnits {
             let nalType = nal[0] & 0x1F
             logNALTypeIfNeeded(nalType)
@@ -72,10 +88,15 @@ final class VideoDecoder {
                 pps = nal
                 tryCreateFormatDescription()
             case 1, 5: // Non-IDR slice, IDR slice
-                decodeSlice(nal, timestampUs: packet.timestampUs)
+                hasSliceNAL = true
+                accessUnitNALs.append(nal)
             default:
-                break
+                accessUnitNALs.append(nal)
             }
+        }
+
+        if hasSliceNAL {
+            decodeAccessUnit(accessUnitNALs, timestampUs: packet.timestampUs)
         }
     }
 
@@ -248,18 +269,25 @@ final class VideoDecoder {
         onEvent?("VideoToolbox session ready")
     }
 
-    // MARK: - Decode a slice NAL unit
+    // MARK: - Decode an access unit
 
-    private func decodeSlice(_ nalData: Data, timestampUs: UInt64) {
+    private func decodeAccessUnit(_ nalUnits: [Data], timestampUs: UInt64) {
         guard let session = decompressionSession, let formatDescription else {
-            onEvent?("Dropped slice bytes=\(nalData.count) timestampUs=\(timestampUs) because decoder is not ready")
+            let totalBytes = nalUnits.reduce(0) { $0 + $1.count }
+            onEvent?(
+                "Dropped access unit nalCount=\(nalUnits.count) bytes=\(totalBytes) timestampUs=\(timestampUs) because decoder is not ready"
+            )
             return
         }
 
-        // Convert Annex B NAL to AVCC: prepend 4-byte big-endian length
-        var nalLength = UInt32(nalData.count).bigEndian
-        var avccData = Data(bytes: &nalLength, count: 4)
-        avccData.append(nalData)
+        // VideoToolbox expects a full access unit as consecutive AVCC length-prefixed NALs.
+        var avccData = Data()
+        avccData.reserveCapacity(nalUnits.reduce(0) { $0 + 4 + $1.count })
+        for nalData in nalUnits {
+            var nalLength = UInt32(nalData.count).bigEndian
+            avccData.append(Data(bytes: &nalLength, count: 4))
+            avccData.append(nalData)
+        }
 
         // Create CMBlockBuffer
         var blockBuffer: CMBlockBuffer?
@@ -288,7 +316,7 @@ final class VideoDecoder {
         }
 
         guard let blockBuffer else {
-            onEvent?("Failed to allocate block buffer for slice bytes=\(nalData.count)")
+            onEvent?("Failed to allocate block buffer for access unit bytes=\(totalLen)")
             return
         }
 
@@ -308,7 +336,7 @@ final class VideoDecoder {
         )
 
         guard let sampleBuffer else {
-            onEvent?("Failed to create sample buffer for slice bytes=\(nalData.count)")
+            onEvent?("Failed to create sample buffer for access unit bytes=\(totalLen)")
             return
         }
 
@@ -324,8 +352,65 @@ final class VideoDecoder {
             infoFlagsOut: &infoFlags
         )
         if status != noErr {
-            onEvent?("VTDecodeFrame failed status=\(status) bytes=\(nalData.count)")
+            onEvent?("VTDecodeFrame failed status=\(status) nalCount=\(nalUnits.count) bytes=\(totalLen)")
         }
+    }
+
+    private func parseAVCCConfigurationRecord(_ data: Data) -> (sps: Data, pps: Data)? {
+        guard data.count >= 7, data.first == 1 else { return nil }
+
+        var cursor = 5
+        let spsCount = Int(data[cursor] & 0x1F)
+        cursor += 1
+
+        var sps: Data?
+        for _ in 0..<spsCount {
+            guard cursor + 2 <= data.count else { return nil }
+            let length = readBigEndianLength(from: data, offset: cursor, width: 2)
+            cursor += 2
+            guard cursor + length <= data.count else { return nil }
+            if sps == nil {
+                sps = data.subdata(in: cursor..<(cursor + length))
+            }
+            cursor += length
+        }
+
+        guard cursor < data.count else { return nil }
+        let ppsCount = Int(data[cursor])
+        cursor += 1
+
+        var pps: Data?
+        for _ in 0..<ppsCount {
+            guard cursor + 2 <= data.count else { return nil }
+            let length = readBigEndianLength(from: data, offset: cursor, width: 2)
+            cursor += 2
+            guard cursor + length <= data.count else { return nil }
+            if pps == nil {
+                pps = data.subdata(in: cursor..<(cursor + length))
+            }
+            cursor += length
+        }
+
+        guard let sps, let pps else { return nil }
+        return (sps, pps)
+    }
+
+    private func logPacketPrefixIfNeeded(_ data: Data) {
+        guard !hasLoggedFirstPacketPrefix else { return }
+        hasLoggedFirstPacketPrefix = true
+        onEvent?("First packet prefix \(hexPrefix(data, maxBytes: 16))")
+    }
+
+    private func logFirstNALPrefixIfNeeded(_ nal: Data) {
+        guard !hasLoggedFirstNALPrefix else { return }
+        hasLoggedFirstNALPrefix = true
+        onEvent?("First NAL prefix \(hexPrefix(nal, maxBytes: 16))")
+    }
+
+    private func hexPrefix(_ data: Data, maxBytes: Int) -> String {
+        data.prefix(maxBytes)
+            .map { String(format: "%02X", $0) }
+            .joined(separator: " ")
     }
 }
 

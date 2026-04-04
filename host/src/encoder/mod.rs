@@ -12,6 +12,7 @@ use crate::stats::PIPELINE_STATS;
 
 const CHANNEL_CAPACITY: usize = 4;
 const DEFAULT_BITRATE: u32 = 15_000_000;
+const AMF_ENCODER_NAME: &str = "h264_amf";
 
 /// Encoded H.264 NAL unit ready for transport.
 #[derive(Debug, Clone)]
@@ -189,10 +190,12 @@ impl EncoderState {
         encoder.set_max_b_frames(0);
         encoder.set_bit_rate(DEFAULT_BITRATE as usize);
         encoder.set_gop(30);
+        configure_encoder_flags(&mut encoder, encoder_name);
 
         let opts = encoder_options(encoder_name);
 
         let encoder = encoder.open_with(opts)?;
+        log_encoder_configuration(encoder_name, &encoder);
         info!(
             width,
             height,
@@ -289,6 +292,7 @@ struct H264BitstreamState {
     pps: Option<Vec<u8>>,
     logged_first_packet: bool,
     warned_missing_parameter_sets: bool,
+    amf_packet_logs: usize,
 }
 
 impl H264BitstreamState {
@@ -350,6 +354,25 @@ fn normalize_h264_payload(
     encoder_name: &str,
 ) -> Vec<u8> {
     let parsed = parse_h264_bitstream(data);
+    if is_amf_encoder(encoder_name) && state.amf_packet_logs < 10 {
+        let nal_types: Vec<String> = parsed
+            .units
+            .iter()
+            .filter_map(|unit| nal_type(unit).map(|kind| kind.to_string()))
+            .collect();
+        info!(
+            encoder = encoder_name,
+            packet_index = state.amf_packet_logs + 1,
+            input = %parsed.format,
+            packet_is_key,
+            packet_bytes = data.len(),
+            packet_prefix = %hex_prefix(data, 16),
+            nal_types = %nal_types.join(","),
+            "Observed AMF encoded H.264 packet"
+        );
+        state.amf_packet_logs += 1;
+    }
+
     if !state.logged_first_packet && !parsed.units.is_empty() {
         let nal_types: Vec<String> = parsed
             .units
@@ -557,6 +580,92 @@ fn encoder_extradata(encoder: &ffmpeg_next::codec::encoder::video::Encoder) -> O
             Some(slice::from_raw_parts(extradata, extradata_size as usize).to_vec())
         }
     }
+}
+
+fn configure_encoder_flags(
+    encoder: &mut ffmpeg_next::codec::encoder::video::Video,
+    encoder_name: &str,
+) {
+    if !is_amf_encoder(encoder_name) {
+        return;
+    }
+
+    let mut flags = codec_flags(encoder);
+    flags.remove(ffmpeg_next::codec::Flags::GLOBAL_HEADER);
+    flags.insert(ffmpeg_next::codec::Flags::CLOSED_GOP);
+    encoder.set_flags(flags);
+
+    info!(
+        encoder = encoder_name,
+        global_header = flags.contains(ffmpeg_next::codec::Flags::GLOBAL_HEADER),
+        closed_gop = flags.contains(ffmpeg_next::codec::Flags::CLOSED_GOP),
+        "Applied AMD-specific encoder flags"
+    );
+}
+
+fn log_encoder_configuration(
+    encoder_name: &str,
+    encoder: &ffmpeg_next::codec::encoder::video::Encoder,
+) {
+    let flags = codec_flags(encoder);
+    let extradata = encoder_extradata(encoder);
+    let extradata_bytes = extradata.as_ref().map_or(0, Vec::len);
+    let extradata_format = extradata
+        .as_deref()
+        .map(describe_extradata_format)
+        .unwrap_or("None");
+    let (sps_bytes, pps_bytes) = extradata
+        .as_deref()
+        .and_then(parameter_sets_from_extradata)
+        .map(|(sps, pps)| (sps.len(), pps.len()))
+        .unwrap_or((0, 0));
+    let extradata_prefix = extradata
+        .as_deref()
+        .map(|bytes| hex_prefix(bytes, 16))
+        .unwrap_or_else(|| "none".to_string());
+
+    info!(
+        encoder = encoder_name,
+        global_header = flags.contains(ffmpeg_next::codec::Flags::GLOBAL_HEADER),
+        closed_gop = flags.contains(ffmpeg_next::codec::Flags::CLOSED_GOP),
+        extradata_bytes,
+        extradata_format,
+        sps_bytes,
+        pps_bytes,
+        extradata_prefix = %extradata_prefix,
+        "Encoder H.264 configuration"
+    );
+}
+
+fn codec_flags<T: AsRef<ffmpeg_next::codec::Context>>(context: &T) -> ffmpeg_next::codec::Flags {
+    unsafe {
+        let raw_flags = (*context.as_ref().as_ptr()).flags;
+        ffmpeg_next::codec::Flags::from_bits_truncate(raw_flags as u32)
+    }
+}
+
+fn describe_extradata_format(extradata: &[u8]) -> &'static str {
+    if extradata.is_empty() {
+        "None"
+    } else if extradata.first().copied() == Some(1) {
+        "AVCC"
+    } else if !parse_annex_b_units(extradata).is_empty() {
+        "AnnexB"
+    } else {
+        "Unknown"
+    }
+}
+
+fn hex_prefix(data: &[u8], max_len: usize) -> String {
+    data.iter()
+        .take(max_len)
+        .map(|byte| format!("{byte:02X}"))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn is_amf_encoder(encoder_name: &str) -> bool {
+    encoder_name == AMF_ENCODER_NAME
 }
 
 fn find_start_code(data: &[u8], from: usize) -> Option<(usize, usize)> {

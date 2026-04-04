@@ -4,6 +4,7 @@
 - Multi-vendor GPU support: automatic detection of NVIDIA, AMD, and Intel GPUs via DXGI
 - Encoder fallback chain: NVENC → AMF → QSV → libx264 (software)
 - Per-encoder optimized low-latency settings
+- AMD H.264 hotfix: AMF output is now normalized for VideoToolbox decode, with AMF-only flag guards and stronger bitstream diagnostics
 - Startup banner showing detected GPU, encoder, and listen address
 - Suppressed mDNS multicast log spam from Tailscale interfaces
 
