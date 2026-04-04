@@ -19,6 +19,7 @@ final class VideoDecoder {
     private var hasLoggedFirstPacketPrefix = false
     private var hasLoggedFirstNALPrefix = false
     private var hasLoggedFirstPacketHex = false
+    private var waitingForSyncSample = true
 
     private let decodeQueue = DispatchQueue(label: "com.eternal.decode", qos: .userInteractive)
 
@@ -42,6 +43,7 @@ final class VideoDecoder {
             self?.formatDescription = nil
             self?.sps = nil
             self?.pps = nil
+            self?.waitingForSyncSample = true
         }
     }
 
@@ -102,7 +104,8 @@ final class VideoDecoder {
         }
 
         if hasSliceNAL {
-            decodeAccessUnit(accessUnitNALs, timestampUs: packet.timestampUs)
+            let isSyncSample = isRandomAccessAccessUnit(accessUnitNALs)
+            decodeAccessUnit(accessUnitNALs, timestampUs: packet.timestampUs, isSyncSample: isSyncSample)
         }
     }
 
@@ -272,12 +275,13 @@ final class VideoDecoder {
 
         VTSessionSetProperty(session, key: kVTDecompressionPropertyKey_RealTime, value: kCFBooleanTrue)
         decompressionSession = session
+        waitingForSyncSample = true
         onEvent?("VideoToolbox session ready")
     }
 
     // MARK: - Decode an access unit
 
-    private func decodeAccessUnit(_ nalUnits: [Data], timestampUs: UInt64) {
+    private func decodeAccessUnit(_ nalUnits: [Data], timestampUs: UInt64, isSyncSample: Bool) {
         guard let session = decompressionSession, let formatDescription else {
             let totalBytes = nalUnits.reduce(0) { $0 + $1.count }
             onEvent?(
@@ -286,9 +290,20 @@ final class VideoDecoder {
             return
         }
 
+        let totalBytes = nalUnits.reduce(0) { $0 + $1.count }
+        if waitingForSyncSample && !isSyncSample {
+            onEvent?(
+                "Dropped inter access unit nalCount=\(nalUnits.count) bytes=\(totalBytes) timestampUs=\(timestampUs) while waiting for sync sample"
+            )
+            return
+        }
+        if isSyncSample {
+            waitingForSyncSample = false
+        }
+
         // VideoToolbox expects a full access unit as consecutive AVCC length-prefixed NALs.
         var avccData = Data()
-        avccData.reserveCapacity(nalUnits.reduce(0) { $0 + 4 + $1.count })
+        avccData.reserveCapacity(totalBytes + (nalUnits.count * 4))
         for nalData in nalUnits {
             var nalLength = UInt32(nalData.count).bigEndian
             avccData.append(Data(bytes: &nalLength, count: 4))
@@ -346,12 +361,29 @@ final class VideoDecoder {
             return
         }
 
+        if let attachmentsArray = CMSampleBufferGetSampleAttachmentsArray(sampleBuffer, createIfNecessary: true) {
+            let attachments = unsafeBitCast(
+                CFArrayGetValueAtIndex(attachmentsArray, 0),
+                to: CFMutableDictionary.self
+            )
+            let syncFlag = isSyncSample ? kCFBooleanFalse : kCFBooleanTrue
+            CFDictionarySetValue(
+                attachments,
+                Unmanaged.passUnretained(kCMSampleAttachmentKey_NotSync).toOpaque(),
+                Unmanaged.passUnretained(syncFlag).toOpaque()
+            )
+            CFDictionarySetValue(
+                attachments,
+                Unmanaged.passUnretained(kCMSampleAttachmentKey_DependsOnOthers).toOpaque(),
+                Unmanaged.passUnretained(syncFlag).toOpaque()
+            )
+        }
+
         // Pass timestampUs through frameReferenceContext so the callback can retrieve it
         let frameRef = UnsafeMutableRawPointer(bitPattern: UInt(truncatingIfNeeded: timestampUs))
 
         let nalCount = nalUnits.count
-        let isKeyframe = nalUnits.contains { ($0[0] & 0x1F) == 5 }
-        print("[VT] Submitting sample: size=\(totalLen) isKeyframe=\(isKeyframe) nalCount=\(nalCount)")
+        print("[VT] Submitting sample: size=\(totalLen) isKeyframe=\(isSyncSample) nalCount=\(nalCount)")
 
         var infoFlags = VTDecodeInfoFlags()
         let status = VTDecompressionSessionDecodeFrame(
@@ -364,6 +396,79 @@ final class VideoDecoder {
         if status != noErr {
             onEvent?("VTDecodeFrame failed status=\(status) nalCount=\(nalUnits.count) bytes=\(totalLen)")
         }
+    }
+
+    private func isRandomAccessAccessUnit(_ nalUnits: [Data]) -> Bool {
+        var sawVCL = false
+
+        for nal in nalUnits where !nal.isEmpty {
+            let nalType = nal[0] & 0x1F
+            switch nalType {
+            case 5:
+                return true
+            case 1...4:
+                sawVCL = true
+                guard let sliceKind = sliceKind(for: nal), sliceKind.isIntra else {
+                    return false
+                }
+            default:
+                break
+            }
+        }
+
+        return sawVCL
+    }
+
+    private func sliceKind(for nal: Data) -> H264SliceKind? {
+        guard let nalHeader = nal.first else { return nil }
+        let nalType = nalHeader & 0x1F
+        switch nalType {
+        case 5:
+            return .i
+        case 1...4:
+            let rbsp = rbspPayload(from: nal.dropFirst())
+            var reader = H264BitReader(bytes: rbsp)
+            guard reader.readUE() != nil else { return nil }
+            guard let sliceType = reader.readUE() else { return nil }
+            switch sliceType % 5 {
+            case 0:
+                return .p
+            case 1:
+                return .b
+            case 2:
+                return .i
+            case 3:
+                return .sp
+            case 4:
+                return .si
+            default:
+                return nil
+            }
+        default:
+            return nil
+        }
+    }
+
+    private func rbspPayload<S: Sequence>(from bytes: S) -> [UInt8] where S.Element == UInt8 {
+        var rbsp: [UInt8] = []
+        rbsp.reserveCapacity(16)
+        var zeroCount = 0
+
+        for byte in bytes {
+            if zeroCount >= 2 && byte == 0x03 {
+                zeroCount = 0
+                continue
+            }
+
+            rbsp.append(byte)
+            if byte == 0 {
+                zeroCount += 1
+            } else {
+                zeroCount = 0
+            }
+        }
+
+        return rbsp
     }
 
     private func parseAVCCConfigurationRecord(_ data: Data) -> (sps: Data, pps: Data)? {
@@ -450,6 +555,60 @@ private func decompressionCallback(
 
     let timestampUs = UInt64(UInt(bitPattern: sourceFrameRefCon))
     decoder.onFrameDecoded?(pixelBuffer, timestampUs)
+}
+
+private enum H264SliceKind {
+    case p
+    case b
+    case i
+    case sp
+    case si
+
+    var isIntra: Bool {
+        self == .i || self == .si
+    }
+}
+
+private struct H264BitReader {
+    let bytes: [UInt8]
+    var bitOffset = 0
+
+    mutating func readBit() -> UInt8? {
+        guard bitOffset / 8 < bytes.count else { return nil }
+        let byte = bytes[bitOffset / 8]
+        let shift = 7 - (bitOffset % 8)
+        bitOffset += 1
+        return (byte >> shift) & 1
+    }
+
+    mutating func readBits(_ count: Int) -> UInt32? {
+        var value: UInt32 = 0
+        for _ in 0..<count {
+            guard let bit = readBit() else { return nil }
+            value = (value << 1) | UInt32(bit)
+        }
+        return value
+    }
+
+    mutating func readUE() -> UInt32? {
+        var leadingZeroBits = 0
+        while readBit() == 0 {
+            leadingZeroBits += 1
+            if leadingZeroBits >= 32 {
+                return nil
+            }
+        }
+
+        let suffix: UInt32
+        if leadingZeroBits == 0 {
+            suffix = 0
+        } else {
+            guard let bits = readBits(leadingZeroBits) else { return nil }
+            suffix = bits
+        }
+
+        return ((UInt32(1) << UInt32(leadingZeroBits)) - 1) + suffix
+    }
 }
 
 private func findStartCode(

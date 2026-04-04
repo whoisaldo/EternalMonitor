@@ -19,6 +19,7 @@ const DEFAULT_BITRATE: u32 = 15_000_000;
 const AMF_ENCODER_NAME: &str = "h264_amf";
 const AMF_CAPTURE_PACKET_LIMIT: u64 = 120;
 const AMF_IDR_WARNING_PACKET: u64 = 60;
+const AMF_FORCED_INTRA_PERIOD: u64 = 30;
 
 /// Encoded H.264 NAL unit ready for transport.
 #[derive(Debug, Clone)]
@@ -108,6 +109,7 @@ fn run_encode_loop(
             .scaler
             .run(&encoder.bgra_frame, &mut encoder.frame)?;
         encoder.frame.set_pts(Some(raw_frame.frame_number as i64));
+        prepare_frame_for_encode(&mut encoder.frame, raw_frame.frame_number, &gpu.encoder_name);
 
         let encode_start = Instant::now();
         encoder.encoder.send_frame(&encoder.frame)?;
@@ -132,7 +134,10 @@ fn run_encode_loop(
                         &mut encoder.h264,
                         &gpu.encoder_name,
                     );
-                    let is_keyframe = packet_is_key || contains_nal_type(&nal_data, 5);
+                    let intra_only_access_unit = access_unit_is_intra_only(&nal_data);
+                    let is_keyframe = packet_is_key
+                        || contains_nal_type(&nal_data, 5)
+                        || (is_amf_encoder(&gpu.encoder_name) && intra_only_access_unit);
                     encoder.observe_amf_diagnostics(
                         &nal_data,
                         raw_frame.frame_number,
@@ -311,6 +316,32 @@ fn apply_bitrate(
     Ok(())
 }
 
+fn prepare_frame_for_encode(
+    frame: &mut ffmpeg_next::frame::Video,
+    frame_number: u64,
+    encoder_name: &str,
+) {
+    let request_intra = is_amf_encoder(encoder_name) && frame_number % AMF_FORCED_INTRA_PERIOD == 0;
+    frame.set_kind(if request_intra {
+        ffmpeg_next::util::picture::Type::I
+    } else {
+        ffmpeg_next::util::picture::Type::None
+    });
+
+    unsafe {
+        (*frame.as_mut_ptr()).key_frame = if request_intra { 1 } else { 0 };
+    }
+
+    if request_intra {
+        info!(
+            encoder = encoder_name,
+            frame = frame_number,
+            period = AMF_FORCED_INTRA_PERIOD,
+            "Requesting AMF intra picture"
+        );
+    }
+}
+
 /// Check if an ffmpeg error is EAGAIN (no output available yet).
 fn is_eagain(e: &ffmpeg_next::Error) -> bool {
     matches!(e, ffmpeg_next::Error::Other { errno } if *errno == libc::EAGAIN)
@@ -333,8 +364,9 @@ struct AmfBitstreamDiagnostics {
     capture_file: Option<File>,
     total_packets: u64,
     captured_packets: u64,
+    seen_random_access: bool,
     seen_idr: bool,
-    warned_missing_idr: bool,
+    warned_missing_random_access: bool,
     validation_complete: bool,
 }
 
@@ -382,8 +414,9 @@ impl AmfBitstreamDiagnostics {
             capture_file,
             total_packets: 0,
             captured_packets: 0,
+            seen_random_access: false,
             seen_idr: false,
-            warned_missing_idr: false,
+            warned_missing_random_access: false,
             validation_complete: false,
         })
     }
@@ -397,6 +430,16 @@ impl AmfBitstreamDiagnostics {
     ) {
         self.total_packets += 1;
         let contains_idr = contains_nal_type(normalized_packet, 5);
+        if is_keyframe && !self.seen_random_access {
+            self.seen_random_access = true;
+            info!(
+                sequence,
+                packet_index = self.total_packets,
+                packet_is_key,
+                contains_idr,
+                "Observed first AMF random-access access unit after normalization"
+            );
+        }
         if contains_idr && !self.seen_idr {
             self.seen_idr = true;
             info!(
@@ -408,17 +451,17 @@ impl AmfBitstreamDiagnostics {
             );
         }
 
-        if !self.seen_idr
-            && !self.warned_missing_idr
+        if !self.seen_random_access
+            && !self.warned_missing_random_access
             && self.total_packets >= AMF_IDR_WARNING_PACKET
         {
             warn!(
                 packet_index = self.total_packets,
                 sequence,
                 capture_path = %self.capture_path.display(),
-                "AMF has not emitted any IDR by packet 60; decoder startup may still fail"
+                "AMF has not emitted any random-access access unit by packet 60; decoder startup may still fail"
             );
-            self.warned_missing_idr = true;
+            self.warned_missing_random_access = true;
         }
 
         if self.captured_packets < AMF_CAPTURE_PACKET_LIMIT {
@@ -958,6 +1001,15 @@ fn append_annex_b_unit(output: &mut Vec<u8>, unit: &[u8]) {
     output.extend_from_slice(unit);
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum H264SliceKind {
+    P,
+    B,
+    I,
+    SP,
+    SI,
+}
+
 fn nal_type(unit: &[u8]) -> Option<u8> {
     unit.first().map(|byte| byte & 0x1F)
 }
@@ -966,6 +1018,117 @@ fn contains_nal_type(data: &[u8], target: u8) -> bool {
     parse_annex_b_units(data)
         .iter()
         .any(|unit| nal_type(unit) == Some(target))
+}
+
+fn access_unit_is_intra_only(data: &[u8]) -> bool {
+    let units = parse_annex_b_units(data);
+    let mut saw_vcl = false;
+
+    for unit in &units {
+        match nal_type(unit) {
+            Some(5) => saw_vcl = true,
+            Some(1..=4) => {
+                saw_vcl = true;
+                let Some(slice_kind) = slice_kind(unit) else {
+                    return false;
+                };
+                if !matches!(slice_kind, H264SliceKind::I | H264SliceKind::SI) {
+                    return false;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    saw_vcl
+}
+
+fn slice_kind(unit: &[u8]) -> Option<H264SliceKind> {
+    match nal_type(unit)? {
+        5 => Some(H264SliceKind::I),
+        1..=4 => {
+            let rbsp = rbsp_from_ebsp(unit.get(1..)?);
+            let mut bits = BitReader::new(&rbsp);
+            let _first_mb_in_slice = bits.read_ue()?;
+            let slice_type = bits.read_ue()? % 5;
+            match slice_type {
+                0 => Some(H264SliceKind::P),
+                1 => Some(H264SliceKind::B),
+                2 => Some(H264SliceKind::I),
+                3 => Some(H264SliceKind::SP),
+                4 => Some(H264SliceKind::SI),
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
+fn rbsp_from_ebsp(data: &[u8]) -> Vec<u8> {
+    let mut rbsp = Vec::with_capacity(data.len());
+    let mut zero_count = 0usize;
+
+    for &byte in data {
+        if zero_count >= 2 && byte == 0x03 {
+            zero_count = 0;
+            continue;
+        }
+
+        rbsp.push(byte);
+        if byte == 0 {
+            zero_count += 1;
+        } else {
+            zero_count = 0;
+        }
+    }
+
+    rbsp
+}
+
+struct BitReader<'a> {
+    data: &'a [u8],
+    bit_offset: usize,
+}
+
+impl<'a> BitReader<'a> {
+    fn new(data: &'a [u8]) -> Self {
+        Self {
+            data,
+            bit_offset: 0,
+        }
+    }
+
+    fn read_bit(&mut self) -> Option<u8> {
+        let byte = *self.data.get(self.bit_offset / 8)?;
+        let shift = 7 - (self.bit_offset % 8);
+        self.bit_offset += 1;
+        Some((byte >> shift) & 1)
+    }
+
+    fn read_bits(&mut self, count: usize) -> Option<u32> {
+        let mut value = 0u32;
+        for _ in 0..count {
+            value = (value << 1) | u32::from(self.read_bit()?);
+        }
+        Some(value)
+    }
+
+    fn read_ue(&mut self) -> Option<u32> {
+        let mut leading_zero_bits = 0usize;
+        while self.read_bit()? == 0 {
+            leading_zero_bits += 1;
+            if leading_zero_bits >= 32 {
+                return None;
+            }
+        }
+
+        let suffix = if leading_zero_bits == 0 {
+            0
+        } else {
+            self.read_bits(leading_zero_bits)?
+        };
+        Some(((1u32 << leading_zero_bits) - 1) + suffix)
+    }
 }
 
 #[cfg(test)]
@@ -1037,5 +1200,19 @@ mod tests {
                 0x9A, 0x22
             ]
         );
+    }
+
+    #[test]
+    fn detects_non_idr_intra_access_unit_as_random_access() {
+        let payload = [0, 0, 0, 1, 0x09, 0x30, 0, 0, 0, 1, 0x41, 0xB8];
+
+        assert!(access_unit_is_intra_only(&payload));
+    }
+
+    #[test]
+    fn rejects_predicted_access_unit_as_random_access() {
+        let payload = [0, 0, 0, 1, 0x09, 0x30, 0, 0, 0, 1, 0x41, 0xE0];
+
+        assert!(!access_unit_is_intra_only(&payload));
     }
 }
