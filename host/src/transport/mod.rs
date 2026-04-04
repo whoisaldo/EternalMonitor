@@ -1,6 +1,7 @@
 pub mod fragment;
 
 use std::net::SocketAddr;
+use std::sync::mpsc as std_mpsc;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
@@ -8,7 +9,7 @@ use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
 use tracing::{info, warn};
 
-use crate::control::SharedControl;
+use crate::control::{SharedControl, SupervisorCommand};
 use crate::encoder::NALUnit;
 use crate::stats::PIPELINE_STATS;
 use fragment::{FragmentHeader, HEADER_SIZE, MAX_PAYLOAD_SIZE};
@@ -23,6 +24,7 @@ pub async fn start_sender(
     listen_port: u16,
     pipeline_epoch: Instant,
     shared: SharedControl,
+    supervisor_tx: std_mpsc::Sender<SupervisorCommand>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let bind_addr: SocketAddr = format!("0.0.0.0:{listen_port}").parse().unwrap();
     let socket = UdpSocket::bind(bind_addr).await?;
@@ -49,9 +51,22 @@ pub async fn start_sender(
                             } else {
                                 src
                             };
+                            let previous_target = *shared.target_addr.lock();
                             *shared.target_addr.lock() = target;
                             PIPELINE_STATS.lock().set_target_addr(target.to_string());
                             info!(%target, "iPad registered as receiver");
+
+                            if previous_target.ip().is_unspecified() || previous_target != target {
+                                info!(
+                                    previous = %previous_target,
+                                    current = %target,
+                                    "Receiver registration changed; restarting pipeline to send a fresh startup keyframe"
+                                );
+                                shared.stop();
+                                if let Err(error) = supervisor_tx.send(SupervisorCommand::Restart) {
+                                    warn!(error = %error, "Failed to request pipeline restart after receiver registration");
+                                }
+                            }
                         }
                     }
                     Err(e) => warn!(error = %e, "recv_from error"),

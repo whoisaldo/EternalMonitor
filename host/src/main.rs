@@ -80,7 +80,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     let supervisor_thread = std::thread::spawn(move || {
-        supervisor_loop(listen_port, shared, gpu_info, supervisor_rx);
+        supervisor_loop(listen_port, shared, gpu_info, supervisor_tx, supervisor_rx);
     });
 
     let _mdns = discovery::advertise_service(listen_port);
@@ -114,9 +114,15 @@ fn supervisor_loop(
     listen_port: u16,
     shared: SharedControl,
     gpu_info: gpu::GpuInfo,
+    supervisor_tx: mpsc::Sender<SupervisorCommand>,
     supervisor_rx: mpsc::Receiver<SupervisorCommand>,
 ) {
-    let mut pipeline_thread = Some(spawn_pipeline_thread(listen_port, shared.clone(), gpu_info.clone()));
+    let mut pipeline_thread = Some(spawn_pipeline_thread(
+        listen_port,
+        shared.clone(),
+        gpu_info.clone(),
+        supervisor_tx.clone(),
+    ));
 
     while let Ok(command) = supervisor_rx.recv() {
         match command {
@@ -136,7 +142,12 @@ fn supervisor_loop(
                     );
                 }
 
-                pipeline_thread = Some(spawn_pipeline_thread(listen_port, shared.clone(), gpu_info.clone()));
+                pipeline_thread = Some(spawn_pipeline_thread(
+                    listen_port,
+                    shared.clone(),
+                    gpu_info.clone(),
+                    supervisor_tx.clone(),
+                ));
             }
             SupervisorCommand::Shutdown => {
                 info!("Shutting down pipeline supervisor");
@@ -148,7 +159,12 @@ fn supervisor_loop(
     }
 }
 
-fn spawn_pipeline_thread(listen_port: u16, shared: SharedControl, gpu_info: gpu::GpuInfo) -> JoinHandle<()> {
+fn spawn_pipeline_thread(
+    listen_port: u16,
+    shared: SharedControl,
+    gpu_info: gpu::GpuInfo,
+    supervisor_tx: mpsc::Sender<SupervisorCommand>,
+) -> JoinHandle<()> {
     shared
         .running
         .store(true, std::sync::atomic::Ordering::SeqCst);
@@ -166,7 +182,7 @@ fn spawn_pipeline_thread(listen_port: u16, shared: SharedControl, gpu_info: gpu:
     std::thread::spawn(move || {
         let rt = tokio::runtime::Runtime::new().expect("Failed to create tokio runtime");
         rt.block_on(async move {
-            run_pipeline(listen_port, shared, gpu_info).await;
+            run_pipeline(listen_port, shared, gpu_info, supervisor_tx).await;
         });
     })
 }
@@ -179,7 +195,12 @@ fn join_pipeline_thread(pipeline_thread: &mut Option<JoinHandle<()>>) {
     }
 }
 
-async fn run_pipeline(listen_port: u16, shared: SharedControl, gpu_info: gpu::GpuInfo) {
+async fn run_pipeline(
+    listen_port: u16,
+    shared: SharedControl,
+    gpu_info: gpu::GpuInfo,
+    supervisor_tx: mpsc::Sender<SupervisorCommand>,
+) {
     // ffmpeg_next::init() is idempotent — called here as safety net for restarts
     if let Err(e) = ffmpeg_next::init() {
         error!(error = %e, "FFmpeg init failed");
@@ -191,7 +212,14 @@ async fn run_pipeline(listen_port: u16, shared: SharedControl, gpu_info: gpu::Gp
     let capture_rx = capture::start_capture(shared.clone(), gpu_info.adapter_index);
     let nal_rx = encoder::start_encoder(capture_rx, shared.clone(), gpu_info);
 
-    if let Err(e) = transport::start_sender(nal_rx, listen_port, pipeline_epoch, shared.clone()).await
+    if let Err(e) = transport::start_sender(
+        nal_rx,
+        listen_port,
+        pipeline_epoch,
+        shared.clone(),
+        supervisor_tx,
+    )
+    .await
     {
         error!(error = %e, "Transport sender exited with error");
     }
