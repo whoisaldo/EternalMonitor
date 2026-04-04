@@ -15,7 +15,7 @@ This repo currently contains a working Windows host capture/encode/transport pat
 Implemented now:
 
 - Windows host captures the primary display with DXGI Desktop Duplication
-- Host converts BGRA to YUV420P and encodes with hardware H.264 (NVENC, AMF, QSV, or software fallback)
+- Host converts BGRA to YUV420P and can select hardware H.264 encoders per GPU vendor
 - Host advertises an mDNS/DNS-SD service and streams frames over UDP on port `9876`
 - iPad app receives fragmented UDP datagrams, reassembles `FramePacket` payloads, decodes with VideoToolbox, and renders with Metal
 - Direct connect by IP works end to end with the current transport format
@@ -31,11 +31,12 @@ Not done yet:
 Known caveat:
 
 - The iPad "Scan network" path may fail to find the host even when direct IP connect works. Treat discovery as incomplete and use manual IP entry when needed.
+- NVIDIA is the current known-good encode/decode path. AMD and Intel encoder paths are present but still being validated against the iPad VideoToolbox decoder.
 
 ## How it works
 
 1. Windows host captures the desktop with DXGI Desktop Duplication
-2. Frames are read back, converted, and encoded with hardware H.264 (auto-detected per GPU vendor)
+2. Frames are read back, converted, and encoded with hardware H.264 (auto-detected per GPU vendor, with NVIDIA currently the verified path)
 3. Encoded `FramePacket` payloads are fragmented into UDP datagrams
 4. The iPad app reassembles and parses those payloads
 5. VideoToolbox decodes frames and Metal renders them

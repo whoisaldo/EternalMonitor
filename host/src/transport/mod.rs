@@ -67,7 +67,7 @@ pub async fn start_sender(
                 let send_start = Instant::now();
                 let timestamp_us = nal.timestamp.duration_since(pipeline_epoch).as_micros() as u64;
                 let seq = nal.sequence as u32;
-                let is_keyframe = detect_idr(&nal.data);
+                let is_keyframe = nal.is_keyframe;
 
                 let (width, height) = {
                     let stats = PIPELINE_STATS.lock();
@@ -144,28 +144,4 @@ pub async fn start_sender(
 
     info!("NAL channel closed, transport sender shutting down");
     Ok(())
-}
-
-/// Scan an Annex B NAL bitstream for IDR slice (NAL type 5) indicating a keyframe.
-fn detect_idr(data: &[u8]) -> bool {
-    let mut i = 0;
-    while i + 3 < data.len() {
-        if data[i] == 0 && data[i + 1] == 0 {
-            let nal_start = if data[i + 2] == 1 {
-                i + 3
-            } else if i + 3 < data.len() && data[i + 2] == 0 && data[i + 3] == 1 {
-                i + 4
-            } else {
-                i += 1;
-                continue;
-            };
-            if nal_start < data.len() && (data[nal_start] & 0x1F) == 5 {
-                return true;
-            }
-            i = nal_start;
-        } else {
-            i += 1;
-        }
-    }
-    false
 }

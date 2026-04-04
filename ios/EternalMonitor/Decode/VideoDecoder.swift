@@ -13,6 +13,9 @@ final class VideoDecoder {
     private var sps: Data?
     private var pps: Data?
     private var callbackRecord: UnsafeMutablePointer<VTDecompressionOutputCallbackRecord>?
+    private var loggedPacketizations = Set<String>()
+    private var loggedNALTypes = Set<UInt8>()
+    private var hasLoggedEmptyPayload = false
 
     private let decodeQueue = DispatchQueue(label: "com.eternal.decode", qos: .userInteractive)
 
@@ -42,10 +45,24 @@ final class VideoDecoder {
     // MARK: - Internal
 
     private func decodeOnQueue(packet: FramePacket) {
-        let nalUnits = parseNALUnits(from: packet.data)
+        let parsed = parseNALUnits(from: packet.data)
+        if loggedPacketizations.insert(parsed.packetization).inserted {
+            onEvent?("Detected \(parsed.packetization) H.264 packetization")
+        }
+
+        let nalUnits = parsed.units
+        guard !nalUnits.isEmpty else {
+            if !hasLoggedEmptyPayload {
+                onEvent?("No H.264 NAL units parsed from packet bytes=\(packet.data.count)")
+                hasLoggedEmptyPayload = true
+            }
+            return
+        }
+        hasLoggedEmptyPayload = false
 
         for nal in nalUnits {
             let nalType = nal[0] & 0x1F
+            logNALTypeIfNeeded(nalType)
 
             switch nalType {
             case 7: // SPS
@@ -64,40 +81,38 @@ final class VideoDecoder {
 
     // MARK: - NAL unit parsing (Annex B → individual NAL units)
 
-    private func parseNALUnits(from data: Data) -> [Data] {
+    private func parseNALUnits(from data: Data) -> (packetization: String, units: [Data]) {
+        let annexBUnits = parseAnnexBNALUnits(from: data)
+        if !annexBUnits.isEmpty {
+            return ("AnnexB", annexBUnits)
+        }
+
+        for lengthFieldBytes in [4, 2, 1] {
+            if let units = parseLengthPrefixedNALUnits(from: data, lengthFieldBytes: lengthFieldBytes) {
+                return ("AVCC(len=\(lengthFieldBytes))", units)
+            }
+        }
+
+        return ("Unknown", [])
+    }
+
+    private func parseAnnexBNALUnits(from data: Data) -> [Data] {
         var units: [Data] = []
-        var i = 0
         let count = data.count
 
         data.withUnsafeBytes { raw in
             let bytes = raw.bindMemory(to: UInt8.self)
 
-            func findStartCode(from pos: Int) -> (offset: Int, length: Int)? {
-                var j = pos
-                while j < count - 2 {
-                    if bytes[j] == 0 && bytes[j + 1] == 0 {
-                        if bytes[j + 2] == 1 {
-                            return (j, 3)
-                        }
-                        if j + 3 < count && bytes[j + 2] == 0 && bytes[j + 3] == 1 {
-                            return (j, 4)
-                        }
-                    }
-                    j += 1
-                }
-                return nil
-            }
-
-            guard let first = findStartCode(from: 0) else { return }
-            i = first.offset + first.length
+            guard let first = findStartCode(in: bytes, count: count, from: 0) else { return }
+            var i = first.offset + first.length
 
             while i < count {
-                if let next = findStartCode(from: i) {
-                    let nalData = Data(bytes: raw.baseAddress! + i, count: next.offset - i)
+                if let next = findStartCode(in: bytes, count: count, from: i) {
+                    let nalData = Data(bytes: raw.baseAddress! + i, count: next.offset - i).trimmingTrailingZeros()
                     if !nalData.isEmpty { units.append(nalData) }
                     i = next.offset + next.length
                 } else {
-                    let nalData = Data(bytes: raw.baseAddress! + i, count: count - i)
+                    let nalData = Data(bytes: raw.baseAddress! + i, count: count - i).trimmingTrailingZeros()
                     if !nalData.isEmpty { units.append(nalData) }
                     break
                 }
@@ -105,6 +120,47 @@ final class VideoDecoder {
         }
 
         return units
+    }
+
+    private func parseLengthPrefixedNALUnits(from data: Data, lengthFieldBytes: Int) -> [Data]? {
+        guard (1...4).contains(lengthFieldBytes), data.count >= lengthFieldBytes else { return nil }
+
+        var units: [Data] = []
+        var cursor = 0
+        while cursor + lengthFieldBytes <= data.count {
+            let nalLength = readBigEndianLength(from: data, offset: cursor, width: lengthFieldBytes)
+            cursor += lengthFieldBytes
+
+            guard nalLength > 0, cursor + nalLength <= data.count else { return nil }
+            units.append(data.subdata(in: cursor..<(cursor + nalLength)))
+            cursor += nalLength
+        }
+
+        return cursor == data.count && !units.isEmpty ? units : nil
+    }
+
+    private func logNALTypeIfNeeded(_ nalType: UInt8) {
+        guard loggedNALTypes.insert(nalType).inserted else { return }
+        onEvent?("First observed NAL type \(nalType) (\(describeNALType(nalType)))")
+    }
+
+    private func describeNALType(_ nalType: UInt8) -> String {
+        switch nalType {
+        case 1:
+            return "non-IDR slice"
+        case 5:
+            return "IDR slice"
+        case 6:
+            return "SEI"
+        case 7:
+            return "SPS"
+        case 8:
+            return "PPS"
+        case 9:
+            return "AUD"
+        default:
+            return "other"
+        }
     }
 
     // MARK: - Format description
@@ -296,6 +352,34 @@ private func decompressionCallback(
     decoder.onFrameDecoded?(pixelBuffer, timestampUs)
 }
 
+private func findStartCode(
+    in bytes: UnsafeBufferPointer<UInt8>,
+    count: Int,
+    from position: Int
+) -> (offset: Int, length: Int)? {
+    var index = position
+    while index < count - 2 {
+        if bytes[index] == 0 && bytes[index + 1] == 0 {
+            if bytes[index + 2] == 1 {
+                return (index, 3)
+            }
+            if index + 3 < count && bytes[index + 2] == 0 && bytes[index + 3] == 1 {
+                return (index, 4)
+            }
+        }
+        index += 1
+    }
+    return nil
+}
+
+private func readBigEndianLength(from data: Data, offset: Int, width: Int) -> Int {
+    var value = 0
+    for index in 0..<width {
+        value = (value << 8) | Int(data[offset + index])
+    }
+    return value
+}
+
 // MARK: - Helper for parameter set creation
 
 private extension Array where Element == Data {
@@ -323,5 +407,15 @@ private extension Array where Element == Data {
                 }
             }
         }
+    }
+}
+
+private extension Data {
+    func trimmingTrailingZeros() -> Data {
+        var trimmed = self
+        while trimmed.last == 0 {
+            trimmed.removeLast()
+        }
+        return trimmed
     }
 }
