@@ -87,12 +87,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     gui_control.shared.stop();
     gui_control.request_shutdown();
 
-    if let Err(error) = supervisor_thread.join() {
-        error!(error = ?error, "Supervisor thread panicked");
+    // Give the supervisor a bounded amount of time to shut down cleanly.
+    // If it doesn't finish (blocked on DXGI acquire, mDNS threads, etc.),
+    // force-exit so the process never lingers as an invisible zombie.
+    let shutdown_deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+    std::thread::spawn(move || {
+        if let Err(error) = supervisor_thread.join() {
+            error!(error = ?error, "Supervisor thread panicked");
+        }
+    });
+
+    while std::time::Instant::now() < shutdown_deadline {
+        std::thread::sleep(std::time::Duration::from_millis(50));
     }
 
     info!("EternalMonitor shutting down");
-    Ok(())
+    std::process::exit(0);
 }
 
 fn supervisor_loop(
