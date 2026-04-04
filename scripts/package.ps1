@@ -25,6 +25,7 @@ if (-not $ffmpegMatch.Success) {
 }
 $ffmpegBin = (Join-Path $ffmpegMatch.Groups[1].Value "bin")
 Copy-Item "$ffmpegBin\*.dll" "$distDir\"
+Copy-Item "$ffmpegBin\ffmpeg.exe" "$distDir\"
 Copy-Item "README.md" "$distDir\"
 Copy-Item "LICENSE" "$distDir\"
 

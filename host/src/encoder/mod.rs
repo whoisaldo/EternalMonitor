@@ -1,3 +1,7 @@
+use std::fs::{self, File};
+use std::io::Write;
+use std::path::PathBuf;
+use std::process::Command;
 use std::slice;
 use std::sync::atomic::Ordering;
 use std::time::Instant;
@@ -13,6 +17,8 @@ use crate::stats::PIPELINE_STATS;
 const CHANNEL_CAPACITY: usize = 4;
 const DEFAULT_BITRATE: u32 = 15_000_000;
 const AMF_ENCODER_NAME: &str = "h264_amf";
+const AMF_CAPTURE_PACKET_LIMIT: u64 = 120;
+const AMF_IDR_WARNING_PACKET: u64 = 60;
 
 /// Encoded H.264 NAL unit ready for transport.
 #[derive(Debug, Clone)]
@@ -127,6 +133,12 @@ fn run_encode_loop(
                         &gpu.encoder_name,
                     );
                     let is_keyframe = packet_is_key || contains_nal_type(&nal_data, 5);
+                    encoder.observe_amf_diagnostics(
+                        &nal_data,
+                        raw_frame.frame_number,
+                        packet_is_key,
+                        is_keyframe,
+                    );
 
                     PIPELINE_STATS
                         .lock()
@@ -170,6 +182,7 @@ struct EncoderState {
     frame: ffmpeg_next::frame::Video,
     packet: ffmpeg_next::Packet,
     h264: H264BitstreamState,
+    amf_diagnostics: Option<AmfBitstreamDiagnostics>,
 }
 
 impl EncoderState {
@@ -232,7 +245,20 @@ impl EncoderState {
             ),
             packet: ffmpeg_next::Packet::empty(),
             h264,
+            amf_diagnostics: AmfBitstreamDiagnostics::new(encoder_name),
         })
+    }
+
+    fn observe_amf_diagnostics(
+        &mut self,
+        normalized_packet: &[u8],
+        sequence: u64,
+        packet_is_key: bool,
+        is_keyframe: bool,
+    ) {
+        if let Some(diagnostics) = self.amf_diagnostics.as_mut() {
+            diagnostics.observe_packet(normalized_packet, sequence, packet_is_key, is_keyframe);
+        }
     }
 }
 
@@ -247,10 +273,14 @@ fn encoder_options(encoder_name: &str) -> ffmpeg_next::Dictionary<'_> {
             opts.set("rc", "cbr");
         }
         "h264_amf" => {
-            opts.set("usage", "ultralowlatency");
+            opts.set("usage", "lowlatency");
+            opts.set("latency", "1");
             opts.set("quality", "speed");
             opts.set("profile", "constrained_baseline");
-            opts.set("header_insertion_mode", "idr");
+            opts.set("level", "4.1");
+            opts.set("coder", "cavlc");
+            opts.set("aud", "1");
+            opts.set("header_spacing", "1");
             opts.set("rc", "cbr");
         }
         "h264_qsv" => {
@@ -296,6 +326,184 @@ struct H264BitstreamState {
     /// Counts packets through normalize; used to periodically inject SPS/PPS
     /// for encoders (AMF) that never produce IDR frames.
     packet_count: u64,
+}
+
+struct AmfBitstreamDiagnostics {
+    capture_path: PathBuf,
+    capture_file: Option<File>,
+    total_packets: u64,
+    captured_packets: u64,
+    seen_idr: bool,
+    warned_missing_idr: bool,
+    validation_complete: bool,
+}
+
+impl AmfBitstreamDiagnostics {
+    fn new(encoder_name: &str) -> Option<Self> {
+        if !is_amf_encoder(encoder_name) {
+            return None;
+        }
+
+        let capture_path = diagnostic_capture_path();
+        if let Some(parent) = capture_path.parent() {
+            if let Err(error) = fs::create_dir_all(parent) {
+                warn!(
+                    encoder = encoder_name,
+                    path = %capture_path.display(),
+                    error = %error,
+                    "Failed to create AMF diagnostic directory"
+                );
+            }
+        }
+
+        let capture_file = match File::create(&capture_path) {
+            Ok(file) => {
+                info!(
+                    encoder = encoder_name,
+                    path = %capture_path.display(),
+                    packet_limit = AMF_CAPTURE_PACKET_LIMIT,
+                    "Capturing normalized AMF packets for diagnostics"
+                );
+                Some(file)
+            }
+            Err(error) => {
+                warn!(
+                    encoder = encoder_name,
+                    path = %capture_path.display(),
+                    error = %error,
+                    "Failed to create AMF diagnostic capture file"
+                );
+                None
+            }
+        };
+
+        Some(Self {
+            capture_path,
+            capture_file,
+            total_packets: 0,
+            captured_packets: 0,
+            seen_idr: false,
+            warned_missing_idr: false,
+            validation_complete: false,
+        })
+    }
+
+    fn observe_packet(
+        &mut self,
+        normalized_packet: &[u8],
+        sequence: u64,
+        packet_is_key: bool,
+        is_keyframe: bool,
+    ) {
+        self.total_packets += 1;
+        let contains_idr = contains_nal_type(normalized_packet, 5);
+        if contains_idr && !self.seen_idr {
+            self.seen_idr = true;
+            info!(
+                sequence,
+                packet_index = self.total_packets,
+                packet_is_key,
+                is_keyframe,
+                "Observed first AMF IDR after normalization"
+            );
+        }
+
+        if !self.seen_idr
+            && !self.warned_missing_idr
+            && self.total_packets >= AMF_IDR_WARNING_PACKET
+        {
+            warn!(
+                packet_index = self.total_packets,
+                sequence,
+                capture_path = %self.capture_path.display(),
+                "AMF has not emitted any IDR by packet 60; decoder startup may still fail"
+            );
+            self.warned_missing_idr = true;
+        }
+
+        if self.captured_packets < AMF_CAPTURE_PACKET_LIMIT {
+            if let Some(file) = self.capture_file.as_mut() {
+                if let Err(error) = file.write_all(normalized_packet) {
+                    warn!(
+                        path = %self.capture_path.display(),
+                        error = %error,
+                        "Failed to append normalized AMF packet to diagnostic capture"
+                    );
+                    self.capture_file = None;
+                }
+            }
+
+            self.captured_packets += 1;
+            if self.captured_packets == AMF_CAPTURE_PACKET_LIMIT {
+                if let Some(file) = self.capture_file.as_mut() {
+                    if let Err(error) = file.flush() {
+                        warn!(
+                            path = %self.capture_path.display(),
+                            error = %error,
+                            "Failed to flush AMF diagnostic capture file"
+                        );
+                    }
+                }
+                self.capture_file = None;
+                self.validate_capture_with_ffmpeg();
+            }
+        }
+    }
+
+    fn validate_capture_with_ffmpeg(&mut self) {
+        if self.validation_complete {
+            return;
+        }
+        self.validation_complete = true;
+
+        let Some(ffmpeg_path) = find_ffmpeg_exe() else {
+            warn!(
+                path = %self.capture_path.display(),
+                "AMF diagnostic capture completed but ffmpeg.exe was not found for software decode validation"
+            );
+            return;
+        };
+
+        match Command::new(&ffmpeg_path)
+            .args([
+                "-hide_banner",
+                "-v",
+                "error",
+                "-i",
+                self.capture_path.to_string_lossy().as_ref(),
+                "-f",
+                "null",
+                "-",
+            ])
+            .output()
+        {
+            Ok(output) if output.status.success() => {
+                info!(
+                    capture = %self.capture_path.display(),
+                    ffmpeg = %ffmpeg_path.display(),
+                    "Local FFmpeg software decode of captured AMF bitstream succeeded"
+                );
+            }
+            Ok(output) => {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                error!(
+                    capture = %self.capture_path.display(),
+                    ffmpeg = %ffmpeg_path.display(),
+                    status = ?output.status.code(),
+                    stderr = %stderr.trim(),
+                    "Local FFmpeg software decode of captured AMF bitstream failed"
+                );
+            }
+            Err(error) => {
+                warn!(
+                    capture = %self.capture_path.display(),
+                    ffmpeg = %ffmpeg_path.display(),
+                    error = %error,
+                    "Failed to launch ffmpeg.exe for AMF software decode validation"
+                );
+            }
+        }
+    }
 }
 
 impl H264BitstreamState {
@@ -406,8 +614,7 @@ fn normalize_h264_payload(
     // so the decoder never receives SPS/PPS and can never initialize.
     // Force SPS/PPS injection on the first packet and every 30 packets.
     let amf_periodic_inject = is_amf_encoder(encoder_name)
-        && !has_sps
-        && !has_pps
+        && (!has_sps || !has_pps)
         && (state.packet_count == 0 || state.packet_count % 30 == 0);
     state.packet_count += 1;
 
@@ -682,6 +889,34 @@ fn is_amf_encoder(encoder_name: &str) -> bool {
     encoder_name == AMF_ENCODER_NAME
 }
 
+fn diagnostic_capture_path() -> PathBuf {
+    diagnostic_dir().join("amf-first-120-packets.h264")
+}
+
+fn diagnostic_dir() -> PathBuf {
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            return dir.join("diagnostics");
+        }
+    }
+    PathBuf::from("diagnostics")
+}
+
+fn find_ffmpeg_exe() -> Option<PathBuf> {
+    let bundled = diagnostic_dir()
+        .parent()
+        .map(|dir| dir.join("ffmpeg.exe"))
+        .filter(|path| path.is_file());
+    if bundled.is_some() {
+        return bundled;
+    }
+
+    std::env::var_os("FFMPEG_DIR")
+        .map(PathBuf::from)
+        .map(|dir| dir.join("bin").join("ffmpeg.exe"))
+        .filter(|path| path.is_file())
+}
+
 fn find_start_code(data: &[u8], from: usize) -> Option<(usize, usize)> {
     let mut i = from;
     while i + 3 <= data.len() {
@@ -781,5 +1016,26 @@ mod tests {
         let normalized = normalize_h264_payload(&payload, true, &mut state, "h264_nvenc");
 
         assert_eq!(normalized, payload);
+    }
+
+    #[test]
+    fn amf_periodic_injection_fills_missing_parameter_set_when_only_pps_is_inline() {
+        let extradata = [
+            1, 66, 0, 30, 0xFF, 0xE1, 0x00, 0x04, 0x67, 0x42, 0x00, 0x1E, 0x01, 0x00, 0x02, 0x68,
+            0xCE,
+        ];
+        let payload = [0, 0, 0, 1, 0x68, 0xCE, 0, 0, 0, 1, 0x41, 0x9A, 0x22];
+
+        let mut state = H264BitstreamState::default();
+        state.refresh_parameter_sets_from_extradata(Some(extradata.to_vec()));
+
+        let normalized = normalize_h264_payload(&payload, false, &mut state, "h264_amf");
+        assert_eq!(
+            normalized,
+            vec![
+                0, 0, 0, 1, 0x67, 0x42, 0x00, 0x1E, 0, 0, 0, 1, 0x68, 0xCE, 0, 0, 0, 1, 0x41,
+                0x9A, 0x22
+            ]
+        );
     }
 }
