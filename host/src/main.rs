@@ -2,6 +2,7 @@ mod capture;
 mod control;
 mod discovery;
 mod encoder;
+mod gpu;
 mod gui;
 mod logging;
 mod stats;
@@ -21,7 +22,7 @@ const DEFAULT_BITRATE_BPS: u32 = 15_000_000;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let env_filter =
-        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info,mdns_sd=warn"));
     let stdout_layer = tracing_subscriber::fmt::layer()
         .with_target(false)
         .with_writer(std::io::stdout.with_max_level(tracing::Level::INFO));
@@ -41,7 +42,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .and_then(|s| s.parse().ok())
         .unwrap_or(9876);
 
-    info!(listen_port, "EternalMonitor host starting");
+    // Initialize FFmpeg early so encoder probing works during GPU detection
+    if let Err(e) = ffmpeg_next::init() {
+        error!(error = %e, "FFmpeg init failed");
+        return Err(e.into());
+    }
+
+    let gpu_info = gpu::GpuInfo::detect();
+
+    info!("══════════════════════════════════");
+    info!("  EternalMonitor v0.1.0");
+    info!("  GPU:     {} ({})", gpu_info.name, gpu_info.vendor);
+    info!("  VRAM:    {} MB", gpu_info.dedicated_vram_mb);
+    info!("  Encoder: {}", gpu_info.codec_display_name);
+    info!("  Listen:  0.0.0.0:{}", listen_port);
+    info!("══════════════════════════════════");
 
     let shared = SharedControl::new(listen_port, DEFAULT_BITRATE_BPS);
     {
@@ -49,6 +64,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         stats.set_bitrate(DEFAULT_BITRATE_BPS);
         stats.set_listen_addr(gui::detect_local_ip(listen_port));
         stats.set_target_addr(shared.target_addr.lock().to_string());
+        stats.set_gpu_name(gpu_info.name.clone());
+        stats.set_codec_name(gpu_info.codec_display_name.clone());
     }
 
     let (supervisor_tx, supervisor_rx) = mpsc::channel();
@@ -58,7 +75,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     let supervisor_thread = std::thread::spawn(move || {
-        supervisor_loop(listen_port, shared, supervisor_rx);
+        supervisor_loop(listen_port, shared, gpu_info, supervisor_rx);
     });
 
     let _mdns = discovery::advertise_service(listen_port);
@@ -81,9 +98,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 fn supervisor_loop(
     listen_port: u16,
     shared: SharedControl,
+    gpu_info: gpu::GpuInfo,
     supervisor_rx: mpsc::Receiver<SupervisorCommand>,
 ) {
-    let mut pipeline_thread = Some(spawn_pipeline_thread(listen_port, shared.clone()));
+    let mut pipeline_thread = Some(spawn_pipeline_thread(listen_port, shared.clone(), gpu_info.clone()));
 
     while let Ok(command) = supervisor_rx.recv() {
         match command {
@@ -103,7 +121,7 @@ fn supervisor_loop(
                     );
                 }
 
-                pipeline_thread = Some(spawn_pipeline_thread(listen_port, shared.clone()));
+                pipeline_thread = Some(spawn_pipeline_thread(listen_port, shared.clone(), gpu_info.clone()));
             }
             SupervisorCommand::Shutdown => {
                 info!("Shutting down pipeline supervisor");
@@ -115,7 +133,7 @@ fn supervisor_loop(
     }
 }
 
-fn spawn_pipeline_thread(listen_port: u16, shared: SharedControl) -> JoinHandle<()> {
+fn spawn_pipeline_thread(listen_port: u16, shared: SharedControl, gpu_info: gpu::GpuInfo) -> JoinHandle<()> {
     shared
         .running
         .store(true, std::sync::atomic::Ordering::SeqCst);
@@ -133,7 +151,7 @@ fn spawn_pipeline_thread(listen_port: u16, shared: SharedControl) -> JoinHandle<
     std::thread::spawn(move || {
         let rt = tokio::runtime::Runtime::new().expect("Failed to create tokio runtime");
         rt.block_on(async move {
-            run_pipeline(listen_port, shared).await;
+            run_pipeline(listen_port, shared, gpu_info).await;
         });
     })
 }
@@ -146,7 +164,8 @@ fn join_pipeline_thread(pipeline_thread: &mut Option<JoinHandle<()>>) {
     }
 }
 
-async fn run_pipeline(listen_port: u16, shared: SharedControl) {
+async fn run_pipeline(listen_port: u16, shared: SharedControl, gpu_info: gpu::GpuInfo) {
+    // ffmpeg_next::init() is idempotent — called here as safety net for restarts
     if let Err(e) = ffmpeg_next::init() {
         error!(error = %e, "FFmpeg init failed");
         stats::PIPELINE_STATS.lock().mark_pipeline_stopped();
@@ -154,8 +173,8 @@ async fn run_pipeline(listen_port: u16, shared: SharedControl) {
     }
 
     let pipeline_epoch = Instant::now();
-    let capture_rx = capture::start_capture(shared.clone());
-    let nal_rx = encoder::start_encoder(capture_rx, shared.clone());
+    let capture_rx = capture::start_capture(shared.clone(), gpu_info.adapter_index);
+    let nal_rx = encoder::start_encoder(capture_rx, shared.clone(), gpu_info);
 
     if let Err(e) = transport::start_sender(nal_rx, listen_port, pipeline_epoch, shared.clone()).await
     {

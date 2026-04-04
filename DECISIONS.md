@@ -38,14 +38,22 @@ Earlier docs overstated this as a never-touch-CPU path. That is not true in the 
 
 ## Encoder
 
-### `ffmpeg-next` with NVENC
+### `ffmpeg-next` with multi-vendor hardware encode
 
-Chosen because it gives a workable Rust integration for H.264 hardware encode on NVIDIA GPUs.
+The host detects the GPU vendor via DXGI adapter enumeration and selects the best
+available hardware encoder using a vendor-preferred fallback chain:
+
+1. Vendor-preferred encoder (NVENC for NVIDIA, AMF for AMD, QSV for Intel)
+2. Other hardware encoders in order: NVENC → AMF → QSV
+3. Software fallback: libx264
+
+Each encoder has tuned low-latency options (`gpu.rs` resolves the encoder,
+`encoder/mod.rs` applies per-encoder settings). The GPU with the most dedicated
+VRAM is selected automatically; software adapters are excluded.
 
 Current reality:
 
-- The working path is `h264_nvenc`
-- The repo currently depends on that path for successful streaming
+- NVIDIA (h264_nvenc), AMD (h264_amf), Intel (h264_qsv), and software (libx264) paths are implemented
 - H.265 is not implemented in the active iPad path yet
 
 ### H.264 Baseline
@@ -106,4 +114,3 @@ These remain intentionally unresolved until the current WiFi UDP path is hardene
 - USB transport design
 - Virtual display driver integration details
 - Input relay protocol and host injection mechanism
-- Multi-codec negotiation

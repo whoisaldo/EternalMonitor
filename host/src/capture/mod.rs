@@ -40,11 +40,11 @@ pub struct RawFrame {
 
 /// Starts the DXGI Desktop Duplication capture loop on a dedicated blocking thread.
 /// Returns an `mpsc::Receiver<RawFrame>` that downstream pipeline stages can consume.
-pub fn start_capture(shared: SharedControl) -> mpsc::Receiver<RawFrame> {
+pub fn start_capture(shared: SharedControl, adapter_index: u32) -> mpsc::Receiver<RawFrame> {
     let (tx, rx) = mpsc::channel::<RawFrame>(4);
 
     tokio::task::spawn_blocking(move || {
-        if let Err(e) = run_capture_loop(tx, shared) {
+        if let Err(e) = run_capture_loop(tx, shared, adapter_index) {
             error!(error = %e, "Capture loop exited with error");
         }
     });
@@ -57,11 +57,12 @@ pub fn start_capture(shared: SharedControl) -> mpsc::Receiver<RawFrame> {
 fn run_capture_loop(
     tx: mpsc::Sender<RawFrame>,
     shared: SharedControl,
+    adapter_index: u32,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // --- Create DXGI factory and select the adapter driving the primary output ---
     let factory: IDXGIFactory1 = unsafe { CreateDXGIFactory1()? };
 
-    let adapter: IDXGIAdapter1 = unsafe { factory.EnumAdapters1(0)? };
+    let adapter: IDXGIAdapter1 = unsafe { factory.EnumAdapters1(adapter_index)? };
     let adapter_desc = unsafe { adapter.GetDesc1()? };
     let adapter_name = String::from_utf16_lossy(
         &adapter_desc

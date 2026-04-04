@@ -1,3 +1,14 @@
+## Unreleased
+
+### What's new
+- Multi-vendor GPU support: automatic detection of NVIDIA, AMD, and Intel GPUs via DXGI
+- Encoder fallback chain: NVENC → AMF → QSV → libx264 (software)
+- Per-encoder optimized low-latency settings
+- Startup banner showing detected GPU, encoder, and listen address
+- Suppressed mDNS multicast log spam from Tailscale interfaces
+
+---
+
 ## EternalMonitor v0.1.0-mirror
 
 First public release. Use your iPad as a wireless second monitor for Windows over local WiFi.

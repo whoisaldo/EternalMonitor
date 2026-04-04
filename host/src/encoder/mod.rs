@@ -6,11 +6,11 @@ use tracing::{error, info, warn};
 
 use crate::capture::RawFrame;
 use crate::control::SharedControl;
+use crate::gpu::GpuInfo;
 use crate::stats::PIPELINE_STATS;
 
 const CHANNEL_CAPACITY: usize = 4;
 const DEFAULT_BITRATE: u32 = 15_000_000;
-const CODEC_NAME: &str = "H.264 (NVENC)";
 
 /// Encoded H.264 NAL unit ready for transport.
 #[derive(Debug, Clone)]
@@ -21,16 +21,17 @@ pub struct NALUnit {
     pub encode_duration_us: u128,
 }
 
-/// Starts the NVENC H.264 encode loop on a dedicated blocking thread.
+/// Starts the H.264 encode loop on a dedicated blocking thread.
 /// Consumes `RawFrame`s from the capture stage and produces `NALUnit`s.
 pub fn start_encoder(
     rx: mpsc::Receiver<RawFrame>,
     shared: SharedControl,
+    gpu: GpuInfo,
 ) -> mpsc::Receiver<NALUnit> {
     let (tx, nal_rx) = mpsc::channel::<NALUnit>(CHANNEL_CAPACITY);
 
     tokio::task::spawn_blocking(move || {
-        if let Err(e) = run_encode_loop(rx, tx, shared) {
+        if let Err(e) = run_encode_loop(rx, tx, shared, gpu) {
             error!(error = %e, "Encode loop exited with error");
         }
     });
@@ -42,11 +43,13 @@ fn run_encode_loop(
     rx: mpsc::Receiver<RawFrame>,
     tx: mpsc::Sender<NALUnit>,
     shared: SharedControl,
+    gpu: GpuInfo,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let codec = ffmpeg_next::encoder::find_by_name("h264_nvenc")
-        .ok_or("h264_nvenc codec not found — is NVENC-enabled FFmpeg installed?")?;
-    info!("Found h264_nvenc codec");
-    PIPELINE_STATS.lock().set_codec_name(CODEC_NAME);
+    if ffmpeg_next::encoder::find_by_name(&gpu.encoder_name).is_none() {
+        return Err(format!("{} codec not found in FFmpeg", gpu.encoder_name).into());
+    }
+    info!(encoder = %gpu.encoder_name, "Found encoder codec");
+    PIPELINE_STATS.lock().set_codec_name(&gpu.codec_display_name);
 
     let mut encoder_state: Option<EncoderState> = None;
     let mut rx = rx;
@@ -66,7 +69,7 @@ fn run_encode_loop(
         }
 
         if encoder_state.is_none() {
-            encoder_state = Some(EncoderState::new(codec, raw_frame.width, raw_frame.height)?);
+            encoder_state = Some(EncoderState::new(&gpu.encoder_name, raw_frame.width, raw_frame.height)?);
         }
 
         let encoder = encoder_state
@@ -148,10 +151,12 @@ struct EncoderState {
 
 impl EncoderState {
     fn new(
-        codec: ffmpeg_next::Codec,
+        encoder_name: &str,
         width: u32,
         height: u32,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+        let codec = ffmpeg_next::encoder::find_by_name(encoder_name)
+            .ok_or_else(|| format!("{} codec not found in FFmpeg", encoder_name))?;
         let context = ffmpeg_next::codec::Context::new_with_codec(codec);
         let mut encoder = context.encoder().video()?;
 
@@ -163,15 +168,10 @@ impl EncoderState {
         encoder.set_bit_rate(DEFAULT_BITRATE as usize);
         encoder.set_gop(30);
 
-        let mut opts = ffmpeg_next::Dictionary::new();
-        opts.set("preset", "p1");
-        opts.set("tune", "ll");
-        opts.set("profile", "baseline");
-        opts.set("zerolatency", "1");
-        opts.set("rc", "cbr");
+        let opts = encoder_options(encoder_name);
 
         let encoder = encoder.open_with(opts)?;
-        info!(width, height, bitrate = DEFAULT_BITRATE, "NVENC encoder opened");
+        info!(width, height, bitrate = DEFAULT_BITRATE, encoder = encoder_name, "Encoder opened");
 
         let scaler = ffmpeg_next::software::scaling::Context::get(
             ffmpeg_next::format::Pixel::BGRA,
@@ -192,6 +192,39 @@ impl EncoderState {
             packet: ffmpeg_next::Packet::empty(),
         })
     }
+}
+
+fn encoder_options(encoder_name: &str) -> ffmpeg_next::Dictionary<'_> {
+    let mut opts = ffmpeg_next::Dictionary::new();
+    match encoder_name {
+        "h264_nvenc" => {
+            opts.set("preset", "p1");
+            opts.set("tune", "ll");
+            opts.set("profile", "baseline");
+            opts.set("zerolatency", "1");
+            opts.set("rc", "cbr");
+        }
+        "h264_amf" => {
+            opts.set("usage", "ultralowlatency");
+            opts.set("quality", "speed");
+            opts.set("profile", "baseline");
+            opts.set("rc", "cbr");
+        }
+        "h264_qsv" => {
+            opts.set("preset", "veryfast");
+            opts.set("profile", "baseline");
+            opts.set("look_ahead", "0");
+        }
+        "libx264" => {
+            opts.set("preset", "ultrafast");
+            opts.set("tune", "zerolatency");
+            opts.set("profile", "baseline");
+        }
+        _ => {
+            opts.set("profile", "baseline");
+        }
+    }
+    opts
 }
 
 fn apply_bitrate(
