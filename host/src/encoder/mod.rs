@@ -354,8 +354,7 @@ struct H264BitstreamState {
     logged_first_packet: bool,
     warned_missing_parameter_sets: bool,
     amf_packet_logs: usize,
-    /// Counts packets through normalize; used to periodically inject SPS/PPS
-    /// for encoders (AMF) that never produce IDR frames.
+    /// Counts packets through normalize; used for AMF first-packet safeguards.
     packet_count: u64,
 }
 
@@ -653,16 +652,15 @@ fn normalize_h264_payload(
     let has_sps = parsed.units.iter().any(|unit| nal_type(unit) == Some(7));
     let has_pps = parsed.units.iter().any(|unit| nal_type(unit) == Some(8));
 
-    // AMF in ultralowlatency mode never produces IDR frames (NAL type 5),
-    // so the decoder never receives SPS/PPS and can never initialize.
-    // Force SPS/PPS injection on the first packet and every 30 packets.
-    let amf_periodic_inject = is_amf_encoder(encoder_name)
-        && (!has_sps || !has_pps)
-        && (state.packet_count == 0 || state.packet_count % 30 == 0);
+    // AMF startup sometimes omits inline SPS/PPS even when the first access unit is a sync
+    // sample. Prefix cached parameter sets on the first packet only; reinserting them later on
+    // inter frames can cause the iPad decoder to rebuild its session mid-GOP and freeze.
+    let amf_startup_inject =
+        is_amf_encoder(encoder_name) && (!has_sps || !has_pps) && state.packet_count == 0;
     state.packet_count += 1;
 
     let should_prefix_parameter_sets =
-        ((packet_is_key || contains_idr) && (!has_sps || !has_pps)) || amf_periodic_inject;
+        ((packet_is_key || contains_idr) && (!has_sps || !has_pps)) || amf_startup_inject;
 
     let mut output = Vec::with_capacity(data.len() + 128);
     if should_prefix_parameter_sets {
@@ -1182,7 +1180,7 @@ mod tests {
     }
 
     #[test]
-    fn amf_periodic_injection_fills_missing_parameter_set_when_only_pps_is_inline() {
+    fn amf_startup_injection_fills_missing_parameter_set_when_only_pps_is_inline() {
         let extradata = [
             1, 66, 0, 30, 0xFF, 0xE1, 0x00, 0x04, 0x67, 0x42, 0x00, 0x1E, 0x01, 0x00, 0x02, 0x68,
             0xCE,
@@ -1200,6 +1198,22 @@ mod tests {
                 0x9A, 0x22
             ]
         );
+    }
+
+    #[test]
+    fn amf_does_not_reinject_parameter_sets_mid_stream_on_inter_frame() {
+        let extradata = [
+            1, 66, 0, 30, 0xFF, 0xE1, 0x00, 0x04, 0x67, 0x42, 0x00, 0x1E, 0x01, 0x00, 0x02, 0x68,
+            0xCE,
+        ];
+        let payload = [0, 0, 0, 1, 0x68, 0xCE, 0, 0, 0, 1, 0x41, 0x9A, 0x22];
+
+        let mut state = H264BitstreamState::default();
+        state.refresh_parameter_sets_from_extradata(Some(extradata.to_vec()));
+        state.packet_count = 30;
+
+        let normalized = normalize_h264_payload(&payload, false, &mut state, "h264_amf");
+        assert_eq!(normalized, payload);
     }
 
     #[test]
