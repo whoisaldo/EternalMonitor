@@ -59,4 +59,19 @@ mod tests {
         assert_eq!(recovered.fragment_count, header.fragment_count);
         assert_eq!(recovered.payload_len, header.payload_len);
     }
+
+    #[test]
+    fn header_is_little_endian() {
+        let header = FragmentHeader {
+            seq: 0x0102_0304,
+            fragment_index: 0x0506,
+            fragment_count: 0x0708,
+            payload_len: 0x090A_0B0C,
+        };
+        let bytes = header.to_bytes();
+        assert_eq!(&bytes[0..4], &[0x04, 0x03, 0x02, 0x01]);
+        assert_eq!(&bytes[4..6], &[0x06, 0x05]);
+        assert_eq!(&bytes[6..8], &[0x08, 0x07]);
+        assert_eq!(&bytes[8..12], &[0x0C, 0x0B, 0x0A, 0x09]);
+    }
 }

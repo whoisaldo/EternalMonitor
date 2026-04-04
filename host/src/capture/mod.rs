@@ -1,10 +1,12 @@
 use std::collections::VecDeque;
+use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 use windows::core::Interface;
 
+use crate::control::SharedControl;
 use crate::stats::PIPELINE_STATS;
 use windows::Win32::Foundation::RECT;
 use windows::Win32::Graphics::Direct3D::D3D_DRIVER_TYPE_UNKNOWN;
@@ -38,11 +40,11 @@ pub struct RawFrame {
 
 /// Starts the DXGI Desktop Duplication capture loop on a dedicated blocking thread.
 /// Returns an `mpsc::Receiver<RawFrame>` that downstream pipeline stages can consume.
-pub fn start_capture() -> mpsc::Receiver<RawFrame> {
+pub fn start_capture(shared: SharedControl) -> mpsc::Receiver<RawFrame> {
     let (tx, rx) = mpsc::channel::<RawFrame>(4);
 
     tokio::task::spawn_blocking(move || {
-        if let Err(e) = run_capture_loop(tx) {
+        if let Err(e) = run_capture_loop(tx, shared) {
             error!(error = %e, "Capture loop exited with error");
         }
     });
@@ -54,6 +56,7 @@ pub fn start_capture() -> mpsc::Receiver<RawFrame> {
 /// and pull frames at ~60fps. Runs on a blocking thread — never call from async context.
 fn run_capture_loop(
     tx: mpsc::Sender<RawFrame>,
+    shared: SharedControl,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // --- Create DXGI factory and select the adapter driving the primary output ---
     let factory: IDXGIFactory1 = unsafe { CreateDXGIFactory1()? };
@@ -69,6 +72,7 @@ fn run_capture_loop(
             .collect::<Vec<_>>(),
     );
     info!(adapter = %adapter_name, "Selected GPU adapter");
+    PIPELINE_STATS.lock().set_gpu_name(adapter_name);
 
     // --- Select primary output (index 0) ---
     let output: IDXGIOutput = unsafe { adapter.EnumOutputs(0)? };
@@ -143,6 +147,11 @@ fn run_capture_loop(
     let mut dirty_rect_buf: Vec<RECT> = Vec::with_capacity(64);
 
     loop {
+        if !shared.running.load(Ordering::SeqCst) {
+            info!("Capture loop stopping on running=false");
+            break;
+        }
+
         let frame_start = Instant::now();
 
         let mut frame_info = DXGI_OUTDUPL_FRAME_INFO::default();
@@ -270,6 +279,10 @@ fn run_capture_loop(
             }
             Err(e) if e.code() == DXGI_ERROR_WAIT_TIMEOUT => {
                 // Desktop unchanged — not an error.
+                if !shared.running.load(Ordering::SeqCst) {
+                    info!("Capture loop stopping after timeout on running=false");
+                    break;
+                }
                 continue;
             }
             Err(e) if e.code() == DXGI_ERROR_ACCESS_LOST => {

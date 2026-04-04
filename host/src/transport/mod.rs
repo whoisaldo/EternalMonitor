@@ -1,12 +1,14 @@
 pub mod fragment;
 
 use std::net::SocketAddr;
-use std::time::Instant;
+use std::sync::atomic::Ordering;
+use std::time::{Duration, Instant};
 
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
 use tracing::{info, warn};
 
+use crate::control::SharedControl;
 use crate::encoder::NALUnit;
 use crate::stats::PIPELINE_STATS;
 use fragment::{FragmentHeader, HEADER_SIZE, MAX_PAYLOAD_SIZE};
@@ -15,82 +17,64 @@ use fragment::{FragmentHeader, HEADER_SIZE, MAX_PAYLOAD_SIZE};
 const HELLO_MAGIC: &[u8] = b"ETERNALHELLO";
 
 /// Consumes NAL units from the encoder, serializes each as a FlatBuffer FramePacket,
-/// fragments into MTU-safe UDP datagrams, and sends them to the registered client.
-///
-/// The sender binds to a known port (from `listen_port`) and waits for a client to
-/// send a HELLO_MAGIC registration packet. Once received, frames are streamed to
-/// that client's address. If a new client sends HELLO, the target switches.
+/// fragments into MTU-safe UDP datagrams, and sends them to the current target address.
 pub async fn start_sender(
     mut nal_rx: mpsc::Receiver<NALUnit>,
     listen_port: u16,
     pipeline_epoch: Instant,
+    shared: SharedControl,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let bind_addr: SocketAddr = format!("0.0.0.0:{}", listen_port).parse().unwrap();
+    let bind_addr: SocketAddr = format!("0.0.0.0:{listen_port}").parse().unwrap();
     let socket = UdpSocket::bind(bind_addr).await?;
     socket.set_broadcast(true)?;
 
     let local_addr = socket.local_addr()?;
     info!(%local_addr, "UDP transport ready — waiting for iPad to connect");
-    {
-        let mut s = PIPELINE_STATS.lock();
-        s.target_addr = "waiting for client...".to_string();
-    }
+    PIPELINE_STATS
+        .lock()
+        .set_target_addr(shared.target_addr.lock().to_string());
 
-    // Wait for the iPad to send a HELLO registration packet.
-    let mut client_addr: Option<SocketAddr> = None;
     let mut hello_buf = [0u8; 64];
 
-    // Drain NALs while also checking for HELLO packets.
-    // We use a select loop so we can receive both NALs and registration packets.
     loop {
         tokio::select! {
-            // Check for incoming registration / keepalive packets
             result = socket.recv_from(&mut hello_buf) => {
                 match result {
                     Ok((len, src)) => {
                         if len >= HELLO_MAGIC.len() && &hello_buf[..HELLO_MAGIC.len()] == HELLO_MAGIC {
-                            // HELLO payload: "ETERNALHELLO" + optional 2-byte LE listen port
-                            let listen_port = if len >= HELLO_MAGIC.len() + 2 {
+                            let target = if len >= HELLO_MAGIC.len() + 2 {
                                 let offset = HELLO_MAGIC.len();
-                                u16::from_le_bytes([hello_buf[offset], hello_buf[offset + 1]])
+                                let listen_port = u16::from_le_bytes([hello_buf[offset], hello_buf[offset + 1]]);
+                                SocketAddr::new(src.ip(), listen_port)
                             } else {
-                                src.port()
+                                src
                             };
-                            let target = SocketAddr::new(src.ip(), listen_port);
-                            if client_addr.as_ref() != Some(&target) {
-                                info!(%target, "iPad registered as receiver");
-                                client_addr = Some(target);
-                                PIPELINE_STATS.lock().target_addr = target.to_string();
-                            }
+                            *shared.target_addr.lock() = target;
+                            PIPELINE_STATS.lock().set_target_addr(target.to_string());
+                            info!(%target, "iPad registered as receiver");
                         }
                     }
-                    Err(e) => {
-                        warn!(error = %e, "recv_from error");
-                    }
+                    Err(e) => warn!(error = %e, "recv_from error"),
                 }
             }
-            // Process NAL units when we have a client
             nal_opt = nal_rx.recv() => {
                 let Some(nal) = nal_opt else { break; };
-
-                let Some(target_addr) = client_addr else {
-                    // No client registered yet — drop the frame
+                let target_addr = *shared.target_addr.lock();
+                if target_addr.ip().is_unspecified() || target_addr.port() == 0 {
                     continue;
-                };
+                }
 
                 let send_start = Instant::now();
                 let timestamp_us = nal.timestamp.duration_since(pipeline_epoch).as_micros() as u64;
                 let seq = nal.sequence as u32;
-
-                // Detect IDR (keyframe) by scanning for NAL unit type 5 in Annex B stream
                 let is_keyframe = detect_idr(&nal.data);
 
-                // Use actual capture resolution from stats
-                let (w, h) = PIPELINE_STATS.lock().capture_resolution;
-                let width = if w > 0 { w } else { 1920 };
-                let height = if h > 0 { h } else { 1080 };
+                let (width, height) = {
+                    let stats = PIPELINE_STATS.lock();
+                    let (w, h) = stats.capture_resolution;
+                    (w.max(1), h.max(1))
+                };
 
-                // Serialize NAL unit as FlatBuffer FramePacket.
                 let fb_bytes = eternal_proto::frame::serialize_frame_packet(
                     seq,
                     timestamp_us,
@@ -100,7 +84,6 @@ pub async fn start_sender(
                     is_keyframe,
                 );
 
-                // Fragment and send.
                 let total_bytes = fb_bytes.len();
                 let chunks: Vec<&[u8]> = fb_bytes.chunks(MAX_PAYLOAD_SIZE).collect();
                 if chunks.len() > u16::MAX as usize {
@@ -131,9 +114,14 @@ pub async fn start_sender(
                     }
                 }
 
-                PIPELINE_STATS
-                    .lock()
-                    .record_transport(total_bytes as u64, fragment_count as u64);
+                let latency_ms = send_start.elapsed().as_secs_f64() * 1000.0
+                    + nal.encode_duration_us as f64 / 1000.0;
+                PIPELINE_STATS.lock().record_transport(
+                    total_bytes as u64,
+                    fragment_count as u64,
+                    latency_ms,
+                    target_addr.to_string(),
+                );
 
                 let send_us = send_start.elapsed().as_micros();
                 info!(
@@ -141,8 +129,15 @@ pub async fn start_sender(
                     fragments = fragment_count,
                     total_bytes,
                     send_us,
+                    target = %target_addr,
                     "Packet sent"
                 );
+            }
+            _ = tokio::time::sleep(Duration::from_millis(50)) => {
+                if !shared.running.load(Ordering::SeqCst) {
+                    info!("Transport loop stopping on running=false");
+                    break;
+                }
             }
         }
     }
@@ -155,21 +150,17 @@ pub async fn start_sender(
 fn detect_idr(data: &[u8]) -> bool {
     let mut i = 0;
     while i + 3 < data.len() {
-        // Look for start code (0x00 0x00 0x01) or (0x00 0x00 0x00 0x01)
         if data[i] == 0 && data[i + 1] == 0 {
-            let (nal_start, _) = if data[i + 2] == 1 {
-                (i + 3, 3)
+            let nal_start = if data[i + 2] == 1 {
+                i + 3
             } else if i + 3 < data.len() && data[i + 2] == 0 && data[i + 3] == 1 {
-                (i + 4, 4)
+                i + 4
             } else {
                 i += 1;
                 continue;
             };
-            if nal_start < data.len() {
-                let nal_type = data[nal_start] & 0x1F;
-                if nal_type == 5 {
-                    return true;
-                }
+            if nal_start < data.len() && (data[nal_start] & 0x1F) == 5 {
+                return true;
             }
             i = nal_start;
         } else {
