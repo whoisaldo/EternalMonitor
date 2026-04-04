@@ -13,7 +13,7 @@ use windows::Win32::System::Registry::{
 };
 
 use crate::control::GuiControl;
-use crate::logging::recent_log_text;
+use crate::logging::{session_log_path, session_log_text};
 use crate::stats::PIPELINE_STATS;
 
 const BG: egui::Color32 = egui::Color32::from_rgb(10, 10, 10);
@@ -341,14 +341,18 @@ impl AnalyzerApp {
                 self.control.request_restart();
             }
             let copy_logs_button = ui.add_enabled(
-                recent_log_text(50).is_some(),
+                session_log_text().is_some(),
                 egui::Button::new("Copy logs").corner_radius(8.0),
             );
             if copy_logs_button.clicked() {
-                if let Some(log_text) = recent_log_text(50) {
+                if let Some(log_text) = session_log_text() {
                     ui.ctx().copy_text(log_text);
                 }
             }
+            copy_logs_button.clone().on_hover_text(format!(
+                "Copies the full session log from {}",
+                session_log_path().display()
+            ));
             if copy_logs_button.hovered() && !copy_logs_button.enabled() {
                 copy_logs_button.on_hover_text("No recent log lines have been captured yet.");
             }

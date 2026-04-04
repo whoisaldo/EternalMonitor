@@ -37,6 +37,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with(memory_layer)
         .init();
 
+    info!(
+        path = %logging::session_log_path().display(),
+        "Session log file initialized"
+    );
+
     let listen_port: u16 = std::env::args()
         .nth(1)
         .and_then(|s| s.parse().ok())
