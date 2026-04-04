@@ -51,7 +51,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let gpu_info = gpu::GpuInfo::detect();
 
     info!("══════════════════════════════════");
-    info!("  EternalMonitor v0.1.0");
+    info!("  EternalMonitor v0.1.1");
     info!("  GPU:     {} ({})", gpu_info.name, gpu_info.vendor);
     info!("  VRAM:    {} MB", gpu_info.dedicated_vram_mb);
     info!("  Encoder: {}", gpu_info.codec_display_name);

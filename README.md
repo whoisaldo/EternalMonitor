@@ -1,7 +1,7 @@
 # EternalMonitor
 
-[![Version](https://img.shields.io/badge/version-v0.1.0--mirror-e8ff47?style=flat&labelColor=111)](https://github.com/whoisaldo/EternalMonitor/releases/tag/v0.1.0-mirror)
-[![Download](https://img.shields.io/badge/download-windows-blue?style=flat&labelColor=111)](https://github.com/whoisaldo/EternalMonitor/releases/download/v0.1.0-mirror/EternalMonitor-v0.1.0-mirror-windows.zip)
+[![Version](https://img.shields.io/badge/version-v0.1.1--mirror-e8ff47?style=flat&labelColor=111)](https://github.com/whoisaldo/EternalMonitor/releases/tag/v0.1.1-mirror)
+[![Download](https://img.shields.io/badge/download-windows-blue?style=flat&labelColor=111)](https://github.com/whoisaldo/EternalMonitor/releases/download/v0.1.1-mirror/EternalMonitor-v0.1.1-mirror-windows.zip)
 [![Website](https://img.shields.io/badge/website-eternalmonitor.dev-e8ff47?style=flat&labelColor=111)](https://eternalmonitor.dev)
 
 **Website:** [eternalmonitor.dev](https://eternalmonitor.dev)
@@ -15,7 +15,7 @@ This repo currently contains a working Windows host capture/encode/transport pat
 Implemented now:
 
 - Windows host captures the primary display with DXGI Desktop Duplication
-- Host converts BGRA to YUV420P and encodes with NVENC H.264
+- Host converts BGRA to YUV420P and encodes with hardware H.264 (NVENC, AMF, QSV, or software fallback)
 - Host advertises an mDNS/DNS-SD service and streams frames over UDP on port `9876`
 - iPad app receives fragmented UDP datagrams, reassembles `FramePacket` payloads, decodes with VideoToolbox, and renders with Metal
 - Direct connect by IP works end to end with the current transport format
@@ -35,7 +35,7 @@ Known caveat:
 ## How it works
 
 1. Windows host captures the desktop with DXGI Desktop Duplication
-2. Frames are read back, converted, and encoded with NVENC H.264
+2. Frames are read back, converted, and encoded with hardware H.264 (auto-detected per GPU vendor)
 3. Encoded `FramePacket` payloads are fragmented into UDP datagrams
 4. The iPad app reassembles and parses those payloads
 5. VideoToolbox decodes frames and Metal renders them
@@ -52,7 +52,7 @@ proto/    Shared protocol serialization code and schemas
 
 ## Build and run
 
-Requires Windows with Rust stable MSVC and an FFmpeg/NVENC-capable setup for the host. The iOS app must be built on macOS with Xcode for a physical device.
+Requires Windows with Rust stable MSVC and FFmpeg 7.1 for the host (GPU encoding auto-detected). The iOS app must be built on macOS with Xcode for a physical device.
 
 ### Windows host
 

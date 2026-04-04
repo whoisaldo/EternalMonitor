@@ -1,4 +1,4 @@
-## Unreleased
+## EternalMonitor v0.1.1-mirror
 
 ### What's new
 - Multi-vendor GPU support: automatic detection of NVIDIA, AMD, and Intel GPUs via DXGI

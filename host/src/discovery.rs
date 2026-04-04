@@ -23,7 +23,7 @@ pub fn advertise_service(port: u16) -> Option<ServiceDaemon> {
     let host = hostname().unwrap_or_else(|| "eternal-host".to_string());
     let host_fqdn = format!("{}.local.", host);
 
-    let properties = [("version", "0.1.0"), ("platform", "windows")];
+    let properties = [("version", "0.1.1"), ("platform", "windows")];
 
     let instance_name = format!("{} ({})", INSTANCE_NAME, host);
 
