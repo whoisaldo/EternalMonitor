@@ -1,6 +1,7 @@
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{mpsc, Arc};
+use std::time::Instant;
 
 use parking_lot::Mutex;
 use tracing::warn;
@@ -10,6 +11,7 @@ pub struct SharedControl {
     pub running: Arc<AtomicBool>,
     pub bitrate_bps: Arc<AtomicU32>,
     pub target_addr: Arc<Mutex<SocketAddr>>,
+    pub last_receiver_restart_at: Arc<Mutex<Option<Instant>>>,
 }
 
 impl SharedControl {
@@ -18,6 +20,7 @@ impl SharedControl {
             running: Arc::new(AtomicBool::new(false)),
             bitrate_bps: Arc::new(AtomicU32::new(initial_bitrate_bps)),
             target_addr: Arc::new(Mutex::new(SocketAddr::from(([0, 0, 0, 0], listen_port)))),
+            last_receiver_restart_at: Arc::new(Mutex::new(None)),
         }
     }
 

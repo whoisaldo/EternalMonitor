@@ -16,6 +16,7 @@ use fragment::{FragmentHeader, HEADER_SIZE, MAX_PAYLOAD_SIZE};
 
 /// Magic bytes that the iPad sends to register itself as a receiver.
 const HELLO_MAGIC: &[u8] = b"ETERNALHELLO";
+const RECEIVER_RESTART_COOLDOWN: Duration = Duration::from_secs(2);
 
 /// Consumes NAL units from the encoder, serializes each as a FlatBuffer FramePacket,
 /// fragments into MTU-safe UDP datagrams, and sends them to the current target address.
@@ -56,12 +57,18 @@ pub async fn start_sender(
                             PIPELINE_STATS.lock().set_target_addr(target.to_string());
                             info!(%target, "iPad registered as receiver");
 
-                            if previous_target.ip().is_unspecified() || previous_target != target {
+                            let now = Instant::now();
+                            let last_restart_at = *shared.last_receiver_restart_at.lock();
+                            if let Some(reason) =
+                                receiver_restart_reason(previous_target, target, last_restart_at, now)
+                            {
                                 info!(
+                                    reason,
                                     previous = %previous_target,
                                     current = %target,
                                     "Receiver registration changed; restarting pipeline to send a fresh startup keyframe"
                                 );
+                                *shared.last_receiver_restart_at.lock() = Some(now);
                                 shared.stop();
                                 if let Err(error) = supervisor_tx.send(SupervisorCommand::Restart) {
                                     warn!(error = %error, "Failed to request pipeline restart after receiver registration");
@@ -159,4 +166,87 @@ pub async fn start_sender(
 
     info!("NAL channel closed, transport sender shutting down");
     Ok(())
+}
+
+fn receiver_restart_reason(
+    previous_target: SocketAddr,
+    current_target: SocketAddr,
+    last_restart_at: Option<Instant>,
+    now: Instant,
+) -> Option<&'static str> {
+    if previous_target.ip().is_unspecified() || previous_target.port() == 0 {
+        return Some("first receiver registration");
+    }
+
+    if previous_target != current_target {
+        return Some("receiver target changed");
+    }
+
+    let recent_restart = last_restart_at
+        .map(|last| now.duration_since(last) < RECEIVER_RESTART_COOLDOWN)
+        .unwrap_or(false);
+    if recent_restart {
+        None
+    } else {
+        Some("receiver re-registered on existing target")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::receiver_restart_reason;
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn restarts_for_first_receiver_registration() {
+        let now = Instant::now();
+        let previous = SocketAddr::from(([0, 0, 0, 0], 9876));
+        let current = SocketAddr::from(([10, 0, 0, 50], 9876));
+        assert_eq!(
+            receiver_restart_reason(previous, current, None, now),
+            Some("first receiver registration")
+        );
+    }
+
+    #[test]
+    fn restarts_when_receiver_target_changes() {
+        let now = Instant::now();
+        let previous = SocketAddr::from(([10, 0, 0, 50], 9876));
+        let current = SocketAddr::from(([10, 0, 0, 51], 9876));
+        assert_eq!(
+            receiver_restart_reason(previous, current, None, now),
+            Some("receiver target changed")
+        );
+    }
+
+    #[test]
+    fn restarts_when_same_receiver_reconnects_after_cooldown() {
+        let now = Instant::now();
+        let current = SocketAddr::from(([10, 0, 0, 50], 9876));
+        assert_eq!(
+            receiver_restart_reason(
+                current,
+                current,
+                Some(now - Duration::from_secs(3)),
+                now
+            ),
+            Some("receiver re-registered on existing target")
+        );
+    }
+
+    #[test]
+    fn suppresses_duplicate_restarts_within_cooldown() {
+        let now = Instant::now();
+        let current = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 50)), 9876);
+        assert_eq!(
+            receiver_restart_reason(
+                current,
+                current,
+                Some(now - Duration::from_millis(500)),
+                now
+            ),
+            None
+        );
+    }
 }
