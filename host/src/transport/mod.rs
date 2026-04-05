@@ -73,6 +73,8 @@ pub async fn start_sender(
                                 if let Err(error) = supervisor_tx.send(SupervisorCommand::Restart) {
                                     warn!(error = %error, "Failed to request pipeline restart after receiver registration");
                                 }
+                                info!("Transport loop exiting immediately after restart request");
+                                break;
                             }
                         }
                     }
