@@ -20,6 +20,8 @@ final class VideoDecoder {
     private var hasLoggedFirstNALPrefix = false
     private var hasLoggedFirstPacketHex = false
     private var waitingForSyncSample = true
+    // NEEDS_XCODE_VERIFY: per-packet logging counter for AMD recovery debugging.
+    private var packetLogCounter: UInt64 = 0
 
     private let decodeQueue = DispatchQueue(label: "com.eternal.decode", qos: .userInteractive)
 
@@ -35,15 +37,25 @@ final class VideoDecoder {
 
     func invalidate() {
         decodeQueue.async { [weak self] in
-            if let session = self?.decompressionSession {
+            guard let self else { return }
+            if let session = self.decompressionSession {
                 VTDecompressionSessionWaitForAsynchronousFrames(session)
                 VTDecompressionSessionInvalidate(session)
             }
-            self?.decompressionSession = nil
-            self?.formatDescription = nil
-            self?.sps = nil
-            self?.pps = nil
-            self?.waitingForSyncSample = true
+            self.decompressionSession = nil
+            self.formatDescription = nil
+            self.sps = nil
+            self.pps = nil
+            self.waitingForSyncSample = true
+            // NEEDS_XCODE_VERIFY: clear diagnostic state so a reconnection re-logs the
+            // first NAL types / packetisation it observes.
+            self.loggedPacketizations.removeAll()
+            self.loggedNALTypes.removeAll()
+            self.hasLoggedEmptyPayload = false
+            self.hasLoggedFirstPacketPrefix = false
+            self.hasLoggedFirstNALPrefix = false
+            self.hasLoggedFirstPacketHex = false
+            self.packetLogCounter = 0
         }
     }
 
@@ -84,11 +96,18 @@ final class VideoDecoder {
 
         var accessUnitNALs: [Data] = []
         var hasSliceNAL = false
+        var nalTypesInPacket: [UInt8] = []
         for nal in nalUnits {
             let nalType = nal[0] & 0x1F
+            nalTypesInPacket.append(nalType)
             logNALTypeIfNeeded(nalType)
 
             switch nalType {
+            case 6, 9:
+                // NEEDS_XCODE_VERIFY: strip SEI(6) and AUD(9) — VideoToolbox on some iPad
+                // models trips on AUDs and SEIs in the submitted sample buffer, particularly
+                // around format-description re-creation. They carry no decode info.
+                continue
             case 7: // SPS
                 sps = nal
                 tryCreateFormatDescription()
@@ -105,6 +124,23 @@ final class VideoDecoder {
 
         if hasSliceNAL {
             let isSyncSample = isRandomAccessAccessUnit(accessUnitNALs)
+            // NEEDS_XCODE_VERIFY: per-packet log for first 20 packets and then every 300th
+            // packet. Helps confirm AMD recovery is firing IDRs as expected.
+            packetLogCounter += 1
+            if packetLogCounter <= 20 || packetLogCounter % 300 == 0 {
+                let typesString = nalTypesInPacket.map { String($0) }.joined(separator: ",")
+                print(
+                    "[VT] pkt seq=\(packet.seq) isKey=\(isSyncSample) nalCount=\(accessUnitNALs.count) nalTypes=\(typesString)"
+                )
+            }
+            // NEEDS_XCODE_VERIFY: on every random-access access unit, recreate the
+            // VTDecompressionSession from the current format description. This clears any
+            // half-broken decoder state left over from a previous GOP — the AMD path on
+            // Windows would lose decoder sync after the first ~1s of P-frames; teardown
+            // forces VideoToolbox to honour the freshly-prepended SPS/PPS.
+            if isSyncSample {
+                createDecompressionSession()
+            }
             decodeAccessUnit(accessUnitNALs, timestampUs: packet.timestampUs, isSyncSample: isSyncSample)
         }
     }

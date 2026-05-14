@@ -22,14 +22,16 @@ use windows::Win32::Graphics::Dxgi::{
     DXGI_OUTDUPL_FRAME_INFO,
 };
 
-const TARGET_FPS: u64 = 60;
-const FRAME_BUDGET: Duration = Duration::from_micros(1_000_000 / TARGET_FPS);
 const ACQUIRE_TIMEOUT_MS: u32 = 16;
 const FPS_WINDOW: usize = 60;
 
+fn frame_budget_for(target_fps: u32) -> Duration {
+    let fps = target_fps.max(1) as u64;
+    Duration::from_micros(1_000_000 / fps)
+}
+
 /// Frame data sent downstream for encoding/transport.
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
 pub struct RawFrame {
     pub frame_number: u64,
     pub timestamp: Instant,
@@ -62,7 +64,18 @@ fn run_capture_loop(
     // --- Create DXGI factory and select the adapter driving the primary output ---
     let factory: IDXGIFactory1 = unsafe { CreateDXGIFactory1()? };
 
-    let adapter: IDXGIAdapter1 = unsafe { factory.EnumAdapters1(adapter_index)? };
+    let (adapter, used_adapter_index) = match unsafe { factory.EnumAdapters1(adapter_index) } {
+        Ok(a) => (a, adapter_index),
+        Err(error) => {
+            warn!(
+                requested = adapter_index,
+                error = %error,
+                "EnumAdapters1 failed for requested adapter index, falling back to adapter 0"
+            );
+            let fallback = unsafe { factory.EnumAdapters1(0)? };
+            (fallback, 0)
+        }
+    };
     let adapter_desc = unsafe { adapter.GetDesc1()? };
     let adapter_name = String::from_utf16_lossy(
         &adapter_desc
@@ -72,7 +85,11 @@ fn run_capture_loop(
             .take_while(|&c| c != 0)
             .collect::<Vec<_>>(),
     );
-    info!(adapter = %adapter_name, "Selected GPU adapter");
+    info!(
+        adapter_index = used_adapter_index,
+        adapter = %adapter_name,
+        "Capture using adapter"
+    );
     PIPELINE_STATS.lock().set_gpu_name(adapter_name);
 
     // --- Select primary output (index 0) ---
@@ -154,6 +171,7 @@ fn run_capture_loop(
         }
 
         let frame_start = Instant::now();
+        let frame_budget = frame_budget_for(shared.target_fps.load(Ordering::SeqCst));
 
         let mut frame_info = DXGI_OUTDUPL_FRAME_INFO::default();
         let mut desktop_resource: Option<IDXGIResource> = None;
@@ -299,11 +317,11 @@ fn run_capture_loop(
 
         // Frame pacing — sleep remainder of budget
         let frame_elapsed = frame_start.elapsed();
-        if frame_elapsed < FRAME_BUDGET {
-            std::thread::sleep(FRAME_BUDGET - frame_elapsed);
+        if frame_elapsed < frame_budget {
+            std::thread::sleep(frame_budget - frame_elapsed);
         } else {
             debug!(
-                over_budget_us = (frame_elapsed - FRAME_BUDGET).as_micros(),
+                over_budget_us = (frame_elapsed - frame_budget).as_micros(),
                 "Frame over budget"
             );
         }

@@ -5,6 +5,7 @@ mod encoder;
 mod gpu;
 mod gui;
 mod logging;
+mod settings;
 mod stats;
 mod transport;
 
@@ -25,17 +26,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info,mdns_sd=warn"));
     let stdout_layer = tracing_subscriber::fmt::layer()
         .with_target(false)
-        .with_writer(std::io::stdout.with_max_level(tracing::Level::INFO));
+        .with_writer(std::io::stdout.with_max_level(tracing::Level::INFO))
+        .with_filter(logging::MdnsDedupFilter::new());
     let memory_layer = tracing_subscriber::fmt::layer()
         .with_target(false)
         .with_ansi(false)
-        .with_writer(|| logging::MemoryLogWriter::new());
-
-    tracing_subscriber::registry()
-        .with(env_filter)
-        .with(stdout_layer)
-        .with(memory_layer)
-        .init();
+        .with_writer(|| logging::MemoryLogWriter::new())
+        .with_filter(logging::MdnsDedupFilter::new());
 
     info!(
         path = %logging::session_log_path().display(),

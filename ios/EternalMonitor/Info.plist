@@ -49,5 +49,7 @@
     <array>
         <string>_eternaldisplay._udp</string>
     </array>
+    <key>NSCameraUsageDescription</key>
+    <string>EternalMonitor uses the camera to scan a QR code displayed by the Windows host so you can connect without typing an IP.</string>
 </dict>
 </plist>

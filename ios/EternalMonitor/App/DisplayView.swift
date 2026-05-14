@@ -6,6 +6,8 @@ struct DisplayView: View {
 
     @State private var showHUD = true
     @State private var hudDismissTask: Task<Void, Never>?
+    // NEEDS_XCODE_VERIFY: connection quality popover state.
+    @State private var showQualityPopover = false
 
     var body: some View {
         ZStack {
@@ -63,6 +65,14 @@ struct DisplayView: View {
             statLabel(String(format: "%.1f", connectionManager.lagMs), unit: "ms")
             divider
             statLabel(connectionManager.transportMode, unit: "")
+            divider
+            qualityBars
+                .onTapGesture { showQualityPopover.toggle() }
+                .popover(isPresented: $showQualityPopover) {
+                    qualityPopover
+                        .padding(12)
+                        .presentationCompactAdaptation(.popover)
+                }
         }
         .padding(.horizontal, 14)
         .padding(.vertical, 8)
@@ -71,6 +81,46 @@ struct DisplayView: View {
                 .fill(.ultraThinMaterial)
                 .environment(\.colorScheme, .dark)
         )
+    }
+
+    // NEEDS_XCODE_VERIFY: 4-bar signal strength indicator.
+    private var qualityBars: some View {
+        let bars = connectionManager.quality.bars
+        let color = qualityColor(bars: bars)
+        return HStack(alignment: .bottom, spacing: 2) {
+            ForEach(0..<4, id: \.self) { idx in
+                Rectangle()
+                    .fill(idx < bars ? color : Color.white.opacity(0.15))
+                    .frame(width: 3, height: CGFloat(4 + idx * 3))
+                    .cornerRadius(0.5)
+            }
+        }
+        .frame(height: 13)
+        .contentShape(Rectangle())
+    }
+
+    private func qualityColor(bars: Int) -> Color {
+        switch bars {
+        case 4: return Color(hex: 0x1D9E75)
+        case 3: return Color(hex: 0xB7E84A)
+        case 2: return Color(hex: 0xE8C547)
+        default: return Color(hex: 0xE24B4A)
+        }
+    }
+
+    // NEEDS_XCODE_VERIFY: popover with exact quality numbers.
+    private var qualityPopover: some View {
+        let q = connectionManager.quality
+        return VStack(alignment: .leading, spacing: 6) {
+            Text("Connection quality")
+                .font(.appMonoMedium(size: 11))
+                .foregroundColor(.white.opacity(0.5))
+            HStack(spacing: 12) {
+                statLabel(String(format: "%.1f", q.lossPercent), unit: "% loss")
+                statLabel(String(format: "%.1f", q.jitterMs), unit: "ms jitter")
+                statLabel("\(q.seqGap)", unit: "max seq gap")
+            }
+        }
     }
 
     private func statLabel(_ value: String, unit: String) -> some View {

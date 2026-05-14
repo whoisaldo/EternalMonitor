@@ -59,9 +59,17 @@ pub async fn start_sender(
 
                             let now = Instant::now();
                             let last_restart_at = *shared.last_receiver_restart_at.lock();
-                            if let Some(reason) =
-                                receiver_restart_reason(previous_target, target, last_restart_at, now)
-                            {
+                            let restart_reason =
+                                receiver_restart_reason(previous_target, target, last_restart_at, now);
+
+                            let target_changed = previous_target != target
+                                && !previous_target.ip().is_unspecified()
+                                && previous_target.port() != 0;
+                            let first_registration = previous_target.ip().is_unspecified()
+                                || previous_target.port() == 0;
+
+                            if restart_reason.is_some() && (first_registration || target_changed) {
+                                let reason = restart_reason.unwrap_or("receiver registration changed");
                                 info!(
                                     reason,
                                     previous = %previous_target,
@@ -75,6 +83,17 @@ pub async fn start_sender(
                                 }
                                 info!("Transport loop exiting immediately after restart request");
                                 break;
+                            } else {
+                                // Same-target re-handshake. Don't restart the pipeline — just force
+                                // the next encoded frame to be an IDR and clear connection counters
+                                // so the GUI shows fresh session stats.
+                                shared.force_next_idr.store(true, Ordering::SeqCst);
+                                PIPELINE_STATS.lock().reset_connection_stats();
+                                *shared.last_receiver_restart_at.lock() = Some(now);
+                                info!(
+                                    %target,
+                                    "New client connected — forcing immediate IDR on next frame"
+                                );
                             }
                         }
                     }

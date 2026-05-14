@@ -18,6 +18,8 @@ final class NetworkScanner: NSObject, ObservableObject {
     private let browser = NetServiceBrowser()
     private var resolvingServices: [String: NetService] = [:]
     private var scanTask: Task<Void, Never>?
+    // NEEDS_XCODE_VERIFY: track auto-retry state so we don't bounce forever when discovery is broken.
+    private var didAutoRetry = false
 
     override init() {
         super.init()
@@ -26,6 +28,11 @@ final class NetworkScanner: NSObject, ObservableObject {
 
     func startScan() {
         guard !isScanning else { return }
+        didAutoRetry = false
+        beginScan()
+    }
+
+    private func beginScan() {
         isScanning = true
         hosts = []
         resolvingServices.removeAll()
@@ -34,7 +41,9 @@ final class NetworkScanner: NSObject, ObservableObject {
         browser.searchForServices(ofType: "_eternaldisplay._udp.", inDomain: "local.")
 
         scanTask = Task { @MainActor in
-            try? await Task.sleep(nanoseconds: 5_000_000_000)
+            // NEEDS_XCODE_VERIFY: 10s timeout — many routers are slow to forward the first mDNS
+            // response, especially right after Wi-Fi reconnect. The brief raised this from 5s.
+            try? await Task.sleep(nanoseconds: 10_000_000_000)
             if !Task.isCancelled {
                 stopScan()
             }
@@ -53,7 +62,20 @@ final class NetworkScanner: NSObject, ObservableObject {
         isScanning = false
 
         if hosts.isEmpty {
-            statusMessage = "No hosts found. Make sure the Windows host is running on the same network."
+            if !didAutoRetry {
+                // NEEDS_XCODE_VERIFY: auto-retry once after 2s. Bonjour browse occasionally
+                // misses the first multicast burst.
+                didAutoRetry = true
+                statusMessage = "No hosts found yet — retrying..."
+                Task { @MainActor in
+                    try? await Task.sleep(nanoseconds: 2_000_000_000)
+                    if self.hosts.isEmpty && !self.isScanning {
+                        self.beginScan()
+                    }
+                }
+            } else {
+                statusMessage = "No hosts found. Make sure the Windows host is running on the same network."
+            }
         } else {
             statusMessage = "Found \(hosts.count) host\(hosts.count == 1 ? "" : "s")"
         }
@@ -114,11 +136,69 @@ extension NetworkScanner: NetServiceBrowserDelegate, NetServiceDelegate {
             defer { resolvingServices.removeValue(forKey: key) }
 
             guard let host = Self.discoveredHost(from: sender) else { return }
+            // NEEDS_XCODE_VERIFY: discovery diagnostic — surface every resolved host so we
+            // can tell whether mDNS is finding the right machine.
+            print("[mDNS] Found: \(host.name) at \(host.address):\(host.port)")
             hosts.removeAll { $0.name == host.name || $0.address == host.address }
             hosts.append(host)
-            hosts.sort { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
+            hosts.sort(by: Self.hostQualityCompare)
             statusMessage = "Found \(hosts.count) host\(hosts.count == 1 ? "" : "s")"
         }
+    }
+
+    /// Prefer IPv4 over IPv6, then prefer same-subnet over different-subnet, then alpha by name.
+    /// NEEDS_XCODE_VERIFY
+    private static func hostQualityCompare(_ a: DiscoveredHost, _ b: DiscoveredHost) -> Bool {
+        let aV4 = a.address.contains(".")
+        let bV4 = b.address.contains(".")
+        if aV4 != bV4 {
+            return aV4 // IPv4 first
+        }
+        let ourSubnet = primaryIPv4Subnet()
+        if let prefix = ourSubnet {
+            let aSame = a.address.hasPrefix(prefix)
+            let bSame = b.address.hasPrefix(prefix)
+            if aSame != bSame {
+                return aSame
+            }
+        }
+        return a.name.localizedCaseInsensitiveCompare(b.name) == .orderedAscending
+    }
+
+    /// Best-effort: return the first three octets ("192.168.1.") of the iPad's primary
+    /// non-loopback IPv4 interface, so we can prefer same-subnet hosts when sorting.
+    /// Returns nil on failure. NEEDS_XCODE_VERIFY.
+    private static func primaryIPv4Subnet() -> String? {
+        var ifaddr: UnsafeMutablePointer<ifaddrs>?
+        guard getifaddrs(&ifaddr) == 0, let first = ifaddr else { return nil }
+        defer { freeifaddrs(ifaddr) }
+
+        var ptr: UnsafeMutablePointer<ifaddrs>? = first
+        while let cur = ptr {
+            let flags = Int32(cur.pointee.ifa_flags)
+            let family = cur.pointee.ifa_addr.pointee.sa_family
+            if (flags & IFF_UP) != 0 && (flags & IFF_LOOPBACK) == 0 && family == AF_INET {
+                var hostname = [CChar](repeating: 0, count: Int(NI_MAXHOST))
+                let result = getnameinfo(
+                    cur.pointee.ifa_addr,
+                    socklen_t(cur.pointee.ifa_addr.pointee.sa_len),
+                    &hostname,
+                    socklen_t(hostname.count),
+                    nil,
+                    socklen_t(0),
+                    NI_NUMERICHOST
+                )
+                if result == 0 {
+                    let ip = String(cString: hostname)
+                    let parts = ip.split(separator: ".")
+                    if parts.count == 4 {
+                        return "\(parts[0]).\(parts[1]).\(parts[2])."
+                    }
+                }
+            }
+            ptr = cur.pointee.ifa_next
+        }
+        return nil
     }
 
     nonisolated func netService(_ sender: NetService, didNotResolve errorDict: [String: NSNumber]) {

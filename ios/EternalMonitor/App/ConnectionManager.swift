@@ -68,6 +68,8 @@ final class ConnectionManager: ObservableObject {
     @Published var transportMode: String = "WiFi"
     @Published var connectionError: String?
     @Published private(set) var diagnostics: [DiagnosticEntry] = []
+    // NEEDS_XCODE_VERIFY: connection quality tracker exposed to the HUD.
+    let quality = ConnectionQualityTracker()
 
     private var udpReceiver: UDPReceiver?
     private var frameAssembler: FrameAssembler?
@@ -116,6 +118,7 @@ final class ConnectionManager: ObservableObject {
             // Capture only the scalar we need — avoids sending CVPixelBuffer across boundary
             let ts = timestampUs
             Task { @MainActor in
+                self.quality.recordFrameDecoded()
                 self.debugState.decodedFrames += 1
                 self.debugState.lastDecodedTimestampUs = ts
                 if self.debugState.decodedFrames == 1 {
@@ -124,6 +127,10 @@ final class ConnectionManager: ObservableObject {
                     self.state = .connected
                     self.transportMode = "WiFi"
                     RecentConnectionStore.shared.add(host: normalizedHost, port: port, isUSB: false)
+                    // NEEDS_XCODE_VERIFY: remember the last successfully-connected target so we
+                    // can pre-fill the IP field on next launch.
+                    UserDefaults.standard.set(normalizedHost, forKey: "lastHost")
+                    UserDefaults.standard.set(Int(port), forKey: "lastPort")
                 }
                 self.fpsCounter.tick()
                 self.fps = self.fpsCounter.currentFPS
@@ -196,6 +203,11 @@ final class ConnectionManager: ObservableObject {
                 }
             }
         }
+        receiver.onFragmentSeq = { [weak self] seq in
+            Task { @MainActor in
+                self?.quality.recordFragmentSeq(seq)
+            }
+        }
         receiver.onDatagramIgnored = { [weak self] message in
             Task { @MainActor in
                 self?.record(.warning, "udp", message)
@@ -258,6 +270,7 @@ final class ConnectionManager: ObservableObject {
         state = .disconnected
         fps = 0
         lagMs = 0
+        quality.reset()
     }
 
     private func record(_ level: DiagnosticLevel, _ category: String, _ message: String) {
@@ -345,6 +358,13 @@ final class AppSettings: ObservableObject {
     @Published var promotionEnabled: Bool {
         didSet { UserDefaults.standard.set(promotionEnabled, forKey: "promotionEnabled") }
     }
+    // NEEDS_XCODE_VERIFY: last successfully-connected host+port for pre-fill on relaunch.
+    @Published var lastHost: String {
+        didSet { UserDefaults.standard.set(lastHost, forKey: "lastHost") }
+    }
+    @Published var lastPort: UInt16 {
+        didSet { UserDefaults.standard.set(Int(lastPort), forKey: "lastPort") }
+    }
 
     init() {
         let defaults = UserDefaults.standard
@@ -353,6 +373,9 @@ final class AppSettings: ObservableObject {
         self.autoReconnect = defaults.object(forKey: "autoReconnect") as? Bool ?? true
         self.targetFPS = defaults.object(forKey: "targetFPS") as? Int ?? 60
         self.promotionEnabled = defaults.object(forKey: "promotionEnabled") as? Bool ?? true
+        self.lastHost = defaults.object(forKey: "lastHost") as? String ?? ""
+        let port = defaults.object(forKey: "lastPort") as? Int ?? 0
+        self.lastPort = UInt16(clamping: port)
     }
 }
 

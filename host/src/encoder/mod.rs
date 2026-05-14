@@ -55,16 +55,45 @@ fn run_encode_loop(
     shared: SharedControl,
     gpu: GpuInfo,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    if ffmpeg_next::encoder::find_by_name(&gpu.encoder_name).is_none() {
-        return Err(format!("{} codec not found in FFmpeg", gpu.encoder_name).into());
+    // Apply GUI encoder override at pipeline start. The override is consulted only here;
+    // mid-stream changes don't take effect until the user requests a Restart.
+    let (encoder_name, codec_display_name) = {
+        let override_name = shared.encoder_override.lock().clone();
+        match override_name {
+            Some(name) if ffmpeg_next::encoder::find_by_name(&name).is_some() => {
+                let display = match name.as_str() {
+                    "h264_nvenc" => "H.264 (NVENC)",
+                    "h264_amf" => "H.264 (AMF)",
+                    "h264_qsv" => "H.264 (QSV)",
+                    "libx264" => "H.264 (x264)",
+                    other => {
+                        warn!(encoder = %other, "Unknown encoder override label");
+                        other
+                    }
+                };
+                info!(encoder = %name, "Encoder override honoured");
+                (name, display.to_string())
+            }
+            Some(name) => {
+                warn!(
+                    encoder = %name,
+                    "Encoder override not available in FFmpeg — falling back to auto-detected encoder"
+                );
+                (gpu.encoder_name.clone(), gpu.codec_display_name.clone())
+            }
+            None => (gpu.encoder_name.clone(), gpu.codec_display_name.clone()),
+        }
+    };
+
+    if ffmpeg_next::encoder::find_by_name(&encoder_name).is_none() {
+        return Err(format!("{} codec not found in FFmpeg", encoder_name).into());
     }
-    info!(encoder = %gpu.encoder_name, "Found encoder codec");
-    PIPELINE_STATS
-        .lock()
-        .set_codec_name(&gpu.codec_display_name);
+    info!(encoder = %encoder_name, "Found encoder codec");
+    PIPELINE_STATS.lock().set_codec_name(&codec_display_name);
 
     let mut encoder_state: Option<EncoderState> = None;
     let mut rx = rx;
+    let mut frames_since_last_idr: u64 = 0;
 
     while let Some(raw_frame) = rx.blocking_recv() {
         if !shared.running.load(Ordering::SeqCst) {
@@ -82,7 +111,7 @@ fn run_encode_loop(
 
         if encoder_state.is_none() {
             encoder_state = Some(EncoderState::new(
-                &gpu.encoder_name,
+                &encoder_name,
                 raw_frame.width,
                 raw_frame.height,
             )?);
@@ -109,7 +138,14 @@ fn run_encode_loop(
             .scaler
             .run(&encoder.bgra_frame, &mut encoder.frame)?;
         encoder.frame.set_pts(Some(raw_frame.frame_number as i64));
-        prepare_frame_for_encode(&mut encoder.frame, raw_frame.frame_number, &gpu.encoder_name);
+        let force_idr = shared.force_next_idr.swap(false, Ordering::SeqCst);
+        let _forced_intra = prepare_frame_for_encode(
+            &mut encoder.frame,
+            raw_frame.frame_number,
+            &encoder_name,
+            &mut frames_since_last_idr,
+            force_idr,
+        );
 
         let encode_start = Instant::now();
         encoder.encoder.send_frame(&encoder.frame)?;
@@ -132,12 +168,12 @@ fn run_encode_loop(
                         packet_bytes,
                         packet_is_key,
                         &mut encoder.h264,
-                        &gpu.encoder_name,
+                        &encoder_name,
                     );
                     let intra_only_access_unit = access_unit_is_intra_only(&nal_data);
                     let is_keyframe = packet_is_key
                         || contains_nal_type(&nal_data, 5)
-                        || (is_amf_encoder(&gpu.encoder_name) && intra_only_access_unit);
+                        || (is_amf_encoder(&encoder_name) && intra_only_access_unit);
                     encoder.observe_amf_diagnostics(
                         &nal_data,
                         raw_frame.frame_number,
@@ -320,8 +356,18 @@ fn prepare_frame_for_encode(
     frame: &mut ffmpeg_next::frame::Video,
     frame_number: u64,
     encoder_name: &str,
-) {
-    let request_intra = is_amf_encoder(encoder_name) && frame_number % AMF_FORCED_INTRA_PERIOD == 0;
+    frames_since_last_idr: &mut u64,
+    force_next_idr: bool,
+) -> bool {
+    let is_amf = is_amf_encoder(encoder_name);
+    // Force the next encoded frame to be an IDR whenever the transport flagged a
+    // re-handshake. Applies to all encoders so any reconnect recovers within 1 frame.
+    let force_hit = force_next_idr;
+    // AMF needs an explicit periodic IDR to keep VideoToolbox in sync; other encoders
+    // already produce a healthy keyframe cadence on their own.
+    let period_hit = is_amf && *frames_since_last_idr >= AMF_FORCED_INTRA_PERIOD;
+    let request_intra = period_hit || force_hit;
+
     frame.set_kind(if request_intra {
         ffmpeg_next::util::picture::Type::I
     } else {
@@ -333,13 +379,29 @@ fn prepare_frame_for_encode(
     }
 
     if request_intra {
-        info!(
-            encoder = encoder_name,
-            frame = frame_number,
-            period = AMF_FORCED_INTRA_PERIOD,
-            "Requesting AMF intra picture"
-        );
+        *frames_since_last_idr = 0;
+        let reason = if force_hit { "force_next_idr" } else { "period" };
+        if is_amf {
+            info!(
+                encoder = encoder_name,
+                frame = frame_number,
+                period = AMF_FORCED_INTRA_PERIOD,
+                reason,
+                "[AMF] Forced IDR"
+            );
+        } else {
+            info!(
+                encoder = encoder_name,
+                frame = frame_number,
+                reason,
+                "[encoder] Forced IDR"
+            );
+        }
+    } else if is_amf {
+        *frames_since_last_idr += 1;
     }
+
+    request_intra
 }
 
 /// Check if an ffmpeg error is EAGAIN (no output available yet).
@@ -567,11 +629,13 @@ impl H264BitstreamState {
         }
     }
 
+    /// Refresh cached SPS/PPS from inline NAL units. Always overwrites so the cache
+    /// never goes stale if the encoder emits a new parameter set mid-stream.
     fn update_parameter_sets_from_units(&mut self, units: &[Vec<u8>]) {
         for unit in units {
             match nal_type(unit) {
-                Some(7) if self.sps.is_none() => self.sps = Some(unit.clone()),
-                Some(8) if self.pps.is_none() => self.pps = Some(unit.clone()),
+                Some(7) => self.sps = Some(unit.clone()),
+                Some(8) => self.pps = Some(unit.clone()),
                 _ => {}
             }
         }
@@ -651,16 +715,19 @@ fn normalize_h264_payload(
     let contains_idr = parsed.units.iter().any(|unit| nal_type(unit) == Some(5));
     let has_sps = parsed.units.iter().any(|unit| nal_type(unit) == Some(7));
     let has_pps = parsed.units.iter().any(|unit| nal_type(unit) == Some(8));
+    let is_amf = is_amf_encoder(encoder_name);
 
-    // AMF startup sometimes omits inline SPS/PPS even when the first access unit is a sync
-    // sample. Prefix cached parameter sets on the first packet only; reinserting them later on
-    // inter frames can cause the iPad decoder to rebuild its session mid-GOP and freeze.
-    let amf_startup_inject =
-        is_amf_encoder(encoder_name) && (!has_sps || !has_pps) && state.packet_count == 0;
+    // For AMF, prepend cached SPS/PPS on every random-access access unit, even if the encoder
+    // already emitted them inline. iPad VideoToolbox is sensitive to GOP-boundary parameter
+    // freshness; the iPad now tears down its decoder on every IDR so redundant SPS/PPS are safe.
+    // For other encoders, only prepend if the keyframe was missing parameter sets.
+    let amf_startup_inject = is_amf && (!has_sps || !has_pps) && state.packet_count == 0;
+    let amf_idr_redundant_prepend = is_amf && (packet_is_key || contains_idr);
     state.packet_count += 1;
 
-    let should_prefix_parameter_sets =
-        ((packet_is_key || contains_idr) && (!has_sps || !has_pps)) || amf_startup_inject;
+    let should_prefix_parameter_sets = amf_idr_redundant_prepend
+        || amf_startup_inject
+        || ((packet_is_key || contains_idr) && (!has_sps || !has_pps));
 
     let mut output = Vec::with_capacity(data.len() + 128);
     if should_prefix_parameter_sets {
@@ -682,8 +749,32 @@ fn normalize_h264_payload(
         }
     }
 
+    // Whenever we prepended cached SPS/PPS, drop any inline SPS(7)/PPS(8) NAL units so the
+    // access unit doesn't contain duplicates.
+    let drop_inline_parameter_sets = should_prefix_parameter_sets
+        && matches!(
+            (state.sps.as_deref(), state.pps.as_deref()),
+            (Some(_), Some(_))
+        );
+
     for unit in &parsed.units {
+        if drop_inline_parameter_sets
+            && matches!(nal_type(unit), Some(7) | Some(8))
+        {
+            continue;
+        }
         append_annex_b_unit(&mut output, unit);
+    }
+
+    // Hex-dump first 8 bytes of every IDR-bearing AMF packet for runtime diagnostics.
+    if is_amf && (packet_is_key || contains_idr) {
+        tracing::debug!(
+            encoder = encoder_name,
+            packet_is_key,
+            contains_idr,
+            hex_prefix = %hex_prefix(&output, 8),
+            "[AMF] IDR packet emitted"
+        );
     }
 
     output
@@ -1213,6 +1304,67 @@ mod tests {
         state.packet_count = 30;
 
         let normalized = normalize_h264_payload(&payload, false, &mut state, "h264_amf");
+        assert_eq!(normalized, payload);
+    }
+
+    #[test]
+    fn amf_reinjects_parameter_sets_on_every_idr_even_mid_stream() {
+        let extradata = [
+            1, 66, 0, 30, 0xFF, 0xE1, 0x00, 0x04, 0x67, 0x42, 0x00, 0x1E, 0x01, 0x00, 0x02, 0x68,
+            0xCE,
+        ];
+        let packet = [0x00, 0x00, 0x00, 0x03, 0x65, 0x88, 0x84];
+
+        let mut state = H264BitstreamState::default();
+        state.refresh_parameter_sets_from_extradata(Some(extradata.to_vec()));
+        state.packet_count = 200;
+
+        let normalized = normalize_h264_payload(&packet, true, &mut state, "h264_amf");
+        assert_eq!(
+            normalized,
+            vec![
+                0, 0, 0, 1, 0x67, 0x42, 0x00, 0x1E, 0, 0, 0, 1, 0x68, 0xCE, 0, 0, 0, 1, 0x65, 0x88,
+                0x84
+            ]
+        );
+    }
+
+    #[test]
+    fn amf_drops_inline_parameter_sets_when_redundantly_prepending() {
+        let extradata = [
+            1, 66, 0, 30, 0xFF, 0xE1, 0x00, 0x04, 0x67, 0x42, 0x00, 0x1E, 0x01, 0x00, 0x02, 0x68,
+            0xCE,
+        ];
+        // Inline SPS + PPS + IDR. AMF must prepend cached SPS/PPS and drop the inline duplicates.
+        let payload = [
+            0, 0, 0, 1, 0x67, 0x42, 0x00, 0x1E, 0, 0, 0, 1, 0x68, 0xCE, 0, 0, 0, 1, 0x65, 0x88,
+            0x84,
+        ];
+
+        let mut state = H264BitstreamState::default();
+        state.refresh_parameter_sets_from_extradata(Some(extradata.to_vec()));
+        state.packet_count = 50;
+
+        let normalized = normalize_h264_payload(&payload, true, &mut state, "h264_amf");
+        // Expect a single SPS + PPS pair followed by IDR — no duplicates.
+        assert_eq!(
+            normalized,
+            vec![
+                0, 0, 0, 1, 0x67, 0x42, 0x00, 0x1E, 0, 0, 0, 1, 0x68, 0xCE, 0, 0, 0, 1, 0x65, 0x88,
+                0x84
+            ]
+        );
+    }
+
+    #[test]
+    fn nvenc_keyframe_with_inline_sps_pps_is_passed_through_unchanged() {
+        // NVENC path must not be altered by the AMF redundant-prepend behaviour.
+        let payload = [
+            0, 0, 0, 1, 0x67, 0x42, 0x00, 0x1E, 0, 0, 0, 1, 0x68, 0xCE, 0, 0, 0, 1, 0x65, 0x88,
+            0x84,
+        ];
+        let mut state = H264BitstreamState::default();
+        let normalized = normalize_h264_payload(&payload, true, &mut state, "h264_nvenc");
         assert_eq!(normalized, payload);
     }
 

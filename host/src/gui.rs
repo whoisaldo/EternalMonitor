@@ -3,6 +3,7 @@ use std::net::SocketAddr;
 use std::os::windows::ffi::OsStrExt;
 
 use eframe::egui;
+use qrcode::{Color as QrModuleColor, QrCode};
 use tracing::{info, warn};
 use windows::core::{w, PCWSTR};
 use windows::Win32::Foundation::{ERROR_FILE_NOT_FOUND, ERROR_SUCCESS};
@@ -14,6 +15,7 @@ use windows::Win32::System::Registry::{
 
 use crate::control::GuiControl;
 use crate::logging::{session_log_path, session_log_text};
+use crate::settings::SettingsFile;
 use crate::stats::PIPELINE_STATS;
 
 const BG: egui::Color32 = egui::Color32::from_rgb(10, 10, 10);
@@ -49,6 +51,7 @@ enum AppTab {
 struct StatsSnapshot {
     listen_addr: String,
     capture_fps: f64,
+    capture_frame_count: u64,
     capture_resolution: (u32, u32),
     encode_fps: f64,
     encode_time_us: u128,
@@ -69,6 +72,7 @@ struct StatsSnapshot {
     pipeline_running: bool,
     uptime_secs: f64,
     mdns_active: bool,
+    gpu_temp_c: Option<f64>,
 }
 
 impl StatsSnapshot {
@@ -77,6 +81,7 @@ impl StatsSnapshot {
         Self {
             listen_addr: s.listen_addr.clone(),
             capture_fps: s.capture_fps,
+            capture_frame_count: s.capture_frame_count,
             capture_resolution: s.capture_resolution,
             encode_fps: s.encode_fps,
             encode_time_us: s.encode_time_us,
@@ -97,9 +102,19 @@ impl StatsSnapshot {
             pipeline_running: s.pipeline_running,
             uptime_secs: s.uptime_secs(),
             mdns_active: s.mdns_active,
+            gpu_temp_c: s.gpu_temp_c,
         }
     }
 }
+
+const ENCODER_AUTO_LABEL: &str = "Auto";
+const ENCODER_CHOICES: &[(&str, &str)] = &[
+    (ENCODER_AUTO_LABEL, ""),
+    ("NVENC", "h264_nvenc"),
+    ("AMF", "h264_amf"),
+    ("QSV", "h264_qsv"),
+    ("x264", "libx264"),
+];
 
 pub struct AnalyzerApp {
     control: GuiControl,
@@ -109,29 +124,92 @@ pub struct AnalyzerApp {
     settings_target_ip: String,
     settings_target_error: Option<String>,
     settings_start_on_boot: bool,
+    settings_encoder_choice: String, // display label, e.g. "Auto" or "NVENC"
     show_qr_modal: bool,
+    qr_cache: Option<(String, QrCode)>,
 }
 
 impl AnalyzerApp {
     pub fn new(_cc: &eframe::CreationContext<'_>, control: GuiControl) -> Self {
-        let target_addr = *control.shared.target_addr.lock();
-        let settings_target_ip = if target_addr.ip().is_unspecified() || target_addr.port() == 0 {
-            String::new()
+        // Load persisted settings first; values fall back to the live runtime state when the
+        // file is missing or unreadable.
+        let persisted = SettingsFile::load();
+
+        let runtime_bitrate_mbps = control
+            .shared
+            .bitrate_bps
+            .load(std::sync::atomic::Ordering::SeqCst) as f32
+            / 1_000_000.0;
+        let bitrate_mbps = if persisted.bitrate_mbps > 0.0 {
+            control.shared.bitrate_bps.store(
+                (persisted.bitrate_mbps * 1_000_000.0).round() as u32,
+                std::sync::atomic::Ordering::SeqCst,
+            );
+            PIPELINE_STATS
+                .lock()
+                .set_bitrate((persisted.bitrate_mbps * 1_000_000.0).round() as u32);
+            persisted.bitrate_mbps
         } else {
-            target_addr.to_string()
+            runtime_bitrate_mbps
+        };
+
+        let fps_target = if persisted.target_fps == 30 || persisted.target_fps == 60 {
+            persisted.target_fps
+        } else {
+            control
+                .shared
+                .target_fps
+                .load(std::sync::atomic::Ordering::SeqCst)
+        };
+        control
+            .shared
+            .target_fps
+            .store(fps_target, std::sync::atomic::Ordering::SeqCst);
+
+        let settings_target_ip = if let Some(ip) = persisted.target_ip.clone() {
+            if let Ok(addr) = ip.parse::<SocketAddr>() {
+                *control.shared.target_addr.lock() = addr;
+                PIPELINE_STATS.lock().set_target_addr(addr.to_string());
+            }
+            ip
+        } else {
+            let target_addr = *control.shared.target_addr.lock();
+            if target_addr.ip().is_unspecified() || target_addr.port() == 0 {
+                String::new()
+            } else {
+                target_addr.to_string()
+            }
+        };
+
+        let encoder_choice = if let Some(name) = persisted.encoder_override.as_deref() {
+            *control.shared.encoder_override.lock() = Some(name.to_string());
+            ENCODER_CHOICES
+                .iter()
+                .find(|(_, ffmpeg)| *ffmpeg == name)
+                .map(|(label, _)| label.to_string())
+                .unwrap_or_else(|| ENCODER_AUTO_LABEL.to_string())
+        } else {
+            ENCODER_AUTO_LABEL.to_string()
+        };
+
+        let start_on_boot = if persisted.start_on_boot != read_startup_registry() {
+            // Persisted state disagrees with the registry — trust the registry as ground truth.
+            read_startup_registry()
+        } else {
+            persisted.start_on_boot
         };
 
         Self {
-            settings_bitrate_mbps: control.shared.bitrate_bps.load(std::sync::atomic::Ordering::SeqCst)
-                as f32
-                / 1_000_000.0,
-            settings_start_on_boot: read_startup_registry(),
-            settings_target_ip,
             control,
             current_tab: AppTab::Stream,
-            settings_fps_target: 60,
+            settings_bitrate_mbps: bitrate_mbps,
+            settings_fps_target: fps_target,
+            settings_target_ip,
             settings_target_error: None,
+            settings_start_on_boot: start_on_boot,
+            settings_encoder_choice: encoder_choice,
             show_qr_modal: false,
+            qr_cache: None,
         }
     }
 
@@ -142,12 +220,38 @@ impl AnalyzerApp {
                 PIPELINE_STATS.lock().set_target_addr(target_addr.to_string());
                 self.settings_target_error = None;
                 info!(target = %target_addr, "Transport target updated from GUI");
+                self.persist_settings();
             }
             Err(error) => {
                 self.settings_target_error = Some("Enter host:port".to_string());
                 warn!(error = %error, target = %self.settings_target_ip, "Invalid target address");
             }
         }
+    }
+
+    fn persist_settings(&self) {
+        let encoder_override = ENCODER_CHOICES
+            .iter()
+            .find(|(label, _)| *label == self.settings_encoder_choice)
+            .and_then(|(_, ffmpeg)| {
+                if ffmpeg.is_empty() {
+                    None
+                } else {
+                    Some((*ffmpeg).to_string())
+                }
+            });
+        let file = SettingsFile {
+            bitrate_mbps: self.settings_bitrate_mbps,
+            target_fps: self.settings_fps_target,
+            target_ip: if self.settings_target_ip.trim().is_empty() {
+                None
+            } else {
+                Some(self.settings_target_ip.trim().to_string())
+            },
+            encoder_override,
+            start_on_boot: self.settings_start_on_boot,
+        };
+        file.save();
     }
 }
 
@@ -196,31 +300,7 @@ impl eframe::App for AnalyzerApp {
         });
 
         if self.show_qr_modal {
-            egui::Window::new("QR Code")
-                .collapsible(false)
-                .resizable(false)
-                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
-                .show(ctx, |ui| {
-                    ui.label(
-                        egui::RichText::new("Connect this target from the iPad app.")
-                            .color(TEXT)
-                            .size(14.0),
-                    );
-                    ui.add_space(4.0);
-                    ui.label(
-                        egui::RichText::new(format!(
-                            "{}",
-                            value_or_unknown(&snap.listen_addr)
-                        ))
-                        .color(MUTED)
-                        .monospace()
-                        .size(13.0),
-                    );
-                    ui.add_space(8.0);
-                    if ui.add(egui::Button::new("Close").corner_radius(8.0)).clicked() {
-                        self.show_qr_modal = false;
-                    }
-                });
+            self.draw_qr_modal(ctx, &snap);
         }
     }
 }
@@ -373,28 +453,67 @@ impl AnalyzerApp {
 
     fn draw_performance_tab(&self, ui: &mut egui::Ui, snap: &StatsSnapshot) {
         ui.add_space(8.0);
-        section_header(ui, "Encode Time (ms)");
-        draw_sparkline(ui, &snap.encode_time_history, 200.0, ACCENT);
 
-        ui.add_space(16.0);
+        // Full-width encode time chart, 180px tall, auto-scaled.
+        card_frame().show(ui, |ui| {
+            section_header(ui, "Encode Time (ms)");
+            draw_sparkline(ui, &snap.encode_time_history, 180.0, ACCENT);
+        });
 
+        ui.add_space(12.0);
+
+        // Capture / Encode / Transport FPS · Bandwidth
         ui.horizontal(|ui| {
             metric_card(ui, "Capture FPS", &format!("{:.1}", snap.capture_fps), ACCENT);
             metric_card(ui, "Encode FPS", &format!("{:.1}", snap.encode_fps), ACCENT);
-            metric_card(ui, "Transport FPS", &format!("{:.1}", snap.transport_fps), ACCENT);
+            metric_card(
+                ui,
+                "Transport FPS",
+                &format!("{:.1}", snap.transport_fps),
+                ACCENT,
+            );
+            metric_card(
+                ui,
+                "Bandwidth",
+                &format!("{:.1} Mbps", snap.bandwidth_mbps),
+                ACCENT,
+            );
         });
 
-        ui.add_space(16.0);
+        ui.add_space(12.0);
 
+        // Cumulative session counters
         card_frame().show(ui, |ui| {
-            stat_row(ui, "Packets sent", &snap.transport_packets_sent.to_string());
-            stat_row(ui, "Fragments sent", &snap.transport_fragments_sent.to_string());
-            stat_row(ui, "Bytes sent", &format_bytes(snap.transport_bytes_sent));
-            stat_row(ui, "Bandwidth", &format!("{:.1} Mbps", snap.bandwidth_mbps));
-            stat_row(ui, "Bits/sec", &format!("{:.0}", snap.bandwidth_bps));
+            section_header(ui, "Session totals");
+            stat_row(
+                ui,
+                "Frames sent",
+                &snap.encode_frame_count.to_string(),
+            );
+            stat_row(
+                ui,
+                "Bytes sent",
+                &format_bytes(snap.transport_bytes_sent),
+            );
+            stat_row(
+                ui,
+                "Packets sent",
+                &snap.transport_packets_sent.to_string(),
+            );
+            stat_row(
+                ui,
+                "Fragments sent",
+                &snap.transport_fragments_sent.to_string(),
+            );
+            stat_row(ui, "Frames captured", &snap.capture_frame_count.to_string());
             stat_row(ui, "Uptime", &format_uptime(snap.uptime_secs));
             stat_row(ui, "Target", value_or_unknown(&snap.target_addr));
             stat_row(ui, "mDNS", if snap.mdns_active { "Active" } else { "Inactive" });
+            let gpu_temp = snap
+                .gpu_temp_c
+                .map(|t| format!("{:.1} °C", t))
+                .unwrap_or_else(|| "unavailable".to_string());
+            stat_row(ui, "GPU temp", &gpu_temp);
         });
     }
 
@@ -403,35 +522,62 @@ impl AnalyzerApp {
         section_header(ui, "Settings");
 
         card_frame().show(ui, |ui| {
+            // --- Bitrate slider ---------------------------------------------------
             ui.horizontal(|ui| {
-                ui.label(egui::RichText::new("Bitrate").color(TEXT).size(13.0));
-                let slider = egui::Slider::new(&mut self.settings_bitrate_mbps, 1.0..=50.0).text("Mbps");
-                if ui.add(slider).changed() {
-                    let bitrate_bps = (self.settings_bitrate_mbps * 1_000_000.0).round() as u32;
-                    self.control
-                        .shared
-                        .bitrate_bps
-                        .store(bitrate_bps, std::sync::atomic::Ordering::SeqCst);
-                    PIPELINE_STATS.lock().set_bitrate(bitrate_bps);
-                }
+                ui.label(egui::RichText::new(format!(
+                    "Bitrate: {:.0} Mbps",
+                    self.settings_bitrate_mbps
+                ))
+                .color(TEXT)
+                .size(13.0));
             });
+            let slider = egui::Slider::new(&mut self.settings_bitrate_mbps, 1.0..=50.0)
+                .show_value(false);
+            if ui.add(slider).changed() {
+                let bitrate_bps = (self.settings_bitrate_mbps * 1_000_000.0).round() as u32;
+                self.control
+                    .shared
+                    .bitrate_bps
+                    .store(bitrate_bps, std::sync::atomic::Ordering::SeqCst);
+                PIPELINE_STATS.lock().set_bitrate(bitrate_bps);
+                self.persist_settings();
+            }
 
-            ui.add_space(8.0);
+            ui.add_space(12.0);
 
+            // --- FPS target segmented control ------------------------------------
             ui.horizontal(|ui| {
                 ui.label(egui::RichText::new("FPS target").color(TEXT).size(13.0));
                 ui.add_space(8.0);
-                let response = ui.add_enabled_ui(false, |ui| {
-                    let _ = ui.selectable_label(self.settings_fps_target == 30, "30");
-                    let _ = ui.selectable_label(self.settings_fps_target == 60, "60");
-                });
-                response
-                    .response
-                    .on_hover_text("Runtime FPS switching is not wired in this build.");
+                let prev = self.settings_fps_target;
+                if ui
+                    .selectable_label(self.settings_fps_target == 30, "30")
+                    .clicked()
+                {
+                    self.settings_fps_target = 30;
+                }
+                if ui
+                    .selectable_label(self.settings_fps_target == 60, "60")
+                    .clicked()
+                {
+                    self.settings_fps_target = 60;
+                }
+                if self.settings_fps_target != prev {
+                    self.control
+                        .shared
+                        .target_fps
+                        .store(self.settings_fps_target, std::sync::atomic::Ordering::SeqCst);
+                    info!(
+                        target_fps = self.settings_fps_target,
+                        "Capture target FPS updated from GUI"
+                    );
+                    self.persist_settings();
+                }
             });
 
-            ui.add_space(8.0);
+            ui.add_space(12.0);
 
+            // --- Target IP --------------------------------------------------------
             ui.horizontal(|ui| {
                 ui.label(egui::RichText::new("Target IP").color(TEXT).size(13.0));
                 let response = ui.add(
@@ -454,22 +600,170 @@ impl AnalyzerApp {
                 ui.label(egui::RichText::new(error).color(RED).size(11.0));
             }
 
-            ui.add_space(8.0);
+            ui.add_space(12.0);
 
-            let prev = self.settings_start_on_boot;
+            // --- Encoder override dropdown ---------------------------------------
+            let detected = PIPELINE_STATS.lock().codec_name.clone();
+            ui.horizontal(|ui| {
+                ui.label(
+                    egui::RichText::new(format!(
+                        "Encoder: {} (detected: {})",
+                        self.settings_encoder_choice,
+                        if detected.is_empty() {
+                            "Unknown"
+                        } else {
+                            &detected
+                        }
+                    ))
+                    .color(TEXT)
+                    .size(13.0),
+                );
+            });
+            let prev_choice = self.settings_encoder_choice.clone();
+            egui::ComboBox::from_id_salt("encoder_override_combo")
+                .selected_text(&self.settings_encoder_choice)
+                .show_ui(ui, |ui| {
+                    for (label, _) in ENCODER_CHOICES {
+                        if ui
+                            .selectable_label(self.settings_encoder_choice == *label, *label)
+                            .clicked()
+                        {
+                            self.settings_encoder_choice = (*label).to_string();
+                        }
+                    }
+                });
+            if self.settings_encoder_choice != prev_choice {
+                let ffmpeg_name = ENCODER_CHOICES
+                    .iter()
+                    .find(|(label, _)| *label == self.settings_encoder_choice)
+                    .map(|(_, ffmpeg)| (*ffmpeg).to_string());
+                *self.control.shared.encoder_override.lock() = ffmpeg_name
+                    .as_deref()
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_string);
+                info!(
+                    encoder = self.settings_encoder_choice,
+                    "Encoder override set — takes effect on next stream restart"
+                );
+                self.persist_settings();
+            }
+
+            ui.add_space(12.0);
+
+            // --- Start on Windows startup ----------------------------------------
+            let prev_boot = self.settings_start_on_boot;
             ui.checkbox(
                 &mut self.settings_start_on_boot,
                 egui::RichText::new("Start on Windows startup").color(TEXT).size(13.0),
             );
-            if self.settings_start_on_boot != prev {
+            if self.settings_start_on_boot != prev_boot {
                 if let Err(error) = set_startup_registry(self.settings_start_on_boot) {
-                    self.settings_start_on_boot = prev;
+                    self.settings_start_on_boot = prev_boot;
                     self.settings_target_error = Some(error);
                 } else {
                     self.settings_target_error = None;
+                    self.persist_settings();
                 }
             }
         });
+    }
+}
+
+impl AnalyzerApp {
+    fn draw_qr_modal(&mut self, ctx: &egui::Context, snap: &StatsSnapshot) {
+        let listen_addr = if snap.listen_addr.is_empty() {
+            self.control.shared.target_addr.lock().to_string()
+        } else {
+            snap.listen_addr.clone()
+        };
+        let url = format!("eternaldisplay://{}", listen_addr);
+
+        // Cache the encoded QR matrix until the URL changes.
+        if self
+            .qr_cache
+            .as_ref()
+            .map(|(cached_url, _)| cached_url != &url)
+            .unwrap_or(true)
+        {
+            match QrCode::new(url.as_bytes()) {
+                Ok(code) => self.qr_cache = Some((url.clone(), code)),
+                Err(error) => {
+                    warn!(error = %error, url = %url, "Failed to encode QR code");
+                    self.qr_cache = None;
+                }
+            }
+        }
+
+        let qr = self.qr_cache.as_ref().map(|(_, c)| c);
+        let mut should_close = false;
+
+        egui::Window::new("QR Code")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .show(ctx, |ui| {
+                ui.label(
+                    egui::RichText::new("Scan this QR with the iPad camera to connect.")
+                        .color(TEXT)
+                        .size(14.0),
+                );
+                ui.add_space(8.0);
+
+                let canvas_size = 360.0_f32;
+                let (rect, _) = ui.allocate_exact_size(
+                    egui::vec2(canvas_size, canvas_size),
+                    egui::Sense::hover(),
+                );
+                let painter = ui.painter_at(rect);
+                painter.rect_filled(rect, 6.0, egui::Color32::WHITE);
+
+                if let Some(code) = qr {
+                    let width = code.width();
+                    let modules = code.to_colors();
+                    let quiet_zone = 4.0_f32;
+                    let module_size = (canvas_size - 2.0 * quiet_zone) / width as f32;
+                    let origin = egui::pos2(rect.left() + quiet_zone, rect.top() + quiet_zone);
+
+                    for y in 0..width {
+                        for x in 0..width {
+                            if matches!(modules[y * width + x], QrModuleColor::Dark) {
+                                let cell = egui::Rect::from_min_size(
+                                    egui::pos2(
+                                        origin.x + x as f32 * module_size,
+                                        origin.y + y as f32 * module_size,
+                                    ),
+                                    egui::vec2(module_size, module_size),
+                                );
+                                painter.rect_filled(cell, 0.0, egui::Color32::BLACK);
+                            }
+                        }
+                    }
+                } else {
+                    painter.text(
+                        rect.center(),
+                        egui::Align2::CENTER_CENTER,
+                        "QR encoding failed",
+                        egui::FontId::monospace(14.0),
+                        RED,
+                    );
+                }
+
+                ui.add_space(8.0);
+                ui.label(
+                    egui::RichText::new(&url)
+                        .color(MUTED2)
+                        .monospace()
+                        .size(13.0),
+                );
+                ui.add_space(8.0);
+                if ui.add(egui::Button::new("Close").corner_radius(8.0)).clicked() {
+                    should_close = true;
+                }
+            });
+
+        if should_close {
+            self.show_qr_modal = false;
+        }
     }
 }
 

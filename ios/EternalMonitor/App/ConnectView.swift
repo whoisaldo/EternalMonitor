@@ -2,12 +2,17 @@ import SwiftUI
 
 struct ConnectView: View {
     @EnvironmentObject var connectionManager: ConnectionManager
+    @EnvironmentObject var settings: AppSettings
     @StateObject private var recentStore = RecentConnectionStore.shared
     @StateObject private var scanner = NetworkScanner()
 
     @State private var hostIP: String = ""
     @State private var port: String = "9876"
     @State private var showSettings = false
+    // NEEDS_XCODE_VERIFY: track whether we've already pre-filled from lastHost so we
+    // don't clobber user edits on every re-render.
+    @State private var didPrefillFromLastHost = false
+    @State private var showQRScanner = false
     @FocusState private var focusedField: Field?
 
     private enum Field: Hashable {
@@ -58,6 +63,8 @@ struct ConnectView: View {
 
                         scanButton
 
+                        qrScanButton
+
                         if !scanner.statusMessage.isEmpty && scanner.hosts.isEmpty {
                             scanStatusMessage
                         }
@@ -92,6 +99,26 @@ struct ConnectView: View {
             }
             .sheet(isPresented: $showSettings) {
                 SettingsView()
+            }
+            .sheet(isPresented: $showQRScanner) {
+                // NEEDS_XCODE_VERIFY: QR scanner sheet for connecting via host-displayed QR.
+                QRScannerView(
+                    onScan: { value in
+                        showQRScanner = false
+                        handleScannedQR(value)
+                    },
+                    onCancel: { showQRScanner = false }
+                )
+            }
+            .onAppear {
+                // NEEDS_XCODE_VERIFY: pre-fill from last successful connection.
+                if !didPrefillFromLastHost && hostIP.isEmpty && !settings.lastHost.isEmpty {
+                    hostIP = settings.lastHost
+                    if settings.lastPort != 0 {
+                        port = String(settings.lastPort)
+                    }
+                    didPrefillFromLastHost = true
+                }
             }
         }
     }
@@ -195,6 +222,15 @@ struct ConnectView: View {
                     .autocorrectionDisabled()
                     .focused($focusedField, equals: .host)
                     .disabled(isConnecting)
+
+                // NEEDS_XCODE_VERIFY: surface the most recent successful connection so the
+                // user can confirm pre-fill came from the right place.
+                if !settings.lastHost.isEmpty && settings.lastHost != normalizedHostIP {
+                    Text("Last connected: \(settings.lastHost)")
+                        .font(.appMonoRegular(size: 11))
+                        .foregroundColor(.white.opacity(0.3))
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                }
             }
 
             VStack(alignment: .leading, spacing: 6) {
@@ -343,6 +379,49 @@ struct ConnectView: View {
                     )
             }
         }
+    }
+
+    // MARK: - Scan QR
+
+    private var qrScanButton: some View {
+        Button {
+            focusedField = nil
+            showQRScanner = true
+        } label: {
+            HStack(spacing: 8) {
+                Image(systemName: "qrcode.viewfinder")
+                Text("Scan QR")
+                    .font(.appMonoRegular(size: 14))
+            }
+            .foregroundColor(.white.opacity(0.6))
+            .frame(maxWidth: .infinity)
+            .padding(.vertical, 14)
+            .background(
+                RoundedRectangle(cornerRadius: 14)
+                    .strokeBorder(Color.white.opacity(0.1), lineWidth: 1)
+            )
+        }
+        .disabled(isConnecting)
+        .opacity(isConnecting ? 0.5 : 1)
+    }
+
+    // NEEDS_XCODE_VERIFY: parse "eternaldisplay://IP:port" and immediately connect.
+    private func handleScannedQR(_ value: String) {
+        let prefix = "eternaldisplay://"
+        guard value.hasPrefix(prefix) else {
+            connectionManager.connectionError = "Scanned QR is not an EternalMonitor link."
+            return
+        }
+        let body = String(value.dropFirst(prefix.count))
+        let parts = body.split(separator: ":")
+        guard parts.count == 2,
+              let scannedPort = UInt16(parts[1]) else {
+            connectionManager.connectionError = "Scanned QR is malformed."
+            return
+        }
+        hostIP = String(parts[0])
+        port = String(scannedPort)
+        connectionManager.connect(host: hostIP, port: scannedPort)
     }
 
     // MARK: - Scan network
