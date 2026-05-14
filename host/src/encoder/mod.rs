@@ -71,8 +71,9 @@ fn run_encode_loop(
                         other
                     }
                 };
+                let display = display.to_string();
                 info!(encoder = %name, "Encoder override honoured");
-                (name, display.to_string())
+                (name, display)
             }
             Some(name) => {
                 warn!(

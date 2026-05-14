@@ -34,6 +34,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with_writer(|| logging::MemoryLogWriter::new())
         .with_filter(logging::MdnsDedupFilter::new());
 
+    tracing_subscriber::registry()
+        .with(env_filter)
+        .with(stdout_layer)
+        .with(memory_layer)
+        .init();
+
     info!(
         path = %logging::session_log_path().display(),
         "Session log file initialized"
