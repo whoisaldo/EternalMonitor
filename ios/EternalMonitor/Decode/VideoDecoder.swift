@@ -2,6 +2,18 @@ import Foundation
 import VideoToolbox
 import CoreMedia
 
+/// Verbose per-frame decode logging. Off by default — these prints run on the decode hot path
+/// (every submitted access unit and every decoded frame) and cause noticeable jank at 60 fps.
+/// Flip to `true` only when debugging the decode pipeline.
+private let verboseDecodeLogging = false
+
+/// Recreate the VTDecompressionSession on every IDR. This is the heavy "AMD recovery" hammer:
+/// it re-inits the hardware decoder ~2×/second (GOP≈30), which trades smoothness for guaranteed
+/// resync. The host now prepends fresh SPS/PPS on every IDR and `tryCreateFormatDescription`
+/// already recreates the session when parameter sets change, so this should be redundant.
+/// Set to `false` to A/B test smoothness vs. long-run sync on the AMD path.
+private let recreateSessionOnEveryIDR = true
+
 /// H.264 hardware decoder using VideoToolbox.
 /// Parses NAL units, extracts SPS/PPS, converts Annex B → AVCC, decodes to CVPixelBuffer.
 final class VideoDecoder {
@@ -20,7 +32,7 @@ final class VideoDecoder {
     private var hasLoggedFirstNALPrefix = false
     private var hasLoggedFirstPacketHex = false
     private var waitingForSyncSample = true
-    // NEEDS_XCODE_VERIFY: per-packet logging counter for AMD recovery debugging.
+    // Per-packet logging counter for AMD recovery debugging (see verboseDecodeLogging).
     private var packetLogCounter: UInt64 = 0
 
     private let decodeQueue = DispatchQueue(label: "com.eternal.decode", qos: .userInteractive)
@@ -47,8 +59,8 @@ final class VideoDecoder {
             self.sps = nil
             self.pps = nil
             self.waitingForSyncSample = true
-            // NEEDS_XCODE_VERIFY: clear diagnostic state so a reconnection re-logs the
-            // first NAL types / packetisation it observes.
+            // Clear diagnostic state so a reconnection re-logs the first NAL types /
+            // packetisation it observes.
             self.loggedPacketizations.removeAll()
             self.loggedNALTypes.removeAll()
             self.hasLoggedEmptyPayload = false
@@ -62,7 +74,7 @@ final class VideoDecoder {
     // MARK: - Internal
 
     private func decodeOnQueue(packet: FramePacket) {
-        if !hasLoggedFirstPacketHex {
+        if verboseDecodeLogging && !hasLoggedFirstPacketHex {
             hasLoggedFirstPacketHex = true
             let hex = packet.data.prefix(16).map { String(format: "%02X", $0) }.joined(separator: " ")
             print("[VideoDecoder] First packet hex (\(packet.data.count) bytes): \(hex)")
@@ -104,9 +116,9 @@ final class VideoDecoder {
 
             switch nalType {
             case 6, 9:
-                // NEEDS_XCODE_VERIFY: strip SEI(6) and AUD(9) — VideoToolbox on some iPad
-                // models trips on AUDs and SEIs in the submitted sample buffer, particularly
-                // around format-description re-creation. They carry no decode info.
+                // Strip SEI(6) and AUD(9) — VideoToolbox on some iPad models trips on AUDs and
+                // SEIs in the submitted sample buffer, particularly around format-description
+                // re-creation. They carry no decode info.
                 continue
             case 7: // SPS
                 sps = nal
@@ -124,21 +136,21 @@ final class VideoDecoder {
 
         if hasSliceNAL {
             let isSyncSample = isRandomAccessAccessUnit(accessUnitNALs)
-            // NEEDS_XCODE_VERIFY: per-packet log for first 20 packets and then every 300th
-            // packet. Helps confirm AMD recovery is firing IDRs as expected.
+            // Per-packet log for the first 20 packets and then every 300th packet. Helps
+            // confirm AMD recovery is firing IDRs as expected (see verboseDecodeLogging).
             packetLogCounter += 1
-            if packetLogCounter <= 20 || packetLogCounter % 300 == 0 {
+            if verboseDecodeLogging && (packetLogCounter <= 20 || packetLogCounter % 300 == 0) {
                 let typesString = nalTypesInPacket.map { String($0) }.joined(separator: ",")
                 print(
                     "[VT] pkt seq=\(packet.seq) isKey=\(isSyncSample) nalCount=\(accessUnitNALs.count) nalTypes=\(typesString)"
                 )
             }
-            // NEEDS_XCODE_VERIFY: on every random-access access unit, recreate the
-            // VTDecompressionSession from the current format description. This clears any
-            // half-broken decoder state left over from a previous GOP — the AMD path on
-            // Windows would lose decoder sync after the first ~1s of P-frames; teardown
-            // forces VideoToolbox to honour the freshly-prepended SPS/PPS.
-            if isSyncSample {
+            // On every random-access access unit, recreate the VTDecompressionSession from the
+            // current format description. This clears any half-broken decoder state left over
+            // from a previous GOP — the AMD path on Windows would lose decoder sync after the
+            // first ~1s of P-frames; teardown forces VideoToolbox to honour the freshly-
+            // prepended SPS/PPS. Gated by recreateSessionOnEveryIDR so it can be A/B tested.
+            if isSyncSample && recreateSessionOnEveryIDR {
                 createDecompressionSession()
             }
             decodeAccessUnit(accessUnitNALs, timestampUs: packet.timestampUs, isSyncSample: isSyncSample)
@@ -309,7 +321,7 @@ final class VideoDecoder {
             return
         }
 
-        VTSessionSetProperty(session, key: kVTDecompressionPropertyKey_RealTime, value: kCFBooleanTrue)
+        VTSessionSetProperty(session, key: kVTDecompressionPropertyKey_RealTime, value: kCFBooleanTrue!)
         decompressionSession = session
         waitingForSyncSample = true
         onEvent?("VideoToolbox session ready")
@@ -402,7 +414,7 @@ final class VideoDecoder {
                 CFArrayGetValueAtIndex(attachmentsArray, 0),
                 to: CFMutableDictionary.self
             )
-            let syncFlag = isSyncSample ? kCFBooleanFalse : kCFBooleanTrue
+            let syncFlag = isSyncSample ? kCFBooleanFalse! : kCFBooleanTrue!
             CFDictionarySetValue(
                 attachments,
                 Unmanaged.passUnretained(kCMSampleAttachmentKey_NotSync).toOpaque(),
@@ -418,8 +430,10 @@ final class VideoDecoder {
         // Pass timestampUs through frameReferenceContext so the callback can retrieve it
         let frameRef = UnsafeMutableRawPointer(bitPattern: UInt(truncatingIfNeeded: timestampUs))
 
-        let nalCount = nalUnits.count
-        print("[VT] Submitting sample: size=\(totalLen) isKeyframe=\(isSyncSample) nalCount=\(nalCount)")
+        if verboseDecodeLogging {
+            let nalCount = nalUnits.count
+            print("[VT] Submitting sample: size=\(totalLen) isKeyframe=\(isSyncSample) nalCount=\(nalCount)")
+        }
 
         var infoFlags = VTDecodeInfoFlags()
         let status = VTDecompressionSessionDecodeFrame(
@@ -578,9 +592,11 @@ private func decompressionCallback(
 ) {
     guard let refCon = decompressionOutputRefCon else { return }
 
-    print("[VT] Output callback fired: status=\(status) flags=\(infoFlags)")
-    if status != noErr {
-        print("[VT] Decode error: \(status)")
+    if verboseDecodeLogging {
+        print("[VT] Output callback fired: status=\(status) flags=\(infoFlags)")
+        if status != noErr {
+            print("[VT] Decode error: \(status)")
+        }
     }
 
     let decoder = Unmanaged<VideoDecoder>.fromOpaque(refCon).takeUnretainedValue()

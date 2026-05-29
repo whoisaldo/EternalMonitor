@@ -68,7 +68,7 @@ final class ConnectionManager: ObservableObject {
     @Published var transportMode: String = "WiFi"
     @Published var connectionError: String?
     @Published private(set) var diagnostics: [DiagnosticEntry] = []
-    // NEEDS_XCODE_VERIFY: connection quality tracker exposed to the HUD.
+    // connection quality tracker exposed to the HUD.
     let quality = ConnectionQualityTracker()
 
     private var udpReceiver: UDPReceiver?
@@ -127,7 +127,7 @@ final class ConnectionManager: ObservableObject {
                     self.state = .connected
                     self.transportMode = "WiFi"
                     RecentConnectionStore.shared.add(host: normalizedHost, port: port, isUSB: false)
-                    // NEEDS_XCODE_VERIFY: remember the last successfully-connected target so we
+                    // remember the last successfully-connected target so we
                     // can pre-fill the IP field on next launch.
                     UserDefaults.standard.set(normalizedHost, forKey: "lastHost")
                     UserDefaults.standard.set(Int(port), forKey: "lastPort")
@@ -358,7 +358,7 @@ final class AppSettings: ObservableObject {
     @Published var promotionEnabled: Bool {
         didSet { UserDefaults.standard.set(promotionEnabled, forKey: "promotionEnabled") }
     }
-    // NEEDS_XCODE_VERIFY: last successfully-connected host+port for pre-fill on relaunch.
+    // last successfully-connected host+port for pre-fill on relaunch.
     @Published var lastHost: String {
         didSet { UserDefaults.standard.set(lastHost, forKey: "lastHost") }
     }

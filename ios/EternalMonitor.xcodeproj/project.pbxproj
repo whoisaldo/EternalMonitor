@@ -14,11 +14,13 @@
 		364520E29F463653E767EFC0 /* ConnectionManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = 76DC9AC42CD825B0067781CB /* ConnectionManager.swift */; };
 		4C6C14D2E6145C74C7849399 /* NetworkScanner.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7DCA62831CD92E0085B031B9 /* NetworkScanner.swift */; };
 		6B5A929350F801FFCA70C379 /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = C87040A4A4ECB5BD1665109D /* Assets.xcassets */; };
+		707861A8A290BE7A63C021AB /* QRScannerView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2E8424F3EB786D7354FBA409 /* QRScannerView.swift */; };
 		7ACBA6FE50621B3D5832C354 /* Shaders.metal in Sources */ = {isa = PBXBuildFile; fileRef = 138555311E48910360D12ED4 /* Shaders.metal */; };
 		849F37C24A83C3B62510B0D4 /* EternalMonitorApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2E8CDE0648F692A8B2573F72 /* EternalMonitorApp.swift */; };
 		9035DAE273FD55FC9541DE58 /* Syne-Variable.ttf in Resources */ = {isa = PBXBuildFile; fileRef = 6A16995CDACE3B9E0913634A /* Syne-Variable.ttf */; };
 		965AE8A45B3FFB80BAC080EA /* FrameAssembler.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3A24C7341579049C355BFF9B /* FrameAssembler.swift */; };
 		97B6455B7B6BF247E760B12C /* JetBrainsMono-Regular.ttf in Resources */ = {isa = PBXBuildFile; fileRef = 4881137D90BCC57F396AC83A /* JetBrainsMono-Regular.ttf */; };
+		9CDFFE4189B757B1CEDB3DA4 /* ConnectionQualityTracker.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9F80E0ABB0BA7EE123B3E43A /* ConnectionQualityTracker.swift */; };
 		AFC68CE158478DF81C400037 /* FramePacket.swift in Sources */ = {isa = PBXBuildFile; fileRef = B9A3804545184ADE28A52B91 /* FramePacket.swift */; };
 		B15A2F855F253000E088A97F /* JetBrainsMono-Medium.ttf in Resources */ = {isa = PBXBuildFile; fileRef = 57CEEC971B0B9C68EFB6EE9D /* JetBrainsMono-Medium.ttf */; };
 		C113137D003992E3EE3ADE2F /* UDPReceiver.swift in Sources */ = {isa = PBXBuildFile; fileRef = 05BECFE479E4EDCA8748C689 /* UDPReceiver.swift */; };
@@ -33,6 +35,7 @@
 		05BECFE479E4EDCA8748C689 /* UDPReceiver.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = UDPReceiver.swift; sourceTree = "<group>"; };
 		138555311E48910360D12ED4 /* Shaders.metal */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.metal; path = Shaders.metal; sourceTree = "<group>"; };
 		2C07F2065243B4D548AF9737 /* ConnectView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ConnectView.swift; sourceTree = "<group>"; };
+		2E8424F3EB786D7354FBA409 /* QRScannerView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = QRScannerView.swift; sourceTree = "<group>"; };
 		2E8CDE0648F692A8B2573F72 /* EternalMonitorApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = EternalMonitorApp.swift; sourceTree = "<group>"; };
 		2EB22B0AF32E701BAD376F2B /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist; path = Info.plist; sourceTree = "<group>"; };
 		3A24C7341579049C355BFF9B /* FrameAssembler.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FrameAssembler.swift; sourceTree = "<group>"; };
@@ -45,6 +48,7 @@
 		76DC9AC42CD825B0067781CB /* ConnectionManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ConnectionManager.swift; sourceTree = "<group>"; };
 		7DCA62831CD92E0085B031B9 /* NetworkScanner.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NetworkScanner.swift; sourceTree = "<group>"; };
 		979006DCCD810D84071E9EC2 /* ContentView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ContentView.swift; sourceTree = "<group>"; };
+		9F80E0ABB0BA7EE123B3E43A /* ConnectionQualityTracker.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ConnectionQualityTracker.swift; sourceTree = "<group>"; };
 		B9A3804545184ADE28A52B91 /* FramePacket.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FramePacket.swift; sourceTree = "<group>"; };
 		C41301B113497F8B50C3EFA6 /* SettingsView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SettingsView.swift; sourceTree = "<group>"; };
 		C87040A4A4ECB5BD1665109D /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
@@ -55,6 +59,14 @@
 /* End PBXFileReference section */
 
 /* Begin PBXGroup section */
+		0C59498B30AADB51EDEC5C50 /* Scan */ = {
+			isa = PBXGroup;
+			children = (
+				2E8424F3EB786D7354FBA409 /* QRScannerView.swift */,
+			);
+			path = Scan;
+			sourceTree = "<group>";
+		};
 		103337C7ABDD73863B0315A0 /* Render */ = {
 			isa = PBXGroup;
 			children = (
@@ -99,6 +111,7 @@
 				4169DC9C88BE43084A67E563 /* Proto */,
 				103337C7ABDD73863B0315A0 /* Render */,
 				93829228B80918636D822D17 /* Resources */,
+				0C59498B30AADB51EDEC5C50 /* Scan */,
 				2EB22B0AF32E701BAD376F2B /* Info.plist */,
 			);
 			path = EternalMonitor;
@@ -109,6 +122,7 @@
 			children = (
 				F27CDC6600C31F70F4162619 /* AppFonts.swift */,
 				76DC9AC42CD825B0067781CB /* ConnectionManager.swift */,
+				9F80E0ABB0BA7EE123B3E43A /* ConnectionQualityTracker.swift */,
 				2C07F2065243B4D548AF9737 /* ConnectView.swift */,
 				979006DCCD810D84071E9EC2 /* ContentView.swift */,
 				D54A9F2A9ECB9A825280149D /* DisplayView.swift */,
@@ -234,6 +248,7 @@
 				157E9180E086E2F941CE1A2C /* AppFonts.swift in Sources */,
 				05D1E5177CC1BE3C1BA622C8 /* ConnectView.swift in Sources */,
 				364520E29F463653E767EFC0 /* ConnectionManager.swift in Sources */,
+				9CDFFE4189B757B1CEDB3DA4 /* ConnectionQualityTracker.swift in Sources */,
 				FE5190E6CA47D70558616B1D /* ContentView.swift in Sources */,
 				CD5051251ACC5857BF90746D /* DisplayView.swift in Sources */,
 				849F37C24A83C3B62510B0D4 /* EternalMonitorApp.swift in Sources */,
@@ -241,6 +256,7 @@
 				AFC68CE158478DF81C400037 /* FramePacket.swift in Sources */,
 				C1CAEB3220E81A66AE6A0C60 /* MetalView.swift in Sources */,
 				4C6C14D2E6145C74C7849399 /* NetworkScanner.swift in Sources */,
+				707861A8A290BE7A63C021AB /* QRScannerView.swift in Sources */,
 				30424AF56F7AD6320A8474D2 /* SettingsView.swift in Sources */,
 				7ACBA6FE50621B3D5832C354 /* Shaders.metal in Sources */,
 				C113137D003992E3EE3ADE2F /* UDPReceiver.swift in Sources */,

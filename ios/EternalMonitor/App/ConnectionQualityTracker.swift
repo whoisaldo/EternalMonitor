@@ -1,4 +1,4 @@
-// NEEDS_XCODE_VERIFY: Connection quality tracker — measures rolling packet loss and
+// Connection quality tracker — measures rolling packet loss and
 // inter-frame jitter. Owned by ConnectionManager; updated from network/decoder
 // callbacks. Published @MainActor so SwiftUI can observe.
 

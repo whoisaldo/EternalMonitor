@@ -18,7 +18,7 @@ final class NetworkScanner: NSObject, ObservableObject {
     private let browser = NetServiceBrowser()
     private var resolvingServices: [String: NetService] = [:]
     private var scanTask: Task<Void, Never>?
-    // NEEDS_XCODE_VERIFY: track auto-retry state so we don't bounce forever when discovery is broken.
+    // track auto-retry state so we don't bounce forever when discovery is broken.
     private var didAutoRetry = false
 
     override init() {
@@ -41,7 +41,7 @@ final class NetworkScanner: NSObject, ObservableObject {
         browser.searchForServices(ofType: "_eternaldisplay._udp.", inDomain: "local.")
 
         scanTask = Task { @MainActor in
-            // NEEDS_XCODE_VERIFY: 10s timeout — many routers are slow to forward the first mDNS
+            // 10s timeout — many routers are slow to forward the first mDNS
             // response, especially right after Wi-Fi reconnect. The brief raised this from 5s.
             try? await Task.sleep(nanoseconds: 10_000_000_000)
             if !Task.isCancelled {
@@ -63,7 +63,7 @@ final class NetworkScanner: NSObject, ObservableObject {
 
         if hosts.isEmpty {
             if !didAutoRetry {
-                // NEEDS_XCODE_VERIFY: auto-retry once after 2s. Bonjour browse occasionally
+                // auto-retry once after 2s. Bonjour browse occasionally
                 // misses the first multicast burst.
                 didAutoRetry = true
                 statusMessage = "No hosts found yet — retrying..."
@@ -136,7 +136,7 @@ extension NetworkScanner: NetServiceBrowserDelegate, NetServiceDelegate {
             defer { resolvingServices.removeValue(forKey: key) }
 
             guard let host = Self.discoveredHost(from: sender) else { return }
-            // NEEDS_XCODE_VERIFY: discovery diagnostic — surface every resolved host so we
+            // discovery diagnostic — surface every resolved host so we
             // can tell whether mDNS is finding the right machine.
             print("[mDNS] Found: \(host.name) at \(host.address):\(host.port)")
             hosts.removeAll { $0.name == host.name || $0.address == host.address }
@@ -147,7 +147,6 @@ extension NetworkScanner: NetServiceBrowserDelegate, NetServiceDelegate {
     }
 
     /// Prefer IPv4 over IPv6, then prefer same-subnet over different-subnet, then alpha by name.
-    /// NEEDS_XCODE_VERIFY
     private static func hostQualityCompare(_ a: DiscoveredHost, _ b: DiscoveredHost) -> Bool {
         let aV4 = a.address.contains(".")
         let bV4 = b.address.contains(".")
@@ -167,7 +166,7 @@ extension NetworkScanner: NetServiceBrowserDelegate, NetServiceDelegate {
 
     /// Best-effort: return the first three octets ("192.168.1.") of the iPad's primary
     /// non-loopback IPv4 interface, so we can prefer same-subnet hosts when sorting.
-    /// Returns nil on failure. NEEDS_XCODE_VERIFY.
+    /// Returns nil on failure.
     private static func primaryIPv4Subnet() -> String? {
         var ifaddr: UnsafeMutablePointer<ifaddrs>?
         guard getifaddrs(&ifaddr) == 0, let first = ifaddr else { return nil }

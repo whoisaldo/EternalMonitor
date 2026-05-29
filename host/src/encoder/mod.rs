@@ -57,7 +57,7 @@ fn run_encode_loop(
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Apply GUI encoder override at pipeline start. The override is consulted only here;
     // mid-stream changes don't take effect until the user requests a Restart.
-    let (encoder_name, codec_display_name) = {
+    let (mut encoder_name, mut codec_display_name) = {
         let override_name = shared.encoder_override.lock().clone();
         match override_name {
             Some(name) if ffmpeg_next::encoder::find_by_name(&name).is_some() => {
@@ -96,6 +96,10 @@ fn run_encode_loop(
     let mut rx = rx;
     let mut frames_since_last_idr: u64 = 0;
 
+    // Guarantee the very first frame of every pipeline is an IDR for all encoders, so the
+    // iPad never sits in `waitingForSyncSample` after a connect or pipeline restart.
+    shared.force_next_idr.store(true, Ordering::SeqCst);
+
     while let Some(raw_frame) = rx.blocking_recv() {
         if !shared.running.load(Ordering::SeqCst) {
             info!("Encoder loop stopping on running=false");
@@ -111,11 +115,26 @@ fn run_encode_loop(
         }
 
         if encoder_state.is_none() {
-            encoder_state = Some(EncoderState::new(
-                &encoder_name,
-                raw_frame.width,
-                raw_frame.height,
-            )?);
+            match EncoderState::new(&encoder_name, raw_frame.width, raw_frame.height) {
+                Ok(state) => encoder_state = Some(state),
+                Err(e) if encoder_name != "libx264" => {
+                    // A hardware encoder (commonly AMF) can fail to *open* even though it is
+                    // compiled into FFmpeg — driver hiccup, AMF runtime busy/missing, transient
+                    // device loss. Fall back to software once so streaming keeps a picture
+                    // instead of the whole encode thread dying.
+                    warn!(
+                        encoder = %encoder_name,
+                        error = %e,
+                        "Encoder failed to open — falling back to libx264 (software)"
+                    );
+                    encoder_name = "libx264".to_string();
+                    codec_display_name = "H.264 (x264)".to_string();
+                    PIPELINE_STATS.lock().set_codec_name(&codec_display_name);
+                    encoder_state =
+                        Some(EncoderState::new(&encoder_name, raw_frame.width, raw_frame.height)?);
+                }
+                Err(e) => return Err(e),
+            }
         }
 
         let encoder = encoder_state
@@ -321,9 +340,18 @@ fn encoder_options(encoder_name: &str) -> ffmpeg_next::Dictionary<'_> {
             opts.set("profile", "constrained_baseline");
             opts.set("level", "4.1");
             opts.set("coder", "cavlc");
-            opts.set("aud", "1");
+            // No AUD (NAL 9): the iPad decoder strips AUDs before submitting to VideoToolbox,
+            // so emitting them only wastes bytes. One FramePacket == one access unit, so the
+            // receiver doesn't need AUDs for access-unit boundary detection.
+            opts.set("aud", "0");
+            // Emit SPS/PPS inline alongside each IDR; the host also prepends cached parameter
+            // sets on every IDR in normalize_h264_payload as a belt-and-suspenders measure.
             opts.set("header_spacing", "1");
             opts.set("rc", "cbr");
+            // IDR cadence is driven by encoder.set_gop(30) (mapped to AMF's IDR period). The
+            // AMF_FORCED_INTRA_PERIOD safety net forces an I-frame every 30 frames in case the
+            // wrapper doesn't honour gop in low-latency mode. Verify on-device via the AMF
+            // packet logs that forced/periodic keyframes carry NAL 5 + SPS/PPS, not bare I.
         }
         "h264_qsv" => {
             opts.set("preset", "veryfast");

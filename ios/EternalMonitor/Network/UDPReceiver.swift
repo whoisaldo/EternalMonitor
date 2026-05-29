@@ -14,7 +14,7 @@ final class UDPReceiver {
     var onHelloFailure: ((String) -> Void)?
     var onDatagramReceived: ((Int) -> Void)?
     var onDatagramIgnored: ((String) -> Void)?
-    // NEEDS_XCODE_VERIFY: surface the sequence number of every fragment so the
+    // surface the sequence number of every fragment so the
     // ConnectionQualityTracker can compute rolling packet loss.
     var onFragmentSeq: ((UInt32) -> Void)?
 

@@ -6,7 +6,7 @@ struct DisplayView: View {
 
     @State private var showHUD = true
     @State private var hudDismissTask: Task<Void, Never>?
-    // NEEDS_XCODE_VERIFY: connection quality popover state.
+    // connection quality popover state.
     @State private var showQualityPopover = false
 
     var body: some View {
@@ -83,7 +83,7 @@ struct DisplayView: View {
         )
     }
 
-    // NEEDS_XCODE_VERIFY: 4-bar signal strength indicator.
+    // 4-bar signal strength indicator.
     private var qualityBars: some View {
         let bars = connectionManager.quality.bars
         let color = qualityColor(bars: bars)
@@ -108,7 +108,7 @@ struct DisplayView: View {
         }
     }
 
-    // NEEDS_XCODE_VERIFY: popover with exact quality numbers.
+    // popover with exact quality numbers.
     private var qualityPopover: some View {
         let q = connectionManager.quality
         return VStack(alignment: .leading, spacing: 6) {

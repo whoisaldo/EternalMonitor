@@ -9,7 +9,7 @@ struct ConnectView: View {
     @State private var hostIP: String = ""
     @State private var port: String = "9876"
     @State private var showSettings = false
-    // NEEDS_XCODE_VERIFY: track whether we've already pre-filled from lastHost so we
+    // track whether we've already pre-filled from lastHost so we
     // don't clobber user edits on every re-render.
     @State private var didPrefillFromLastHost = false
     @State private var showQRScanner = false
@@ -101,7 +101,7 @@ struct ConnectView: View {
                 SettingsView()
             }
             .sheet(isPresented: $showQRScanner) {
-                // NEEDS_XCODE_VERIFY: QR scanner sheet for connecting via host-displayed QR.
+                // QR scanner sheet for connecting via host-displayed QR.
                 QRScannerView(
                     onScan: { value in
                         showQRScanner = false
@@ -111,7 +111,7 @@ struct ConnectView: View {
                 )
             }
             .onAppear {
-                // NEEDS_XCODE_VERIFY: pre-fill from last successful connection.
+                // pre-fill from last successful connection.
                 if !didPrefillFromLastHost && hostIP.isEmpty && !settings.lastHost.isEmpty {
                     hostIP = settings.lastHost
                     if settings.lastPort != 0 {
@@ -223,7 +223,7 @@ struct ConnectView: View {
                     .focused($focusedField, equals: .host)
                     .disabled(isConnecting)
 
-                // NEEDS_XCODE_VERIFY: surface the most recent successful connection so the
+                // surface the most recent successful connection so the
                 // user can confirm pre-fill came from the right place.
                 if !settings.lastHost.isEmpty && settings.lastHost != normalizedHostIP {
                     Text("Last connected: \(settings.lastHost)")
@@ -405,7 +405,7 @@ struct ConnectView: View {
         .opacity(isConnecting ? 0.5 : 1)
     }
 
-    // NEEDS_XCODE_VERIFY: parse "eternaldisplay://IP:port" and immediately connect.
+    // parse "eternaldisplay://IP:port" and immediately connect.
     private func handleScannedQR(_ value: String) {
         let prefix = "eternaldisplay://"
         guard value.hasPrefix(prefix) else {

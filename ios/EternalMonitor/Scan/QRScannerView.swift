@@ -1,4 +1,4 @@
-// NEEDS_XCODE_VERIFY: AVFoundation QR scanner sheet. Presented from ConnectView when
+// AVFoundation QR scanner sheet. Presented from ConnectView when
 // the user taps "Scan QR". Returns the decoded string via `onScan`; closing the sheet
 // without scanning returns nothing.
 
