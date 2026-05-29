@@ -1,0 +1,57 @@
+EternalMonitor - Quick Start (Windows host)
+===========================================
+
+This turns your Windows PC's screen into a stream your iPad can display
+over your local Wi-Fi. This package is the WINDOWS side only. You also
+need the EternalMonitor app on an iPad (the sender of this file will give
+you a separate invite for that).
+
+What you need
+-------------
+1. A Windows PC (this one) with an AMD, NVIDIA, or Intel graphics card.
+2. An iPad with the EternalMonitor app installed.
+3. Both devices on the SAME Wi-Fi network.
+
+Step 1 - Unzip
+--------------
+Right-click the .zip you received and choose "Extract All...". Keep all
+the files together in one folder - the .exe needs the .dll files next to it.
+
+Step 2 - Run the host
+---------------------
+Double-click  EternalMonitor-host.exe
+
+- Windows may show a blue "Windows protected your PC" box. Click
+  "More info" -> "Run anyway". (This only happens because the app isn't
+  code-signed yet; it is safe.)
+- The first time, Windows Firewall will ask to allow network access.
+  CHECK both "Private networks" and "Public networks", then click "Allow".
+  If you miss this, the iPad won't be able to connect.
+
+Step 3 - Note the IP address
+----------------------------
+When the host starts it shows your PC's local IP address (looks like
+192.168.x.x). Write it down - you'll type it into the iPad app.
+
+Step 4 - Connect from the iPad
+------------------------------
+1. Open the EternalMonitor app on the iPad.
+2. If "Scan network" finds the PC, tap it. If not, choose manual /
+   direct IP entry and type the IP from Step 3. Port is 9876.
+3. Your Windows screen should appear on the iPad within a second or two.
+
+If it doesn't work
+------------------
+- Make sure both devices are on the SAME Wi-Fi (not guest network, not
+  one on Wi-Fi and one on Ethernet on a different subnet).
+- Re-check the Firewall prompt from Step 2. You can re-allow it under
+  Windows Settings -> Privacy & security -> Windows Security ->
+  Firewall & network protection -> Allow an app through firewall.
+- Try the manual IP entry instead of "Scan network".
+- Keep the host window open the whole time.
+
+What to report back
+-------------------
+If you hit problems, the host window prints log lines - a screenshot of
+that window plus a note of what the iPad showed is the most useful thing
+to send back.
