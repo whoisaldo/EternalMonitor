@@ -10,6 +10,12 @@ final class FrameAssembler {
     private var latestCompletedSeq: UInt32 = 0
     private var cleanupCounter: UInt32 = 0
 
+    /// A backward jump in sequence numbers larger than this means the host restarted its
+    /// pipeline (capture-display switch, resolution change, etc.) and reset seq toward 0.
+    /// Without this, every frame of the new stream is `<= latestCompletedSeq` and gets
+    /// dropped forever — the app appears frozen until it's force-quit.
+    private static let streamRestartGap: UInt32 = 256
+
     struct PendingFrame {
         let fragmentCount: UInt16
         var fragments: [UInt16: Data]
@@ -21,9 +27,22 @@ final class FrameAssembler {
     }
 
     func addFragment(seq: UInt32, index: UInt16, count: UInt16, payload: Data) {
-        // Drop stale fragments (seq older than latest completed)
-        if seq <= latestCompletedSeq && latestCompletedSeq > 0 {
-            return
+        if latestCompletedSeq > 0 {
+            if seq == latestCompletedSeq {
+                // Duplicate fragment for the frame we just completed — ignore.
+                return
+            }
+            if seq < latestCompletedSeq {
+                if latestCompletedSeq - seq > Self.streamRestartGap {
+                    // Host restarted its stream (seq reset toward 0). Drop the old stream's
+                    // state and accept this fragment as the start of the new stream.
+                    onDiagnostic?("Stream restart detected (seq \(latestCompletedSeq) -> \(seq)) — resetting reassembly")
+                    reset()
+                } else {
+                    // Genuinely stale/late fragment from the current stream.
+                    return
+                }
+            }
         }
 
         guard count > 0 else {
