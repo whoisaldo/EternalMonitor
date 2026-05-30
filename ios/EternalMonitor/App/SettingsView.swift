@@ -82,6 +82,32 @@ struct SettingsView: View {
                 } header: {
                     sectionHeader("About")
                 }
+
+                // Credits
+                Section {
+                    creditLink(
+                        "Developer",
+                        "github.com/whoisaldo",
+                        symbol: "chevron.left.forwardslash.chevron.right",
+                        url: "https://github.com/whoisaldo"
+                    )
+                    creditLink(
+                        "Repository",
+                        "EternalMonitor",
+                        symbol: "shippingbox",
+                        url: "https://github.com/whoisaldo/EternalMonitor"
+                    )
+                    creditLink(
+                        "Questions & concerns",
+                        "aliyounes@eternalreverse.com",
+                        symbol: "envelope",
+                        url: "mailto:aliyounes@eternalreverse.com"
+                    )
+                } header: {
+                    sectionHeader("Credits")
+                } footer: {
+                    footnote("Built by Ali Younes (@whoisaldo).")
+                }
             }
             .scrollContentBackground(.hidden)
             .background(Theme.void.ignoresSafeArea())
@@ -119,6 +145,27 @@ struct SettingsView: View {
             Text(value)
                 .font(.appMonoRegular(size: 13))
                 .foregroundColor(Theme.text2)
+        }
+    }
+
+    @ViewBuilder
+    private func creditLink(_ title: String, _ value: String, symbol: String, url: String) -> some View {
+        if let destination = URL(string: url) {
+            Link(destination: destination) {
+                HStack {
+                    Label(title, systemImage: symbol)
+                        .foregroundColor(Theme.text)
+                    Spacer()
+                    Text(value)
+                        .font(.appMonoRegular(size: 13))
+                        .foregroundColor(Theme.amber)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                    Image(systemName: "arrow.up.right")
+                        .font(.system(size: 10, weight: .semibold))
+                        .foregroundColor(Theme.text3)
+                }
+            }
         }
     }
 }
