@@ -19,7 +19,7 @@ use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_SA
 use windows::Win32::Graphics::Dxgi::{
     CreateDXGIFactory1, IDXGIFactory1, IDXGIOutput, IDXGIOutput1,
     IDXGIOutputDuplication, IDXGIResource, DXGI_ERROR_ACCESS_LOST, DXGI_ERROR_WAIT_TIMEOUT,
-    DXGI_OUTDUPL_FRAME_INFO,
+    DXGI_OUTDUPL_FRAME_INFO, DXGI_OUTDUPL_POINTER_SHAPE_INFO,
 };
 
 const ACQUIRE_TIMEOUT_MS: u32 = 16;
@@ -122,7 +122,9 @@ fn resolve_target(outputs: &[OutputInfo], target: &CaptureTarget) -> Option<usiz
     }
     let primary = outputs.iter().position(|o| o.is_primary).unwrap_or(0);
     match target {
-        CaptureTarget::PrimaryAuto => Some(primary),
+        // VirtualExtended is reconciled into an Output(name) before resolution; treat any
+        // leftover as primary defensively.
+        CaptureTarget::PrimaryAuto | CaptureTarget::VirtualExtended => Some(primary),
         CaptureTarget::Output(name) => match outputs.iter().position(|o| &o.device_name == name) {
             Some(i) => Some(i),
             None => {
@@ -134,6 +136,60 @@ fn resolve_target(outputs: &[OutputInfo], target: &CaptureTarget) -> Option<usiz
                 Some(primary)
             }
         },
+    }
+}
+
+/// How long to wait for the virtual display to attach after enabling its driver.
+const VDD_ATTACH_TIMEOUT: Duration = Duration::from_secs(6);
+const VDD_POLL_INTERVAL: Duration = Duration::from_millis(120);
+
+/// Reconcile the virtual display device to the requested target and return the concrete
+/// target to capture. `VirtualExtended` enables the bundled driver, waits for its output to
+/// attach, and returns it as an `Output(name)`; any other target disables the driver so no
+/// phantom monitor lingers. Falls back to `PrimaryAuto` if the virtual display can't be
+/// brought up.
+fn reconcile_virtual_display(target: &CaptureTarget) -> CaptureTarget {
+    match target {
+        CaptureTarget::VirtualExtended => {
+            let before: Vec<String> = enumerate_outputs()
+                .into_iter()
+                .map(|o| o.device_name)
+                .collect();
+            if !crate::vdd::enable() {
+                warn!(
+                    "Virtual display could not be enabled (installer task missing?) — \
+                     capturing the primary display instead"
+                );
+                return CaptureTarget::PrimaryAuto;
+            }
+            let deadline = Instant::now() + VDD_ATTACH_TIMEOUT;
+            while Instant::now() < deadline {
+                std::thread::sleep(VDD_POLL_INTERVAL);
+                let now = enumerate_outputs();
+                let non_primary: Vec<&OutputInfo> =
+                    now.iter().filter(|o| !o.is_primary).collect();
+                if let Some(chosen) = non_primary
+                    .iter()
+                    .find(|o| !before.contains(&o.device_name))
+                    .or_else(|| non_primary.first())
+                {
+                    info!(
+                        device = %chosen.device_name,
+                        width = chosen.width,
+                        height = chosen.height,
+                        "Virtual display attached — capturing it"
+                    );
+                    return CaptureTarget::Output(chosen.device_name.clone());
+                }
+            }
+            warn!("Virtual display did not attach in time — capturing the primary display instead");
+            CaptureTarget::PrimaryAuto
+        }
+        other => {
+            // Any non-virtual target: ensure the virtual display is off.
+            crate::vdd::disable();
+            other.clone()
+        }
     }
 }
 
@@ -164,7 +220,10 @@ fn run_capture_loop(
     // The capture adapter FOLLOWS the chosen output (which may differ from the
     // encoder-detection adapter on a multi-GPU system); the encoder stays vendor-based
     // and independent. `adapter_index` is only the last-resort fallback below.
-    let target = shared.capture_target.lock().clone();
+    let requested_target = shared.capture_target.lock().clone();
+    // Turn the virtual display on/off to match the request before enumerating, so the
+    // managed virtual output only exists while we're capturing it.
+    let target = reconcile_virtual_display(&requested_target);
     let outputs = enumerate_outputs();
     for o in &outputs {
         info!(
@@ -304,6 +363,14 @@ fn run_capture_loop(
     let mut frame_timestamps: VecDeque<Instant> = VecDeque::with_capacity(FPS_WINDOW + 1);
     let mut dirty_rect_buf: Vec<RECT> = Vec::with_capacity(64);
 
+    // Desktop Duplication never bakes the mouse cursor into the desktop image — it sends
+    // the position every frame and the shape only when it changes. Cache the shape and
+    // composite it into each frame so the cursor is visible on the iPad.
+    let mut cursor = CursorState::default();
+    let mut cursor_visible = false;
+    let mut cursor_x: i32 = 0;
+    let mut cursor_y: i32 = 0;
+
     loop {
         if !shared.running.load(Ordering::SeqCst) {
             info!("Capture loop stopping on running=false");
@@ -325,6 +392,16 @@ fn run_capture_loop(
         match hr {
             Ok(()) => {
                 frame_number += 1;
+
+                // --- Track cursor position/shape (must read shape before ReleaseFrame) ---
+                if frame_info.LastMouseUpdateTime != 0 {
+                    cursor_visible = frame_info.PointerPosition.Visible.as_bool();
+                    cursor_x = frame_info.PointerPosition.Position.x;
+                    cursor_y = frame_info.PointerPosition.Position.y;
+                }
+                if frame_info.PointerShapeBufferSize > 0 {
+                    cursor.update_shape(&duplication, frame_info.PointerShapeBufferSize);
+                }
 
                 // --- Get dirty rect count ---
                 let dirty_count =
@@ -401,6 +478,19 @@ fn run_capture_loop(
 
                             unsafe {
                                 device_context.Unmap(&staging_texture, 0);
+                            }
+
+                            // Composite the mouse cursor into the BGRA frame.
+                            if cursor_visible && cursor.has_shape {
+                                draw_cursor(
+                                    &mut pixel_buf,
+                                    tex_width,
+                                    tex_height,
+                                    row_bytes,
+                                    &cursor,
+                                    cursor_x,
+                                    cursor_y,
+                                );
                             }
 
                             pixel_buf.clone()
@@ -494,6 +584,199 @@ fn get_dirty_rect_count(
     } {
         Ok(()) => actual_size as usize / std::mem::size_of::<RECT>(),
         Err(_) => 0,
+    }
+}
+
+// DXGI pointer shape types (DXGI_OUTDUPL_POINTER_SHAPE_TYPE_*).
+const DXGI_POINTER_SHAPE_MONOCHROME: u32 = 1;
+const DXGI_POINTER_SHAPE_COLOR: u32 = 2;
+const DXGI_POINTER_SHAPE_MASKED_COLOR: u32 = 4;
+
+/// Caches the latest mouse-cursor shape from DXGI Desktop Duplication. The shape only
+/// arrives when it changes, so it's kept across frames and composited at the per-frame
+/// pointer position.
+#[derive(Default)]
+struct CursorState {
+    shape: Vec<u8>,
+    shape_type: u32,
+    width: u32,
+    height: u32,
+    pitch: u32,
+    has_shape: bool,
+}
+
+impl CursorState {
+    /// Fetch the current pointer shape. Must be called while a frame is acquired
+    /// (before `ReleaseFrame`). On failure the previous shape is kept.
+    fn update_shape(&mut self, duplication: &IDXGIOutputDuplication, buffer_size: u32) {
+        self.shape.resize(buffer_size as usize, 0);
+        let mut required = 0u32;
+        let mut info = DXGI_OUTDUPL_POINTER_SHAPE_INFO::default();
+        match unsafe {
+            duplication.GetFramePointerShape(
+                buffer_size,
+                self.shape.as_mut_ptr() as *mut core::ffi::c_void,
+                &mut required,
+                &mut info,
+            )
+        } {
+            Ok(()) => {
+                self.shape_type = info.Type;
+                self.width = info.Width;
+                self.height = info.Height;
+                self.pitch = info.Pitch;
+                self.has_shape = true;
+            }
+            Err(e) => {
+                warn!(error = %e, "GetFramePointerShape failed — cursor shape not updated");
+            }
+        }
+    }
+}
+
+/// Composite the cached cursor into a BGRA frame at top-left `(px, py)` (this output's
+/// pixel space). Handles the three DXGI pointer shape types; out-of-bounds pixels are
+/// clipped.
+fn draw_cursor(
+    buf: &mut [u8],
+    frame_w: u32,
+    frame_h: u32,
+    row_bytes: usize,
+    cursor: &CursorState,
+    px: i32,
+    py: i32,
+) {
+    match cursor.shape_type {
+        DXGI_POINTER_SHAPE_COLOR => {
+            draw_color_cursor(buf, frame_w, frame_h, row_bytes, cursor, px, py, false)
+        }
+        DXGI_POINTER_SHAPE_MASKED_COLOR => {
+            draw_color_cursor(buf, frame_w, frame_h, row_bytes, cursor, px, py, true)
+        }
+        DXGI_POINTER_SHAPE_MONOCHROME => {
+            draw_monochrome_cursor(buf, frame_w, frame_h, row_bytes, cursor, px, py)
+        }
+        _ => {}
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn draw_color_cursor(
+    buf: &mut [u8],
+    frame_w: u32,
+    frame_h: u32,
+    row_bytes: usize,
+    cursor: &CursorState,
+    px: i32,
+    py: i32,
+    masked: bool,
+) {
+    let pitch = cursor.pitch as usize;
+    for row in 0..cursor.height {
+        let sy = py + row as i32;
+        if sy < 0 || sy >= frame_h as i32 {
+            continue;
+        }
+        for col in 0..cursor.width {
+            let sx = px + col as i32;
+            if sx < 0 || sx >= frame_w as i32 {
+                continue;
+            }
+            let src = row as usize * pitch + col as usize * 4;
+            if src + 4 > cursor.shape.len() {
+                continue;
+            }
+            let (b, g, r, a) = (
+                cursor.shape[src],
+                cursor.shape[src + 1],
+                cursor.shape[src + 2],
+                cursor.shape[src + 3],
+            );
+            let dst = sy as usize * row_bytes + sx as usize * 4;
+            if dst + 4 > buf.len() {
+                continue;
+            }
+            if masked {
+                // MASKED_COLOR: alpha 0 = opaque pixel; alpha 0xFF = XOR with screen.
+                if a == 0 {
+                    buf[dst] = b;
+                    buf[dst + 1] = g;
+                    buf[dst + 2] = r;
+                } else {
+                    buf[dst] ^= b;
+                    buf[dst + 1] ^= g;
+                    buf[dst + 2] ^= r;
+                }
+            } else {
+                // COLOR: straight alpha blend over the screen.
+                let af = a as u32;
+                let inv = 255 - af;
+                buf[dst] = ((b as u32 * af + buf[dst] as u32 * inv) / 255) as u8;
+                buf[dst + 1] = ((g as u32 * af + buf[dst + 1] as u32 * inv) / 255) as u8;
+                buf[dst + 2] = ((r as u32 * af + buf[dst + 2] as u32 * inv) / 255) as u8;
+            }
+        }
+    }
+}
+
+fn draw_monochrome_cursor(
+    buf: &mut [u8],
+    frame_w: u32,
+    frame_h: u32,
+    row_bytes: usize,
+    cursor: &CursorState,
+    px: i32,
+    py: i32,
+) {
+    // Monochrome shapes pack an AND mask (top half) and an XOR mask (bottom half),
+    // 1 bit per pixel. The real cursor height is half the reported buffer height.
+    let pitch = cursor.pitch as usize;
+    let cur_h = cursor.height / 2;
+    for row in 0..cur_h {
+        let sy = py + row as i32;
+        if sy < 0 || sy >= frame_h as i32 {
+            continue;
+        }
+        for col in 0..cursor.width {
+            let sx = px + col as i32;
+            if sx < 0 || sx >= frame_w as i32 {
+                continue;
+            }
+            let byte = col as usize / 8;
+            let bit = 7u8 - (col % 8) as u8;
+            let and_idx = row as usize * pitch + byte;
+            let xor_idx = (row + cur_h) as usize * pitch + byte;
+            if xor_idx >= cursor.shape.len() {
+                continue;
+            }
+            let and_bit = (cursor.shape[and_idx] >> bit) & 1;
+            let xor_bit = (cursor.shape[xor_idx] >> bit) & 1;
+            let dst = sy as usize * row_bytes + sx as usize * 4;
+            if dst + 4 > buf.len() {
+                continue;
+            }
+            match (and_bit, xor_bit) {
+                (0, 0) => {
+                    // Opaque black.
+                    buf[dst] = 0;
+                    buf[dst + 1] = 0;
+                    buf[dst + 2] = 0;
+                }
+                (0, 1) => {
+                    // Opaque white.
+                    buf[dst] = 255;
+                    buf[dst + 1] = 255;
+                    buf[dst + 2] = 255;
+                }
+                (1, 0) => {} // Transparent — leave the screen pixel.
+                _ => {
+                    // (1, 1): invert the screen pixel.
+                    buf[dst] = !buf[dst];
+                    buf[dst + 1] = !buf[dst + 1];
+                    buf[dst + 2] = !buf[dst + 2];
+                }
+            }
+        }
     }
 }
 

@@ -129,6 +129,9 @@ impl StatsSnapshot {
 }
 
 const CAPTURE_AUTO_LABEL: &str = "Auto (primary)";
+const CAPTURE_VIRTUAL_LABEL: &str = "Extended display (iPad)";
+/// Sentinel stored in settings/`settings_capture_display` for the managed virtual display.
+const CAPTURE_VIRTUAL_SENTINEL: &str = "virtual";
 
 /// Combo label for an enumerated output, e.g. `DISPLAY3 · 2732×2048 · +2560,0 · primary`.
 fn format_output_label(o: &OutputInfo) -> String {
@@ -233,6 +236,10 @@ impl AnalyzerApp {
         // honors it (same model as encoder_override — the first pipeline run started before
         // the GUI loaded settings).
         let settings_capture_display = match persisted.capture_display.as_deref() {
+            Some(s) if s == CAPTURE_VIRTUAL_SENTINEL => {
+                *control.shared.capture_target.lock() = CaptureTarget::VirtualExtended;
+                CAPTURE_VIRTUAL_SENTINEL.to_string()
+            }
             Some(name) if !name.is_empty() => {
                 *control.shared.capture_target.lock() = CaptureTarget::Output(name.to_string());
                 name.to_string()
@@ -743,6 +750,8 @@ impl AnalyzerApp {
             let prev_display = self.settings_capture_display.clone();
             let selected_text = if self.settings_capture_display.is_empty() {
                 CAPTURE_AUTO_LABEL.to_string()
+            } else if self.settings_capture_display == CAPTURE_VIRTUAL_SENTINEL {
+                CAPTURE_VIRTUAL_LABEL.to_string()
             } else if let Some(o) = outputs
                 .iter()
                 .find(|o| o.device_name == self.settings_capture_display)
@@ -764,6 +773,16 @@ impl AnalyzerApp {
                     {
                         self.settings_capture_display = String::new();
                     }
+                    // Managed virtual display — created on demand, removed when not in use.
+                    if ui
+                        .selectable_label(
+                            self.settings_capture_display == CAPTURE_VIRTUAL_SENTINEL,
+                            CAPTURE_VIRTUAL_LABEL,
+                        )
+                        .clicked()
+                    {
+                        self.settings_capture_display = CAPTURE_VIRTUAL_SENTINEL.to_string();
+                    }
                     for o in &outputs {
                         let selected = self.settings_capture_display == o.device_name;
                         if ui.selectable_label(selected, format_output_label(o)).clicked() {
@@ -775,6 +794,8 @@ impl AnalyzerApp {
                 *self.control.shared.capture_target.lock() =
                     if self.settings_capture_display.is_empty() {
                         CaptureTarget::PrimaryAuto
+                    } else if self.settings_capture_display == CAPTURE_VIRTUAL_SENTINEL {
+                        CaptureTarget::VirtualExtended
                     } else {
                         CaptureTarget::Output(self.settings_capture_display.clone())
                     };
@@ -785,9 +806,11 @@ impl AnalyzerApp {
                 self.persist_settings();
             }
             ui.label(
-                egui::RichText::new("Applies on next Restart stream")
-                    .color(MUTED)
-                    .size(11.0),
+                egui::RichText::new(
+                    "Extended display turns on only while streaming to it. Applies on next Restart stream.",
+                )
+                .color(MUTED)
+                .size(11.0),
             );
 
             ui.add_space(12.0);
@@ -807,6 +830,38 @@ impl AnalyzerApp {
                     self.persist_settings();
                 }
             }
+        });
+
+        ui.add_space(12.0);
+        section_header(ui, "Credits");
+        card_frame().show(ui, |ui| {
+            ui.label(
+                egui::RichText::new("EternalMonitor")
+                    .color(TEXT)
+                    .size(13.0)
+                    .monospace()
+                    .strong(),
+            );
+            ui.label(
+                egui::RichText::new("Built by Ali Younes (@whoisaldo)")
+                    .color(MUTED2)
+                    .size(11.0)
+                    .monospace(),
+            );
+            ui.add_space(8.0);
+            credit_link(ui, "Developer", "github.com/whoisaldo", "https://github.com/whoisaldo");
+            credit_link(
+                ui,
+                "Repository",
+                "github.com/whoisaldo/EternalMonitor",
+                "https://github.com/whoisaldo/EternalMonitor",
+            );
+            credit_link(
+                ui,
+                "Questions & concerns",
+                "aliyounes@eternalreverse.com",
+                "mailto:aliyounes@eternalreverse.com",
+            );
         });
     }
 }
@@ -1199,6 +1254,20 @@ fn stat_row(ui: &mut egui::Ui, label: &str, value: &str) {
         ui.label(egui::RichText::new(label).color(MUTED).size(11.0).monospace());
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             ui.label(egui::RichText::new(value).color(TEXT).size(11.0).monospace());
+        });
+    });
+}
+
+/// A credits row: muted label on the left, an amber clickable link on the right.
+fn credit_link(ui: &mut egui::Ui, label: &str, text: &str, url: &str) {
+    ui.horizontal(|ui| {
+        ui.label(egui::RichText::new(label).color(MUTED).size(11.0).monospace());
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            ui.hyperlink_to(
+                egui::RichText::new(text).color(ACCENT).size(11.0).monospace(),
+                url,
+            )
+            .on_hover_text(url);
         });
     });
 }

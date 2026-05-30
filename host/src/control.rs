@@ -32,6 +32,10 @@ pub enum CaptureTarget {
     PrimaryAuto,
     /// Capture the output whose DXGI `DeviceName` matches this string (e.g. `\\.\DISPLAY3`).
     Output(String),
+    /// Capture the managed virtual extended display. The capture loop enables the bundled
+    /// virtual display driver on demand (so no phantom monitor exists when unused), waits
+    /// for its output to appear, and disables it again when the target changes.
+    VirtualExtended,
 }
 
 impl SharedControl {

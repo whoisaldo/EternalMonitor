@@ -8,6 +8,7 @@ mod logging;
 mod settings;
 mod stats;
 mod transport;
+mod vdd;
 
 use std::sync::mpsc;
 use std::thread::JoinHandle;
@@ -108,6 +109,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     gui_control.shared.stop();
     gui_control.request_shutdown();
+
+    // Never leave the virtual display attached after we exit — it should only exist while
+    // EternalMonitor is actively using it.
+    vdd::disable();
 
     // Give the supervisor a bounded amount of time to shut down cleanly.
     // If it doesn't finish (blocked on DXGI acquire, mDNS threads, etc.),
