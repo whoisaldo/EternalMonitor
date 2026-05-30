@@ -48,7 +48,11 @@
 ### Capture
 
 - API: DXGI Desktop Duplication
-- Current behavior: captures the primary output and copies it into a CPU-readable staging texture
+- Current behavior: enumerates all adapters/outputs and duplicates a **selectable** output
+  (primary by default), copying it into a CPU-readable staging texture
+- The Settings tab exposes a capture-display picker; choosing a virtual output created by
+  an Indirect Display Driver turns the iPad into an extended desktop instead of a mirror.
+  The capture adapter follows the chosen output; encoder selection stays vendor-based.
 - Output format passed downstream: BGRA frame buffer plus frame metadata
 
 This is functional but not yet the final zero-copy path described in earlier docs.
@@ -118,7 +122,8 @@ Not all planned protocol families are implemented yet. `InputEvent`, richer cont
 
 ## Not implemented yet
 
-- Virtual display driver path
+- First-party signed display driver (the host currently drives a third-party signed
+  virtual display driver; a first-party in-tree IDD is a v0.2.0 goal)
 - USB transport
 - Reverse input channel
 - Reliability controls such as selective NACK

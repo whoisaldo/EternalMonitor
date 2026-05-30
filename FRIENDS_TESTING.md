@@ -1,8 +1,24 @@
 # Friends Testing Guide (organizer notes)
 
 Notes for coordinating a friends/beta test across mixed hardware. The tester-facing
-instructions live in `scripts/QUICKSTART.txt` (shipped inside the Windows zip); this file is
-for you, the person handing the build out.
+instructions live in `scripts/QUICKSTART.txt`; this file is for you, the person handing the
+build out.
+
+## Hand out the installer, not the zip
+
+Build `EternalMonitor-Setup.exe` with `scripts/build-installer.ps1` and send that single
+file. The tester double-clicks it, approves one Windows (UAC) prompt, and gets the host,
+FFmpeg, and the virtual display driver installed in one run — no unzip, no manual driver
+steps. To bundle the driver, drop the signed setup into `installer/vendor/vdd/` first (see
+that folder's `README.txt`); without it the build still works but produces an app-only
+installer and the extended-display option won't appear.
+
+## Extended display vs mirror
+
+By default the iPad mirrors the primary screen. To test the iPad as a real extended desktop,
+have the tester open Settings → Capture display → Refresh, pick the virtual display, and click
+Restart stream. Dragging a window past the edge of the main screen should land it on the iPad.
+If no virtual display is listed, the installer's driver step didn't complete — re-run it.
 
 ## Build parity matters
 

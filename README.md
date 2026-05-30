@@ -14,15 +14,17 @@ This repo currently contains a working Windows host capture/encode/transport pat
 
 Implemented now:
 
-- Windows host captures the primary display with DXGI Desktop Duplication
+- Windows host captures a **selectable display output** (primary by default) with DXGI Desktop Duplication
+- Capture-display picker in the Settings tab — stream any output, including a **virtual extended display** created by a signed Indirect Display Driver, so the iPad can be a true second screen instead of only a mirror
 - Host converts BGRA to YUV420P and can select hardware H.264 encoders per GPU vendor
 - Host advertises an mDNS/DNS-SD service and streams frames over UDP on port `9876`
 - iPad app receives fragmented UDP datagrams, reassembles `FramePacket` payloads, decodes with VideoToolbox, and renders with Metal
 - Direct connect by IP works end to end with the current transport format
+- One-step Windows installer (`EternalMonitor-Setup.exe`) that bundles the host, FFmpeg runtime, and the virtual display driver for non-technical testers
 
 Not done yet:
 
-- Virtual display driver integration
+- First-party signed display driver (today the host drives a third-party signed virtual display driver)
 - USB transport
 - Input relay back to Windows
 - Reliability layer beyond basic UDP fragmentation/reassembly
@@ -46,9 +48,12 @@ Current target is practical local-network streaming, not a finished second-monit
 ## Repo layout
 
 ```text
-host/     Rust Windows host: capture, encode, UDP transport, mDNS advertisement
-ios/      Swift iPad app: connect UI, UDP receive, reassembly, decode, render
-proto/    Shared protocol serialization code and schemas
+host/       Rust Windows host: capture, encode, UDP transport, mDNS advertisement, egui GUI
+ios/        Swift iPad app: connect UI, UDP receive, reassembly, decode, render
+proto/      Shared protocol serialization code and schemas
+installer/  Inno Setup script + bundled-driver staging for EternalMonitor-Setup.exe
+scripts/    package.ps1 (zip), build-installer.ps1 (Setup.exe), QUICKSTART.txt
+docs/       eternalmonitor.dev website (GitHub Pages)
 ```
 
 ## Build and run
@@ -79,6 +84,23 @@ xcodegen generate
 
 Then open the generated Xcode project on macOS, build the `EternalMonitor` target, and run it on a physical iPad.
 
+## Installer (for testers)
+
+Non-technical testers don't need Rust or the zip. Build a single `EternalMonitor-Setup.exe`:
+
+```powershell
+.\scripts\build-installer.ps1
+```
+
+It compiles the release host, bundles the FFmpeg runtime, and — if a signed virtual
+display driver is staged in `installer/vendor/vdd/` (see that folder's `README.txt`) —
+bundles it too. The tester double-clicks the installer, approves one Windows (UAC)
+prompt, and gets the app plus the virtual display installed in one run. The driver
+install always requires that single elevation prompt; a fully seamless first-party
+driver is a future (v0.2.0) goal.
+
+Tester-facing instructions live in [scripts/QUICKSTART.txt](scripts/QUICKSTART.txt).
+
 ## Troubleshooting
 
 - If the iPad says no complete frame was reassembled, make sure both the Windows host and the iPad app were rebuilt from the same revision. The UDP fragment header changed in the working transport fix.
@@ -90,9 +112,16 @@ Then open the generated Xcode project on macOS, build the `EternalMonitor` targe
 
 - [ARCHITECTURE.md](ARCHITECTURE.md)
 - [DECISIONS.md](DECISIONS.md)
-- [ROADMAP.md](ROADMAP.md)
-- [CLAUDE.md](CLAUDE.md)
+- [RELEASE_NOTES.md](RELEASE_NOTES.md)
+- [FRIENDS_TESTING.md](FRIENDS_TESTING.md) — organizer notes for beta testing
+
+## Credits
+
+Built by Ali Younes ([@whoisaldo](https://github.com/whoisaldo)).
+
+- Repository: [github.com/whoisaldo/EternalMonitor](https://github.com/whoisaldo/EternalMonitor)
+- Questions & concerns: [aliyounes@eternalreverse.com](mailto:aliyounes@eternalreverse.com)
 
 ## License
 
-See [LICENSE](LICENSE).
+Released under the MIT License — see [LICENSE](LICENSE). © 2026 Ali Younes.

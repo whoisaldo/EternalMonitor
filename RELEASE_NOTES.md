@@ -1,3 +1,16 @@
+## Unreleased
+
+### What's new
+- Selectable capture display: a "Capture display" picker in the Settings tab streams any
+  output, including a virtual extended display from a signed Indirect Display Driver — the
+  iPad can be a true second screen, not just a mirror. Default stays primary (no change).
+- Startup banner and Stream tab now show the active capture source.
+- One-step Windows installer (`EternalMonitor-Setup.exe`) that bundles the host, FFmpeg
+  runtime, and the virtual display driver — one double-click + one UAC prompt for testers.
+- Credits/contact added to the Windows GUI and the iPad app Settings.
+
+---
+
 ## EternalMonitor v0.1.1-mirror
 
 ### What's new

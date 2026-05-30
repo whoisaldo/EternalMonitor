@@ -15,5 +15,8 @@ GIT_POLICY.md
 /EternalMonitor-*-windows/
 /EternalMonitor-*-windows.zip
 
+# Installer build staging + output (scripts/build-installer.ps1)
+/build/
+
 # iOS archive/export artifacts
 ios/build/
