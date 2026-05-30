@@ -31,7 +31,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let memory_layer = tracing_subscriber::fmt::layer()
         .with_target(false)
         .with_ansi(false)
-        .with_writer(|| logging::MemoryLogWriter::new())
+        .with_writer(logging::MemoryLogWriter::new)
         .with_filter(logging::MdnsDedupFilter::new());
 
     tracing_subscriber::registry()

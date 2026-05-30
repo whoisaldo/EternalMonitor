@@ -6,28 +6,33 @@ struct DisplayView: View {
 
     @State private var showHUD = true
     @State private var hudDismissTask: Task<Void, Never>?
-    // connection quality popover state.
     @State private var showQualityPopover = false
 
     var body: some View {
         ZStack {
+            Color.black.ignoresSafeArea()
+
             // Full-bleed video
             MetalView()
                 .ignoresSafeArea()
                 .onTapGesture(count: 3) {
-                    // Triple-tap to toggle HUD
                     showHUD.toggle()
                     scheduleHUDDismiss()
                 }
                 .onTapGesture(count: 1) {
-                    if showHUD {
-                        showHUD = false
-                    }
+                    if showHUD { withAnimation(.easeOut(duration: 0.25)) { showHUD = false } }
                 }
 
-            // HUD + bottom bar overlay
+            // Viewfinder registration marks frame the picture (fade with the HUD).
+            if showHUD {
+                ViewfinderCorners(armLength: 26, inset: 18)
+                    .stroke(Theme.amber.opacity(0.55), lineWidth: 1.5)
+                    .ignoresSafeArea()
+                    .transition(.opacity)
+                    .allowsHitTesting(false)
+            }
+
             VStack {
-                // Top-right stats HUD
                 HStack {
                     Spacer()
                     if showHUD && settings.showHUD {
@@ -40,161 +45,143 @@ struct DisplayView: View {
 
                 Spacer()
 
-                // Bottom status bar
-                bottomBar
-                    .padding(.horizontal, 16)
-                    .padding(.bottom, 8)
+                if showHUD {
+                    bottomBar
+                        .padding(.horizontal, 16)
+                        .padding(.bottom, 8)
+                        .transition(.opacity.combined(with: .move(edge: .bottom)))
+                }
             }
         }
         .statusBarHidden(true)
         .persistentSystemOverlays(.hidden)
-        .onAppear {
-            scheduleHUDDismiss()
-        }
-        .onDisappear {
-            hudDismissTask?.cancel()
-        }
+        .onAppear { scheduleHUDDismiss() }
+        .onDisappear { hudDismissTask?.cancel() }
     }
 
     // MARK: - HUD overlay
 
     private var hudOverlay: some View {
-        HStack(spacing: 12) {
-            statLabel("\(Int(connectionManager.fps))", unit: "fps")
+        HStack(spacing: 14) {
+            stat("\(Int(connectionManager.fps))", unit: "fps", color: Theme.amber)
             divider
-            statLabel(String(format: "%.1f", connectionManager.lagMs), unit: "ms")
+            stat(String(format: "%.0f", connectionManager.lagMs), unit: "ms", color: Theme.phosphor)
             divider
-            statLabel(connectionManager.transportMode, unit: "")
+            stat(connectionManager.transportMode, unit: "", color: Theme.text)
             divider
             qualityBars
                 .onTapGesture { showQualityPopover.toggle() }
                 .popover(isPresented: $showQualityPopover) {
                     qualityPopover
-                        .padding(12)
+                        .padding(14)
+                        .background(Theme.panel)
                         .presentationCompactAdaptation(.popover)
                 }
+                .accessibilityLabel("Connection quality details")
         }
         .padding(.horizontal, 14)
-        .padding(.vertical, 8)
+        .padding(.vertical, 9)
         .background(
-            RoundedRectangle(cornerRadius: 10)
+            RoundedRectangle(cornerRadius: 11, style: .continuous)
                 .fill(.ultraThinMaterial)
                 .environment(\.colorScheme, .dark)
+                .overlay(
+                    RoundedRectangle(cornerRadius: 11, style: .continuous)
+                        .strokeBorder(Theme.hairline, lineWidth: 1)
+                )
         )
     }
 
-    // 4-bar signal strength indicator.
     private var qualityBars: some View {
         let bars = connectionManager.quality.bars
-        let color = qualityColor(bars: bars)
+        let color = Theme.quality(bars: bars)
         return HStack(alignment: .bottom, spacing: 2) {
             ForEach(0..<4, id: \.self) { idx in
-                Rectangle()
+                RoundedRectangle(cornerRadius: 0.5)
                     .fill(idx < bars ? color : Color.white.opacity(0.15))
                     .frame(width: 3, height: CGFloat(4 + idx * 3))
-                    .cornerRadius(0.5)
             }
         }
         .frame(height: 13)
         .contentShape(Rectangle())
     }
 
-    private func qualityColor(bars: Int) -> Color {
-        switch bars {
-        case 4: return Color(hex: 0x1D9E75)
-        case 3: return Color(hex: 0xB7E84A)
-        case 2: return Color(hex: 0xE8C547)
-        default: return Color(hex: 0xE24B4A)
-        }
-    }
-
-    // popover with exact quality numbers.
     private var qualityPopover: some View {
         let q = connectionManager.quality
-        return VStack(alignment: .leading, spacing: 6) {
-            Text("Connection quality")
-                .font(.appMonoMedium(size: 11))
-                .foregroundColor(.white.opacity(0.5))
-            HStack(spacing: 12) {
-                statLabel(String(format: "%.1f", q.lossPercent), unit: "% loss")
-                statLabel(String(format: "%.1f", q.jitterMs), unit: "ms jitter")
-                statLabel("\(q.seqGap)", unit: "max seq gap")
+        return VStack(alignment: .leading, spacing: 10) {
+            SectionLabel(title: "Connection quality")
+            HStack(spacing: 18) {
+                Readout(value: String(format: "%.1f", q.lossPercent), unit: "%", label: "loss", color: q.lossPercent < 3 ? Theme.phosphor : Theme.caution)
+                Readout(value: String(format: "%.0f", q.jitterMs), unit: "ms", label: "jitter", color: Theme.text)
+                Readout(value: "\(q.seqGap)", unit: "", label: "max gap", color: Theme.text)
             }
         }
     }
 
-    private func statLabel(_ value: String, unit: String) -> some View {
+    private func stat(_ value: String, unit: String, color: Color) -> some View {
         HStack(spacing: 3) {
             Text(value)
-                .font(.appMonoMedium(size: 12))
-                .foregroundColor(.white)
+                .font(.appMonoMedium(size: 13))
+                .foregroundColor(color)
             if !unit.isEmpty {
                 Text(unit)
                     .font(.appMonoRegular(size: 10))
-                    .foregroundColor(.white.opacity(0.5))
+                    .foregroundColor(Theme.text2)
             }
         }
     }
 
     private var divider: some View {
         Rectangle()
-            .fill(Color.white.opacity(0.2))
-            .frame(width: 1, height: 12)
+            .fill(Color.white.opacity(0.18))
+            .frame(width: 1, height: 13)
     }
 
     // MARK: - Bottom bar
 
     private var bottomBar: some View {
         HStack {
-            // Connection pill
-            HStack(spacing: 6) {
-                Circle()
-                    .fill(Color(hex: 0x1D9E75))
-                    .frame(width: 8, height: 8)
-
-                Text("Connected")
-                    .font(.appMonoRegular(size: 12))
-                    .foregroundColor(.white.opacity(0.7))
-
-                Text("·")
-                    .foregroundColor(.white.opacity(0.3))
-
-                Text(connectionManager.transportMode)
+            HStack(spacing: 8) {
+                SignalDot(color: Theme.phosphor, size: 8)
+                Text("ON AIR")
                     .font(.appMonoMedium(size: 12))
-                    .foregroundColor(Color(hex: 0x1D9E75))
+                    .tracking(1)
+                    .foregroundColor(Theme.phosphor)
+                Text("·")
+                    .foregroundColor(Theme.text3)
+                Text(connectionManager.transportMode)
+                    .font(.appMonoRegular(size: 12))
+                    .foregroundColor(Theme.text2)
             }
             .padding(.horizontal, 14)
-            .padding(.vertical, 8)
+            .padding(.vertical, 9)
             .background(
                 Capsule()
                     .fill(Color.white.opacity(0.06))
-                    .overlay(
-                        Capsule()
-                            .strokeBorder(Color.white.opacity(0.08), lineWidth: 0.5)
-                    )
+                    .overlay(Capsule().strokeBorder(Theme.hairline, lineWidth: 0.5))
             )
 
             Spacer()
 
-            // Disconnect button
             Button {
                 connectionManager.disconnect()
             } label: {
-                Text("Disconnect")
-                    .font(.appMonoMedium(size: 12))
-                    .foregroundColor(Color(hex: 0xe8ff47))
-                    .padding(.horizontal, 14)
-                    .padding(.vertical, 8)
-                    .background(
-                        Capsule()
-                            .fill(Color(hex: 0xe8ff47).opacity(0.1))
-                    )
+                HStack(spacing: 6) {
+                    Image(systemName: "stop.fill").font(.system(size: 10))
+                    Text("Disconnect")
+                        .font(.appMonoMedium(size: 12))
+                }
+                .foregroundColor(Theme.amber)
+                .padding(.horizontal, 14)
+                .padding(.vertical, 9)
+                .background(Capsule().fill(Theme.amber.opacity(0.12)))
             }
+            .accessibilityLabel("Disconnect")
         }
         .padding(.horizontal, 8)
         .padding(.vertical, 6)
         .background(
-            RoundedRectangle(cornerRadius: 20)
+            RoundedRectangle(cornerRadius: 22, style: .continuous)
                 .fill(.ultraThinMaterial)
                 .environment(\.colorScheme, .dark)
         )
@@ -204,7 +191,7 @@ struct DisplayView: View {
 
     private func scheduleHUDDismiss() {
         hudDismissTask?.cancel()
-        showHUD = true
+        withAnimation(.easeOut(duration: 0.25)) { showHUD = true }
         hudDismissTask = Task {
             try? await Task.sleep(for: .seconds(5))
             if !Task.isCancelled {

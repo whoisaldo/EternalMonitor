@@ -13,6 +13,8 @@ struct ConnectView: View {
     // don't clobber user edits on every re-render.
     @State private var didPrefillFromLastHost = false
     @State private var showQRScanner = false
+    @State private var appeared = false
+    @AppStorage("didSeeOnboarding") private var didSeeOnboarding = false
     @FocusState private var focusedField: Field?
 
     private enum Field: Hashable {
@@ -31,57 +33,67 @@ struct ConnectView: View {
         UInt16(port.trimmingCharacters(in: .whitespacesAndNewlines))
     }
 
+    private var canConnect: Bool {
+        !normalizedHostIP.isEmpty && parsedPort != nil
+    }
+
     var body: some View {
         NavigationStack {
             ZStack {
-                Color(hex: 0x080808).ignoresSafeArea()
-                gridOverlay
+                SignalBackground()
 
                 ScrollView {
-                    VStack(spacing: 28) {
-                        Spacer().frame(height: 40)
+                    VStack(spacing: 22) {
+                        Spacer().frame(height: 28)
 
                         logoSection
+                            .reveal(appeared, 0)
 
-                        // Error banner
+                        if !didSeeOnboarding {
+                            onboardingCard
+                                .reveal(appeared, 1)
+                        }
+
                         if let error = connectionManager.connectionError {
                             errorBanner(error)
                         }
 
                         inputSection
+                            .reveal(appeared, 2)
 
                         if isConnecting || connectionManager.connectionError != nil || !connectionManager.diagnostics.isEmpty {
                             diagnosticsSection
                         }
 
-                        // Connect / Cancel buttons
                         if isConnecting {
                             connectingSection
                         } else {
                             connectButton
+                                .reveal(appeared, 3)
                         }
 
-                        scanButton
+                        HStack(spacing: 12) {
+                            scanButton
+                            qrScanButton
+                        }
+                        .reveal(appeared, 4)
 
-                        qrScanButton
-
-                        if !scanner.statusMessage.isEmpty && scanner.hosts.isEmpty {
-                            scanStatusMessage
+                        if scanner.hosts.isEmpty && !scanner.isScanning && !scanner.statusMessage.isEmpty {
+                            scanEmptyState
                         }
 
-                        // Discovered hosts
                         if !scanner.hosts.isEmpty {
                             discoveredSection
                         }
 
-                        // Recent connections
                         if !recentStore.connections.isEmpty && scanner.hosts.isEmpty {
                             recentSection
+                                .reveal(appeared, 5)
                         }
 
-                        Spacer().frame(height: 40)
+                        Spacer().frame(height: 36)
                     }
-                    .padding(.horizontal, 32)
+                    .padding(.horizontal, 28)
                 }
                 .scrollDismissesKeyboard(.interactively)
             }
@@ -92,16 +104,16 @@ struct ConnectView: View {
                     Button {
                         showSettings = true
                     } label: {
-                        Image(systemName: "gearshape")
-                            .foregroundColor(Color(hex: 0xe8ff47))
+                        Image(systemName: "slider.horizontal.3")
+                            .foregroundColor(Theme.amber)
                     }
+                    .accessibilityLabel("Settings")
                 }
             }
             .sheet(isPresented: $showSettings) {
                 SettingsView()
             }
             .sheet(isPresented: $showQRScanner) {
-                // QR scanner sheet for connecting via host-displayed QR.
                 QRScannerView(
                     onScan: { value in
                         showQRScanner = false
@@ -111,7 +123,6 @@ struct ConnectView: View {
                 )
             }
             .onAppear {
-                // pre-fill from last successful connection.
                 if !didPrefillFromLastHost && hostIP.isEmpty && !settings.lastHost.isEmpty {
                     hostIP = settings.lastHost
                     if settings.lastPort != 0 {
@@ -119,39 +130,100 @@ struct ConnectView: View {
                     }
                     didPrefillFromLastHost = true
                 }
+                if !appeared {
+                    withAnimation(.easeOut(duration: 0.5)) { appeared = true }
+                }
+            }
+        }
+        .tint(Theme.amber)
+    }
+
+    // MARK: - Logo lockup
+
+    private var logoSection: some View {
+        VStack(spacing: 14) {
+            ZStack {
+                if UIImage(named: "LogoImage") != nil {
+                    Image("LogoImage")
+                        .resizable()
+                        .aspectRatio(contentMode: .fit)
+                        .frame(width: 76, height: 76)
+                        .clipShape(RoundedRectangle(cornerRadius: 18, style: .continuous))
+                } else {
+                    signalMark
+                        .frame(width: 76, height: 76)
+                        .background(
+                            RoundedRectangle(cornerRadius: 18, style: .continuous)
+                                .fill(Theme.amber.opacity(0.10))
+                        )
+                }
+            }
+            .overlay(
+                ViewfinderCorners(armLength: 12, inset: -6)
+                    .stroke(Theme.amber.opacity(0.5), lineWidth: 1)
+            )
+
+            VStack(spacing: 3) {
+                Text("ETERNALMONITOR")
+                    .font(.appDisplayBold(size: 26))
+                    .tracking(1)
+                    .foregroundColor(Theme.text)
+
+                Text("WINDOWS DISPLAY · SIGNAL LINK")
+                    .font(.appMonoRegular(size: 11))
+                    .tracking(2)
+                    .foregroundColor(Theme.text3)
             }
         }
     }
 
-    // MARK: - Logo
-
-    private var logoSection: some View {
-        VStack(spacing: 12) {
-            if UIImage(named: "LogoImage") != nil {
-                Image("LogoImage")
-                    .resizable()
-                    .aspectRatio(contentMode: .fit)
-                    .frame(width: 80, height: 80)
-                    .clipShape(RoundedRectangle(cornerRadius: 18))
-            } else {
-                // Fallback if image asset isn't found
-                Text("E")
-                    .font(.appDisplayBold(size: 48))
-                    .foregroundColor(Color(hex: 0xe8ff47))
-                    .frame(width: 80, height: 80)
-                    .background(
-                        RoundedRectangle(cornerRadius: 18)
-                            .fill(Color(hex: 0xe8ff47).opacity(0.1))
-                    )
+    // Three ascending amber bars — a transmit-level meter.
+    private var signalMark: some View {
+        HStack(alignment: .bottom, spacing: 5) {
+            ForEach(0..<3, id: \.self) { i in
+                RoundedRectangle(cornerRadius: 1)
+                    .fill(Theme.amber)
+                    .frame(width: 7, height: CGFloat(14 + i * 11))
             }
+        }
+    }
 
-            Text("EternalMonitor")
-                .font(.appDisplayBold(size: 28))
-                .foregroundColor(.white)
+    // MARK: - Onboarding hint
 
-            Text("Windows display streaming")
+    private var onboardingCard: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            HStack {
+                SectionLabel(title: "How it works")
+                Spacer()
+                Button {
+                    withAnimation(.easeInOut(duration: 0.2)) { didSeeOnboarding = true }
+                } label: {
+                    Image(systemName: "xmark")
+                        .font(.system(size: 12, weight: .medium))
+                        .foregroundColor(Theme.text3)
+                }
+                .accessibilityLabel("Dismiss tips")
+            }
+            onboardingStep("1", "Run EternalMonitor on your Windows PC.")
+            onboardingStep("2", "Scan the QR it shows, or type the PC's IP below.")
+            onboardingStep("3", "Tap Connect — your screen appears here.")
+        }
+        .moduleCard()
+        .transition(.opacity.combined(with: .move(edge: .top)))
+    }
+
+    private func onboardingStep(_ n: String, _ text: String) -> some View {
+        HStack(alignment: .top, spacing: 10) {
+            Text(n)
+                .font(.appMonoMedium(size: 11))
+                .foregroundColor(Theme.void)
+                .frame(width: 18, height: 18)
+                .background(Circle().fill(Theme.amber))
+            Text(text)
                 .font(.appMonoRegular(size: 13))
-                .foregroundColor(.white.opacity(0.4))
+                .foregroundColor(Theme.text2)
+                .fixedSize(horizontal: false, vertical: true)
+            Spacer(minLength: 0)
         }
     }
 
@@ -160,31 +232,33 @@ struct ConnectView: View {
     private func errorBanner(_ message: String) -> some View {
         HStack(spacing: 10) {
             Image(systemName: "exclamationmark.triangle.fill")
-                .foregroundColor(.orange)
+                .foregroundColor(Theme.caution)
                 .font(.system(size: 16))
 
             Text(message)
                 .font(.appMonoRegular(size: 12))
-                .foregroundColor(.white.opacity(0.8))
+                .foregroundColor(Theme.text2)
                 .multilineTextAlignment(.leading)
+                .fixedSize(horizontal: false, vertical: true)
 
-            Spacer()
+            Spacer(minLength: 0)
 
             Button {
-                connectionManager.connectionError = nil
+                withAnimation { connectionManager.connectionError = nil }
             } label: {
                 Image(systemName: "xmark")
                     .font(.system(size: 12, weight: .medium))
-                    .foregroundColor(.white.opacity(0.4))
+                    .foregroundColor(Theme.text3)
             }
+            .accessibilityLabel("Dismiss error")
         }
         .padding(14)
         .background(
-            RoundedRectangle(cornerRadius: 12)
-                .fill(Color.orange.opacity(0.1))
+            RoundedRectangle(cornerRadius: 12, style: .continuous)
+                .fill(Theme.caution.opacity(0.10))
                 .overlay(
-                    RoundedRectangle(cornerRadius: 12)
-                        .strokeBorder(Color.orange.opacity(0.3), lineWidth: 1)
+                    RoundedRectangle(cornerRadius: 12, style: .continuous)
+                        .strokeBorder(Theme.caution.opacity(0.30), lineWidth: 1)
                 )
         )
         .transition(.opacity.combined(with: .move(edge: .top)))
@@ -194,81 +268,61 @@ struct ConnectView: View {
 
     private var inputSection: some View {
         VStack(spacing: 14) {
-            VStack(alignment: .leading, spacing: 6) {
-                Text("HOST IP")
-                    .font(.appMonoMedium(size: 11))
-                    .foregroundColor(.white.opacity(0.4))
+            field(label: "HOST IP", placeholder: "e.g. 10.0.0.45", text: $hostIP, field: .host, keyboard: .decimalPad)
 
-                TextField("e.g. 10.0.0.45", text: $hostIP)
-                    .font(.appMonoRegular(size: 16))
-                    .foregroundColor(.white)
-                    .padding(.horizontal, 16)
-                    .padding(.vertical, 14)
-                    .background(
-                        RoundedRectangle(cornerRadius: 12)
-                            .fill(Color.white.opacity(0.05))
-                            .overlay(
-                                RoundedRectangle(cornerRadius: 12)
-                                    .strokeBorder(
-                                        focusedField == .host
-                                            ? Color(hex: 0xe8ff47)
-                                            : Color.white.opacity(0.1),
-                                        lineWidth: 1
-                                    )
-                            )
-                    )
-                    .keyboardType(.decimalPad)
-                    .textContentType(.none)
-                    .autocorrectionDisabled()
-                    .focused($focusedField, equals: .host)
-                    .disabled(isConnecting)
-
-                // surface the most recent successful connection so the
-                // user can confirm pre-fill came from the right place.
-                if !settings.lastHost.isEmpty && settings.lastHost != normalizedHostIP {
-                    Text("Last connected: \(settings.lastHost)")
+            if !settings.lastHost.isEmpty && settings.lastHost != normalizedHostIP {
+                Button {
+                    hostIP = settings.lastHost
+                    if settings.lastPort != 0 { port = String(settings.lastPort) }
+                } label: {
+                    Text("Use last: \(settings.lastHost)")
                         .font(.appMonoRegular(size: 11))
-                        .foregroundColor(.white.opacity(0.3))
+                        .foregroundColor(Theme.amber.opacity(0.8))
                         .frame(maxWidth: .infinity, alignment: .leading)
                 }
             }
 
-            VStack(alignment: .leading, spacing: 6) {
-                Text("PORT")
-                    .font(.appMonoMedium(size: 11))
-                    .foregroundColor(.white.opacity(0.4))
-
-                TextField("9876", text: $port)
-                    .font(.appMonoRegular(size: 16))
-                    .foregroundColor(.white)
-                    .padding(.horizontal, 16)
-                    .padding(.vertical, 14)
-                    .background(
-                        RoundedRectangle(cornerRadius: 12)
-                            .fill(Color.white.opacity(0.05))
-                            .overlay(
-                                RoundedRectangle(cornerRadius: 12)
-                                    .strokeBorder(
-                                        focusedField == .port
-                                            ? Color(hex: 0xe8ff47)
-                                            : Color.white.opacity(0.1),
-                                        lineWidth: 1
-                                    )
-                            )
-                    )
-                    .keyboardType(.numberPad)
-                    .focused($focusedField, equals: .port)
-                    .disabled(isConnecting)
-            }
+            field(label: "PORT", placeholder: "9876", text: $port, field: .port, keyboard: .numberPad)
 
             if !port.isEmpty && parsedPort == nil {
                 Text("Enter a valid UDP port between 1 and 65535.")
                     .font(.appMonoRegular(size: 11))
-                    .foregroundColor(.orange.opacity(0.8))
+                    .foregroundColor(Theme.caution)
                     .frame(maxWidth: .infinity, alignment: .leading)
             }
         }
         .opacity(isConnecting ? 0.5 : 1)
+    }
+
+    private func field(label: String, placeholder: String, text: Binding<String>, field: Field, keyboard: UIKeyboardType) -> some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text(label)
+                .font(.appMonoMedium(size: 11))
+                .tracking(1)
+                .foregroundColor(Theme.text3)
+
+            TextField(placeholder, text: text)
+                .font(.appMonoRegular(size: 17))
+                .foregroundColor(Theme.text)
+                .padding(.horizontal, 16)
+                .padding(.vertical, 15)
+                .background(
+                    RoundedRectangle(cornerRadius: 12, style: .continuous)
+                        .fill(Color.white.opacity(0.04))
+                        .overlay(
+                            RoundedRectangle(cornerRadius: 12, style: .continuous)
+                                .strokeBorder(
+                                    focusedField == field ? Theme.amber : Theme.hairline,
+                                    lineWidth: 1
+                                )
+                        )
+                )
+                .keyboardType(keyboard)
+                .textContentType(.none)
+                .autocorrectionDisabled()
+                .focused($focusedField, equals: field)
+                .disabled(isConnecting)
+        }
     }
 
     // MARK: - Connect button
@@ -282,27 +336,22 @@ struct ConnectView: View {
             }
         } label: {
             HStack(spacing: 8) {
-                Image(systemName: "link")
+                Image(systemName: "dot.radiowaves.up.forward")
                 Text("Connect")
-                    .font(.appDisplayBold(size: 16))
+                    .font(.appDisplayBold(size: 17))
             }
-            .foregroundColor(Color(hex: 0x080808))
-            .frame(maxWidth: .infinity)
-            .padding(.vertical, 16)
-            .background(
-                RoundedRectangle(cornerRadius: 14)
-                    .fill(Color(hex: 0xe8ff47))
-            )
         }
-        .disabled(normalizedHostIP.isEmpty || parsedPort == nil)
-        .opacity(normalizedHostIP.isEmpty || parsedPort == nil ? 0.5 : 1)
+        .buttonStyle(AmberButtonStyle())
+        .disabled(!canConnect)
+        .opacity(canConnect ? 1 : 0.45)
+        .accessibilityLabel("Connect to host")
     }
+
+    // MARK: - Diagnostics
 
     private var diagnosticsSection: some View {
         VStack(alignment: .leading, spacing: 10) {
-            Text("DIAGNOSTICS")
-                .font(.appMonoMedium(size: 11))
-                .foregroundColor(.white.opacity(0.4))
+            SectionLabel(title: "Diagnostics")
 
             let entries = Array(connectionManager.diagnostics.suffix(8).reversed())
             ForEach(entries) { entry in
@@ -310,17 +359,18 @@ struct ConnectView: View {
                     Text(entry.level.rawValue)
                         .font(.appMonoMedium(size: 10))
                         .foregroundColor(color(for: entry.level))
-                        .frame(width: 40, alignment: .leading)
+                        .frame(width: 42, alignment: .leading)
 
                     VStack(alignment: .leading, spacing: 4) {
                         Text(entry.category.uppercased())
                             .font(.appMonoMedium(size: 10))
-                            .foregroundColor(.white.opacity(0.35))
+                            .foregroundColor(Theme.text3)
 
                         Text(entry.message)
                             .font(.appMonoRegular(size: 11))
-                            .foregroundColor(.white.opacity(0.72))
+                            .foregroundColor(Theme.text2)
                             .textSelection(.enabled)
+                            .fixedSize(horizontal: false, vertical: true)
                     }
 
                     Spacer(minLength: 0)
@@ -328,41 +378,39 @@ struct ConnectView: View {
                 .padding(.horizontal, 14)
                 .padding(.vertical, 10)
                 .background(
-                    RoundedRectangle(cornerRadius: 12)
-                        .fill(Color.white.opacity(0.04))
+                    RoundedRectangle(cornerRadius: 12, style: .continuous)
+                        .fill(Color.white.opacity(0.035))
                         .overlay(
-                            RoundedRectangle(cornerRadius: 12)
-                                .strokeBorder(Color.white.opacity(0.08), lineWidth: 1)
+                            RoundedRectangle(cornerRadius: 12, style: .continuous)
+                                .strokeBorder(Theme.hairline, lineWidth: 1)
                         )
                 )
             }
         }
     }
 
-    // MARK: - Connecting state (spinner + cancel)
+    // MARK: - Connecting state
 
     private var connectingSection: some View {
         VStack(spacing: 14) {
-            // Status
-            HStack(spacing: 10) {
-                ProgressView()
-                    .tint(Color(hex: 0xe8ff47))
-                Text("Waiting for frames from \(normalizedHostIP)...")
+            HStack(spacing: 12) {
+                SignalDot(color: Theme.amber)
+                Text("Acquiring signal from \(normalizedHostIP)…")
                     .font(.appMonoRegular(size: 14))
-                    .foregroundColor(.white.opacity(0.7))
+                    .foregroundColor(Theme.text2)
+                Spacer(minLength: 0)
             }
-            .frame(maxWidth: .infinity)
-            .padding(.vertical, 16)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(16)
             .background(
-                RoundedRectangle(cornerRadius: 14)
-                    .fill(Color(hex: 0xe8ff47).opacity(0.08))
+                RoundedRectangle(cornerRadius: 13, style: .continuous)
+                    .fill(Theme.amber.opacity(0.08))
                     .overlay(
-                        RoundedRectangle(cornerRadius: 14)
-                            .strokeBorder(Color(hex: 0xe8ff47).opacity(0.2), lineWidth: 1)
+                        RoundedRectangle(cornerRadius: 13, style: .continuous)
+                            .strokeBorder(Theme.amber.opacity(0.25), lineWidth: 1)
                     )
             )
 
-            // Cancel button
             Button {
                 withAnimation(.easeInOut(duration: 0.2)) {
                     connectionManager.cancel()
@@ -370,18 +418,32 @@ struct ConnectView: View {
             } label: {
                 Text("Cancel")
                     .font(.appDisplayBold(size: 16))
-                    .foregroundColor(Color(hex: 0xe8ff47))
-                    .frame(maxWidth: .infinity)
-                    .padding(.vertical, 14)
-                    .background(
-                        RoundedRectangle(cornerRadius: 14)
-                            .strokeBorder(Color(hex: 0xe8ff47).opacity(0.4), lineWidth: 1)
-                    )
             }
+            .buttonStyle(GhostButtonStyle(accent: Theme.amber))
         }
     }
 
-    // MARK: - Scan QR
+    // MARK: - Scan buttons
+
+    private var scanButton: some View {
+        Button {
+            focusedField = nil
+            if scanner.isScanning { scanner.stopScan() } else { scanner.startScan() }
+        } label: {
+            HStack(spacing: 8) {
+                if scanner.isScanning {
+                    ProgressView().tint(Theme.amber).scaleEffect(0.8)
+                } else {
+                    Image(systemName: "antenna.radiowaves.left.and.right")
+                }
+                Text(scanner.isScanning ? "Scanning" : "Scan")
+                    .font(.appMonoMedium(size: 13))
+            }
+        }
+        .buttonStyle(GhostButtonStyle(accent: scanner.isScanning ? Theme.amber : Theme.text2))
+        .disabled(isConnecting)
+        .opacity(isConnecting ? 0.5 : 1)
+    }
 
     private var qrScanButton: some View {
         Button {
@@ -391,16 +453,10 @@ struct ConnectView: View {
             HStack(spacing: 8) {
                 Image(systemName: "qrcode.viewfinder")
                 Text("Scan QR")
-                    .font(.appMonoRegular(size: 14))
+                    .font(.appMonoMedium(size: 13))
             }
-            .foregroundColor(.white.opacity(0.6))
-            .frame(maxWidth: .infinity)
-            .padding(.vertical, 14)
-            .background(
-                RoundedRectangle(cornerRadius: 14)
-                    .strokeBorder(Color.white.opacity(0.1), lineWidth: 1)
-            )
         }
+        .buttonStyle(GhostButtonStyle(accent: Theme.text2))
         .disabled(isConnecting)
         .opacity(isConnecting ? 0.5 : 1)
     }
@@ -414,8 +470,7 @@ struct ConnectView: View {
         }
         let body = String(value.dropFirst(prefix.count))
         let parts = body.split(separator: ":")
-        guard parts.count == 2,
-              let scannedPort = UInt16(parts[1]) else {
+        guard parts.count == 2, let scannedPort = UInt16(parts[1]) else {
             connectionManager.connectionError = "Scanned QR is malformed."
             return
         }
@@ -424,43 +479,25 @@ struct ConnectView: View {
         connectionManager.connect(host: hostIP, port: scannedPort)
     }
 
-    // MARK: - Scan network
+    // MARK: - Scan empty state
 
-    private var scanButton: some View {
-        Button {
-            focusedField = nil
-            if scanner.isScanning {
-                scanner.stopScan()
-            } else {
-                scanner.startScan()
-            }
-        } label: {
-            HStack(spacing: 8) {
-                if scanner.isScanning {
-                    ProgressView()
-                        .tint(.white.opacity(0.5))
-                        .scaleEffect(0.8)
-                } else {
-                    Image(systemName: "antenna.radiowaves.left.and.right")
-                }
-                Text(scanner.isScanning ? "Scanning..." : "Scan network")
-                    .font(.appMonoRegular(size: 14))
-            }
-            .foregroundColor(.white.opacity(0.6))
-            .frame(maxWidth: .infinity)
-            .padding(.vertical, 14)
-            .background(
-                RoundedRectangle(cornerRadius: 14)
-                    .strokeBorder(
-                        scanner.isScanning
-                            ? Color(hex: 0xe8ff47).opacity(0.3)
-                            : Color.white.opacity(0.1),
-                        lineWidth: 1
-                    )
-            )
+    private var scanEmptyState: some View {
+        HStack(alignment: .top, spacing: 10) {
+            Image(systemName: "wifi.exclamationmark")
+                .foregroundColor(Theme.text3)
+                .font(.system(size: 15))
+            Text("No hosts found. Enter the IP shown on the PC, and check both devices are on the same Wi-Fi (not a guest network).")
+                .font(.appMonoRegular(size: 12))
+                .foregroundColor(Theme.text2)
+                .fixedSize(horizontal: false, vertical: true)
+            Spacer(minLength: 0)
         }
-        .disabled(isConnecting)
-        .opacity(isConnecting ? 0.5 : 1)
+        .padding(14)
+        .background(
+            RoundedRectangle(cornerRadius: 12, style: .continuous)
+                .fill(Color.white.opacity(0.03))
+        )
+        .transition(.opacity)
     }
 
     // MARK: - Discovered hosts
@@ -468,16 +505,12 @@ struct ConnectView: View {
     private var discoveredSection: some View {
         VStack(alignment: .leading, spacing: 10) {
             HStack {
-                Text("FOUND ON NETWORK")
-                    .font(.appMonoMedium(size: 11))
-                    .foregroundColor(.white.opacity(0.4))
-
+                SectionLabel(title: "Found on network")
                 Spacer()
-
                 if !scanner.statusMessage.isEmpty {
                     Text(scanner.statusMessage)
                         .font(.appMonoRegular(size: 10))
-                        .foregroundColor(Color(hex: 0x1D9E75).opacity(0.8))
+                        .foregroundColor(Theme.phosphor.opacity(0.85))
                 }
             }
 
@@ -487,18 +520,16 @@ struct ConnectView: View {
                     port = "\(host.port)"
                 } label: {
                     HStack(spacing: 12) {
-                        Circle()
-                            .fill(Color(hex: 0x1D9E75))
-                            .frame(width: 8, height: 8)
+                        SignalDot(color: Theme.phosphor, size: 8)
 
                         VStack(alignment: .leading, spacing: 2) {
                             Text(host.address)
                                 .font(.appMonoRegular(size: 15))
-                                .foregroundColor(.white)
+                                .foregroundColor(Theme.text)
                             if host.name != host.address {
                                 Text(host.name)
                                     .font(.appMonoRegular(size: 11))
-                                    .foregroundColor(.white.opacity(0.3))
+                                    .foregroundColor(Theme.text3)
                             }
                         }
 
@@ -506,20 +537,20 @@ struct ConnectView: View {
 
                         Text(":\(String(host.port))")
                             .font(.appMonoRegular(size: 12))
-                            .foregroundColor(.white.opacity(0.3))
+                            .foregroundColor(Theme.text3)
 
                         Image(systemName: "arrow.right.circle.fill")
-                            .foregroundColor(Color(hex: 0xe8ff47).opacity(0.6))
+                            .foregroundColor(Theme.amber.opacity(0.7))
                             .font(.system(size: 18))
                     }
                     .padding(.horizontal, 16)
-                    .padding(.vertical, 12)
+                    .padding(.vertical, 13)
                     .background(
-                        RoundedRectangle(cornerRadius: 12)
-                            .fill(Color(hex: 0x1D9E75).opacity(0.06))
+                        RoundedRectangle(cornerRadius: 12, style: .continuous)
+                            .fill(Theme.phosphor.opacity(0.06))
                             .overlay(
-                                RoundedRectangle(cornerRadius: 12)
-                                    .strokeBorder(Color(hex: 0x1D9E75).opacity(0.15), lineWidth: 1)
+                                RoundedRectangle(cornerRadius: 12, style: .continuous)
+                                    .strokeBorder(Theme.phosphor.opacity(0.18), lineWidth: 1)
                             )
                     )
                 }
@@ -528,20 +559,11 @@ struct ConnectView: View {
         .transition(.opacity.combined(with: .move(edge: .bottom)))
     }
 
-    private var scanStatusMessage: some View {
-        Text(scanner.statusMessage)
-            .font(.appMonoRegular(size: 11))
-            .foregroundColor(.white.opacity(0.45))
-            .frame(maxWidth: .infinity, alignment: .leading)
-    }
-
     // MARK: - Recent connections
 
     private var recentSection: some View {
         VStack(alignment: .leading, spacing: 10) {
-            Text("RECENT")
-                .font(.appMonoMedium(size: 11))
-                .foregroundColor(.white.opacity(0.4))
+            SectionLabel(title: "Recent")
 
             ForEach(recentStore.connections) { conn in
                 Button {
@@ -552,31 +574,28 @@ struct ConnectView: View {
                         VStack(alignment: .leading, spacing: 4) {
                             Text(conn.host)
                                 .font(.appMonoRegular(size: 15))
-                                .foregroundColor(.white)
+                                .foregroundColor(Theme.text)
                             Text(":\(String(conn.port))")
                                 .font(.appMonoRegular(size: 12))
-                                .foregroundColor(.white.opacity(0.3))
+                                .foregroundColor(Theme.text3)
                         }
 
                         Spacer()
 
-                        Text(conn.isUSB ? "USB" : "WiFi")
+                        Text(conn.isUSB ? "USB" : "WIFI")
                             .font(.appMonoMedium(size: 10))
-                            .foregroundColor(conn.isUSB ? Color(hex: 0xe8ff47) : Color(hex: 0x1D9E75))
+                            .tracking(1)
+                            .foregroundColor(conn.isUSB ? Theme.amber : Theme.phosphor)
                             .padding(.horizontal, 8)
                             .padding(.vertical, 4)
                             .background(
-                                Capsule()
-                                    .fill(
-                                        (conn.isUSB ? Color(hex: 0xe8ff47) : Color(hex: 0x1D9E75))
-                                            .opacity(0.15)
-                                    )
+                                Capsule().fill((conn.isUSB ? Theme.amber : Theme.phosphor).opacity(0.15))
                             )
                     }
                     .padding(.horizontal, 16)
-                    .padding(.vertical, 12)
+                    .padding(.vertical, 13)
                     .background(
-                        RoundedRectangle(cornerRadius: 12)
+                        RoundedRectangle(cornerRadius: 12, style: .continuous)
                             .fill(Color.white.opacity(0.03))
                     )
                 }
@@ -585,62 +604,23 @@ struct ConnectView: View {
         .opacity(isConnecting ? 0.5 : 1)
     }
 
-    // MARK: - Grid overlay
-
-    private var gridOverlay: some View {
-        Canvas { context, size in
-            let spacing: CGFloat = 40
-            let color = Color.white.opacity(0.03)
-
-            var x: CGFloat = 0
-            while x < size.width {
-                context.stroke(
-                    Path { path in
-                        path.move(to: CGPoint(x: x, y: 0))
-                        path.addLine(to: CGPoint(x: x, y: size.height))
-                    },
-                    with: .color(color),
-                    lineWidth: 0.5
-                )
-                x += spacing
-            }
-
-            var y: CGFloat = 0
-            while y < size.height {
-                context.stroke(
-                    Path { path in
-                        path.move(to: CGPoint(x: 0, y: y))
-                        path.addLine(to: CGPoint(x: size.width, y: y))
-                    },
-                    with: .color(color),
-                    lineWidth: 0.5
-                )
-                y += spacing
-            }
-        }
-        .ignoresSafeArea()
-        .allowsHitTesting(false)
-    }
-
     private func color(for level: DiagnosticLevel) -> Color {
         switch level {
-        case .info:
-            return Color(hex: 0x1D9E75)
-        case .warning:
-            return .orange
-        case .error:
-            return .red
+        case .info: return Theme.phosphor
+        case .warning: return Theme.caution
+        case .error: return Theme.fault
         }
     }
 }
 
-// MARK: - Color hex extension
+// MARK: - Staggered reveal
 
-extension Color {
-    init(hex: UInt32) {
-        let r = Double((hex >> 16) & 0xFF) / 255.0
-        let g = Double((hex >> 8) & 0xFF) / 255.0
-        let b = Double(hex & 0xFF) / 255.0
-        self.init(red: r, green: g, blue: b)
+private extension View {
+    /// Fade + rise on first appear, ordered by `index`.
+    func reveal(_ appeared: Bool, _ index: Int) -> some View {
+        self
+            .opacity(appeared ? 1 : 0)
+            .offset(y: appeared ? 0 : 14)
+            .animation(.easeOut(duration: 0.45).delay(Double(index) * 0.07), value: appeared)
     }
 }

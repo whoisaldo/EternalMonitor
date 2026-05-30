@@ -10,3 +10,7 @@ tools/downloads/
 tools/ffmpeg-7.1/
 EternalMonitor.png
 GIT_POLICY.md
+
+# Release artifacts produced by scripts/package.ps1
+/EternalMonitor-*-windows/
+/EternalMonitor-*-windows.zip

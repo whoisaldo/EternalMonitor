@@ -17,7 +17,7 @@ use windows::Win32::Graphics::Direct3D11::{
 };
 use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_SAMPLE_DESC};
 use windows::Win32::Graphics::Dxgi::{
-    CreateDXGIFactory1, IDXGIAdapter1, IDXGIFactory1, IDXGIOutput, IDXGIOutput1,
+    CreateDXGIFactory1, IDXGIFactory1, IDXGIOutput, IDXGIOutput1,
     IDXGIOutputDuplication, IDXGIResource, DXGI_ERROR_ACCESS_LOST, DXGI_ERROR_WAIT_TIMEOUT,
     DXGI_OUTDUPL_FRAME_INFO,
 };
@@ -70,7 +70,10 @@ fn run_capture_loop(
             warn!(
                 requested = adapter_index,
                 error = %error,
-                "EnumAdapters1 failed for requested adapter index, falling back to adapter 0"
+                "EnumAdapters1 failed for requested adapter index, falling back to adapter 0. \
+                 The encoder was selected from the originally-detected adapter's vendor, so on a \
+                 multi-GPU system this fallback may capture a different-vendor GPU than the \
+                 encoder expects — check that the captured adapter and codec below match."
             );
             let fallback = unsafe { factory.EnumAdapters1(0)? };
             (fallback, 0)
@@ -85,6 +88,15 @@ fn run_capture_loop(
             .take_while(|&c| c != 0)
             .collect::<Vec<_>>(),
     );
+    if used_adapter_index != adapter_index {
+        warn!(
+            requested = adapter_index,
+            using = used_adapter_index,
+            adapter = %adapter_name,
+            "Capturing on a fallback adapter that differs from the one GPU detection selected — \
+             verify the codec on the Stream tab matches this GPU's vendor"
+        );
+    }
     info!(
         adapter_index = used_adapter_index,
         adapter = %adapter_name,

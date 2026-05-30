@@ -90,7 +90,14 @@ fn run_encode_loop(
         return Err(format!("{} codec not found in FFmpeg", encoder_name).into());
     }
     info!(encoder = %encoder_name, "Found encoder codec");
-    PIPELINE_STATS.lock().set_codec_name(&codec_display_name);
+    {
+        let mut stats = PIPELINE_STATS.lock();
+        stats.set_codec_name(&codec_display_name);
+        // Fresh pipeline start: clear any stale software-fallback flag. The encode loop
+        // re-sets it below only if a hardware encoder actually fails to open. A deliberate
+        // libx264 override is not a fallback, so it intentionally leaves this false.
+        stats.set_software_fallback(false);
+    }
 
     let mut encoder_state: Option<EncoderState> = None;
     let mut rx = rx;
@@ -129,7 +136,11 @@ fn run_encode_loop(
                     );
                     encoder_name = "libx264".to_string();
                     codec_display_name = "H.264 (x264)".to_string();
-                    PIPELINE_STATS.lock().set_codec_name(&codec_display_name);
+                    {
+                        let mut stats = PIPELINE_STATS.lock();
+                        stats.set_codec_name(&codec_display_name);
+                        stats.set_software_fallback(true);
+                    }
                     encoder_state =
                         Some(EncoderState::new(&encoder_name, raw_frame.width, raw_frame.height)?);
                 }

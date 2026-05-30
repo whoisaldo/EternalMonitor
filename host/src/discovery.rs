@@ -31,10 +31,7 @@ pub fn advertise_service(port: u16) -> Option<ServiceDaemon> {
     let host_fqdn = format!("{}.local.", host);
     let instance_name = format!("{} ({})", INSTANCE_NAME, host);
 
-    let service_info = match build_service_info(port, &host_fqdn, &instance_name) {
-        Some(info) => info,
-        None => return None,
-    };
+    let service_info = build_service_info(port, &host_fqdn, &instance_name)?;
 
     let full_name = service_info.get_fullname().to_string();
     let initial_addrs: Vec<_> = service_info.get_addresses().iter().copied().collect();

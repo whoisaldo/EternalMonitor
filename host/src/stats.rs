@@ -28,6 +28,10 @@ pub struct PipelineStats {
     pub nal_bytes_last: usize,
     pub bitrate_bps: u32,
     pub codec_name: String,
+    /// True when a hardware encoder failed to open and the pipeline fell back to libx264
+    /// (CPU) encoding. Surfaced as a warning banner in the GUI so a tester is never silently
+    /// stuck on slow software encoding.
+    pub using_software_fallback: bool,
     encode_timestamps: VecDeque<Instant>,
 
     // Transport
@@ -77,6 +81,7 @@ impl PipelineStats {
             nal_bytes_last: 0,
             bitrate_bps: 0,
             codec_name: String::new(),
+            using_software_fallback: false,
             encode_timestamps: VecDeque::with_capacity(128),
 
             transport_fps: 0.0,
@@ -107,6 +112,7 @@ impl PipelineStats {
         let target_addr = self.target_addr.clone();
         let bitrate_bps = self.bitrate_bps;
         let codec_name = self.codec_name.clone();
+        let using_software_fallback = self.using_software_fallback;
         let mdns_active = self.mdns_active;
         let gpu_temp_c = self.gpu_temp_c;
 
@@ -116,6 +122,7 @@ impl PipelineStats {
         self.target_addr = target_addr;
         self.bitrate_bps = bitrate_bps;
         self.codec_name = codec_name;
+        self.using_software_fallback = using_software_fallback;
         self.mdns_active = mdns_active;
         self.gpu_temp_c = gpu_temp_c;
     }
@@ -162,6 +169,10 @@ impl PipelineStats {
 
     pub fn set_codec_name(&mut self, codec_name: impl Into<String>) {
         self.codec_name = codec_name.into();
+    }
+
+    pub fn set_software_fallback(&mut self, using_software_fallback: bool) {
+        self.using_software_fallback = using_software_fallback;
     }
 
     pub fn record_capture(&mut self, width: u32, height: u32) {
@@ -258,6 +269,7 @@ mod tests {
         stats.target_addr = "10.0.0.1:9876".to_string();
         stats.bitrate_bps = 15_000_000;
         stats.codec_name = "H.264".to_string();
+        stats.using_software_fallback = true;
         stats.mdns_active = true;
         stats.capture_frame_count = 10;
         stats.encode_frame_count = 8;
@@ -271,6 +283,7 @@ mod tests {
         assert_eq!(stats.target_addr, "10.0.0.1:9876");
         assert_eq!(stats.bitrate_bps, 15_000_000);
         assert_eq!(stats.codec_name, "H.264");
+        assert!(stats.using_software_fallback);
         assert!(stats.mdns_active);
         assert_eq!(stats.capture_frame_count, 0);
         assert_eq!(stats.encode_frame_count, 0);

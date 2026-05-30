@@ -19,7 +19,7 @@ pub struct FragmentHeader {
 }
 
 impl FragmentHeader {
-    pub fn to_bytes(&self) -> [u8; HEADER_SIZE] {
+    pub fn to_bytes(self) -> [u8; HEADER_SIZE] {
         let mut buf = [0u8; HEADER_SIZE];
         buf[0..4].copy_from_slice(&self.seq.to_le_bytes());
         buf[4..6].copy_from_slice(&self.fragment_index.to_le_bytes());

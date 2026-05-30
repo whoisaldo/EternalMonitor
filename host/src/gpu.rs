@@ -114,7 +114,7 @@ fn detect_from_dxgi() -> Result<GpuInfo, Box<dyn std::error::Error>> {
 
         let is_better = best
             .as_ref()
-            .map_or(true, |(_, _, _, best_vram)| vram_mb > *best_vram);
+            .is_none_or(|(_, _, _, best_vram)| vram_mb > *best_vram);
         if is_better {
             best = Some((index, name, vendor, vram_mb));
         }

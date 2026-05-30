@@ -199,7 +199,7 @@ fn interface_bucket(message: &str) -> String {
         let rest = &message[idx + "interface".len()..];
         let trimmed = rest.trim_start_matches([':', ' ']);
         let end = trimmed
-            .find(|c: char| c == ',' || c == '"' || c == ')')
+            .find([',', '"', ')'])
             .unwrap_or(trimmed.len());
         return trimmed[..end].trim().to_string();
     }

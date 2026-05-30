@@ -40,6 +40,17 @@ Step 4 - Connect from the iPad
    direct IP entry and type the IP from Step 3. Port is 9876.
 3. Your Windows screen should appear on the iPad within a second or two.
 
+If the video is choppy or laggy
+-------------------------------
+- This is almost always Wi-Fi, not the app. Get close to the router, use
+  5 GHz instead of 2.4 GHz, or plug the PC into Ethernet. A busy/weak
+  network drops frames and the picture freezes or stutters.
+- Open the host's "Performance" tab and check the Codec. If it reads
+  "H.264 (x264)" you are encoding on the CPU (slow + hot) because the
+  hardware encoder didn't start - update your GPU drivers and click
+  "Restart stream". The host also shows an amber warning banner when this
+  happens.
+
 If it doesn't work
 ------------------
 - Make sure both devices are on the SAME Wi-Fi (not guest network, not
@@ -49,9 +60,12 @@ If it doesn't work
   Firewall & network protection -> Allow an app through firewall.
 - Try the manual IP entry instead of "Scan network".
 - Keep the host window open the whole time.
+- Make sure the iPad app build matches this host version - older builds
+  use a different wire format and will show corrupted or no video.
 
 What to report back
 -------------------
-If you hit problems, the host window prints log lines - a screenshot of
-that window plus a note of what the iPad showed is the most useful thing
-to send back.
+If you hit problems, the easiest thing is to click "Copy logs" on the
+host's Stream tab and paste that into the chat, along with a note of what
+the iPad showed and which GPU you have (shown on the Stream tab). A full
+log file is also saved next to the .exe in the "logs" folder.
