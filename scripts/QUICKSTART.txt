@@ -1,10 +1,9 @@
 EternalMonitor - Quick Start (Windows host)
 ===========================================
 
-This turns your Windows PC's screen into a stream your iPad can display
-over your local Wi-Fi. This package is the WINDOWS side only. You also
-need the EternalMonitor app on an iPad (the sender of this file will give
-you a separate invite for that).
+This turns your Windows PC into a second screen for your iPad over your
+local Wi-Fi. This is the WINDOWS side only. You also need the EternalMonitor
+app on an iPad (the sender will give you a separate invite for that).
 
 What you need
 -------------
@@ -12,60 +11,77 @@ What you need
 2. An iPad with the EternalMonitor app installed.
 3. Both devices on the SAME Wi-Fi network.
 
-Step 1 - Unzip
---------------
-Right-click the .zip you received and choose "Extract All...". Keep all
-the files together in one folder - the .exe needs the .dll files next to it.
-
-Step 2 - Run the host
----------------------
-Double-click  EternalMonitor-host.exe
+Step 1 - Install
+----------------
+Double-click  EternalMonitor-Setup.exe
 
 - Windows may show a blue "Windows protected your PC" box. Click
-  "More info" -> "Run anyway". (This only happens because the app isn't
-  code-signed yet; it is safe.)
-- The first time, Windows Firewall will ask to allow network access.
-  CHECK both "Private networks" and "Public networks", then click "Allow".
-  If you miss this, the iPad won't be able to connect.
+  "More info" -> "Run anyway". (This only happens because the installer
+  isn't code-signed yet; it is safe.)
+- Click "Yes" on the Windows permission (UAC) prompt. This one prompt lets
+  the installer set up the app AND the virtual display, so the iPad can be a
+  real SECOND screen (not just a mirror).
+- Click through the installer with the default options. When it finishes,
+  EternalMonitor starts automatically.
+
+That's it for setup - no files to unzip, no drivers to install by hand.
+
+Step 2 - Allow the network prompt
+---------------------------------
+The first time the host runs, Windows Firewall will ask to allow network
+access. CHECK both "Private networks" and "Public networks", then click
+"Allow". If you miss this, the iPad won't be able to connect.
 
 Step 3 - Note the IP address
 ----------------------------
-When the host starts it shows your PC's local IP address (looks like
-192.168.x.x). Write it down - you'll type it into the iPad app.
+The host window shows your PC's local IP address (looks like 192.168.x.x).
+Write it down - you'll type it into the iPad app.
 
 Step 4 - Connect from the iPad
 ------------------------------
 1. Open the EternalMonitor app on the iPad.
-2. If "Scan network" finds the PC, tap it. If not, choose manual /
-   direct IP entry and type the IP from Step 3. Port is 9876.
-3. Your Windows screen should appear on the iPad within a second or two.
+2. If "Scan network" finds the PC, tap it. If not, choose manual / direct
+   IP entry and type the IP from Step 3. Port is 9876.
+3. Your PC's screen appears on the iPad within a second or two.
+
+Step 5 - Mirror vs. extended screen
+-----------------------------------
+By default the iPad MIRRORS your main screen. To use the iPad as a separate
+EXTENDED workspace (drag windows onto it):
+
+1. In the host window, open the "Settings" tab.
+2. Under "Capture display", click "Refresh", then pick the virtual display
+   (it appears in the list once the setup has installed it - it is the one
+   that is NOT your main monitor).
+3. Click "Restart stream".
+
+The iPad now shows the extended desktop. Drag a window past the right edge
+of your main screen and it lands on the iPad. To go back to mirroring,
+choose "Auto (primary)" and Restart stream again.
 
 If the video is choppy or laggy
 -------------------------------
 - This is almost always Wi-Fi, not the app. Get close to the router, use
-  5 GHz instead of 2.4 GHz, or plug the PC into Ethernet. A busy/weak
-  network drops frames and the picture freezes or stutters.
-- Open the host's "Performance" tab and check the Codec. If it reads
-  "H.264 (x264)" you are encoding on the CPU (slow + hot) because the
-  hardware encoder didn't start - update your GPU drivers and click
-  "Restart stream". The host also shows an amber warning banner when this
-  happens.
+  5 GHz instead of 2.4 GHz, or plug the PC into Ethernet.
+- Open the "Performance" tab and check the Codec. If it reads "H.264 (x264)"
+  you are encoding on the CPU (slow) because the hardware encoder didn't
+  start - update your GPU drivers and click "Restart stream".
 
 If it doesn't work
 ------------------
-- Make sure both devices are on the SAME Wi-Fi (not guest network, not
-  one on Wi-Fi and one on Ethernet on a different subnet).
+- Make sure both devices are on the SAME Wi-Fi (not a guest network).
 - Re-check the Firewall prompt from Step 2. You can re-allow it under
   Windows Settings -> Privacy & security -> Windows Security ->
   Firewall & network protection -> Allow an app through firewall.
-- Try the manual IP entry instead of "Scan network".
+- Try manual IP entry instead of "Scan network".
 - Keep the host window open the whole time.
-- Make sure the iPad app build matches this host version - older builds
-  use a different wire format and will show corrupted or no video.
+- Make sure the iPad app build matches this host version.
+- No extended display in the list? Re-run EternalMonitor-Setup.exe and make
+  sure the virtual-display step completes, then reopen Settings -> Refresh.
 
 What to report back
 -------------------
-If you hit problems, the easiest thing is to click "Copy logs" on the
-host's Stream tab and paste that into the chat, along with a note of what
-the iPad showed and which GPU you have (shown on the Stream tab). A full
-log file is also saved next to the .exe in the "logs" folder.
+If you hit problems, click "Copy logs" on the host's Stream tab and paste
+that into the chat, along with what the iPad showed and which GPU you have
+(shown on the Stream tab). A full log file is also saved in the "logs"
+folder inside the install folder.

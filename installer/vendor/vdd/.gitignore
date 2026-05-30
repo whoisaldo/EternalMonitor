@@ -1,0 +1,4 @@
+# Do not commit the third-party driver binary — testers/builders supply it locally.
+*
+!.gitignore
+!README.txt
