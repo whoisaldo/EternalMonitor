@@ -19,6 +19,8 @@ pub struct PipelineStats {
     pub capture_resolution: (u32, u32),
     pub capture_frame_count: u64,
     pub gpu_name: String,
+    /// Active capture source, e.g. `\\.\DISPLAY3 (2732x2048)`. Empty until capture starts.
+    pub capture_display: String,
     capture_timestamps: VecDeque<Instant>,
 
     // Encoder
@@ -73,6 +75,7 @@ impl PipelineStats {
             capture_resolution: (0, 0),
             capture_frame_count: 0,
             gpu_name: String::new(),
+            capture_display: String::new(),
             capture_timestamps: VecDeque::with_capacity(128),
 
             encode_fps: 0.0,
@@ -108,6 +111,7 @@ impl PipelineStats {
 
     pub fn reset_for_restart(&mut self) {
         let gpu_name = self.gpu_name.clone();
+        let capture_display = self.capture_display.clone();
         let listen_addr = self.listen_addr.clone();
         let target_addr = self.target_addr.clone();
         let bitrate_bps = self.bitrate_bps;
@@ -118,6 +122,7 @@ impl PipelineStats {
 
         *self = Self::new();
         self.gpu_name = gpu_name;
+        self.capture_display = capture_display;
         self.listen_addr = listen_addr;
         self.target_addr = target_addr;
         self.bitrate_bps = bitrate_bps;
@@ -153,6 +158,10 @@ impl PipelineStats {
 
     pub fn set_gpu_name(&mut self, gpu_name: String) {
         self.gpu_name = gpu_name;
+    }
+
+    pub fn set_capture_display(&mut self, capture_display: String) {
+        self.capture_display = capture_display;
     }
 
     pub fn set_target_addr(&mut self, target_addr: String) {

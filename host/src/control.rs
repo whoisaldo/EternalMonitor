@@ -20,6 +20,18 @@ pub struct SharedControl {
     /// Encoder name override from the Settings tab, applied on next pipeline restart.
     /// `None` means use auto-detected encoder from GpuInfo.
     pub encoder_override: Arc<Mutex<Option<String>>>,
+    /// Which display output the capture loop should duplicate, applied on next pipeline
+    /// restart. `PrimaryAuto` mirrors the primary monitor (today's behavior).
+    pub capture_target: Arc<Mutex<CaptureTarget>>,
+}
+
+/// Selects which display output the capture loop duplicates.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CaptureTarget {
+    /// Capture the primary desktop output (the one at (0,0)). Default.
+    PrimaryAuto,
+    /// Capture the output whose DXGI `DeviceName` matches this string (e.g. `\\.\DISPLAY3`).
+    Output(String),
 }
 
 impl SharedControl {
@@ -31,6 +43,7 @@ impl SharedControl {
             target_addr: Arc::new(Mutex::new(SocketAddr::from(([0, 0, 0, 0], listen_port)))),
             force_next_idr: Arc::new(AtomicBool::new(false)),
             encoder_override: Arc::new(Mutex::new(None)),
+            capture_target: Arc::new(Mutex::new(CaptureTarget::PrimaryAuto)),
         }
     }
 

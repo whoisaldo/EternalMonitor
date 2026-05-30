@@ -58,11 +58,25 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let gpu_info = gpu::GpuInfo::detect();
 
+    // Best-effort capture source for the banner — reflects the default (primary). The
+    // authoritative per-run source (including a persisted/fallback selection) is logged
+    // inside the capture loop when the stream starts.
+    let capture_summary = {
+        let outputs = capture::enumerate_outputs();
+        outputs
+            .iter()
+            .find(|o| o.is_primary)
+            .or_else(|| outputs.first())
+            .map(|o| format!("{} ({}x{})", o.device_name, o.width, o.height))
+            .unwrap_or_else(|| "unknown".to_string())
+    };
+
     info!("══════════════════════════════════");
     info!("  EternalMonitor v0.1.1");
     info!("  GPU:     {} ({})", gpu_info.name, gpu_info.vendor);
     info!("  VRAM:    {} MB", gpu_info.dedicated_vram_mb);
     info!("  Encoder: {}", gpu_info.codec_display_name);
+    info!("  Capture: {}", capture_summary);
     info!("  Listen:  0.0.0.0:{}", listen_port);
     info!("══════════════════════════════════");
 

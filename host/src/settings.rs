@@ -15,6 +15,10 @@ pub struct SettingsFile {
     pub target_ip: Option<String>,
     #[serde(default)]
     pub encoder_override: Option<String>,
+    /// DXGI `DeviceName` of the capture display (e.g. `\\.\DISPLAY3`).
+    /// `None` means auto (primary monitor).
+    #[serde(default)]
+    pub capture_display: Option<String>,
     pub start_on_boot: bool,
 }
 
@@ -25,6 +29,7 @@ impl Default for SettingsFile {
             target_fps: 60,
             target_ip: None,
             encoder_override: None,
+            capture_display: None,
             start_on_boot: false,
         }
     }

@@ -6,7 +6,7 @@ use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 use windows::core::Interface;
 
-use crate::control::SharedControl;
+use crate::control::{CaptureTarget, SharedControl};
 use crate::stats::PIPELINE_STATS;
 use windows::Win32::Foundation::RECT;
 use windows::Win32::Graphics::Direct3D::D3D_DRIVER_TYPE_UNKNOWN;
@@ -40,6 +40,103 @@ pub struct RawFrame {
     pub height: u32,
 }
 
+/// A desktop-attached display output discovered via DXGI, usable as a capture source.
+#[derive(Debug, Clone)]
+pub struct OutputInfo {
+    pub adapter_index: u32,
+    pub output_index: u32,
+    pub device_name: String,
+    pub width: u32,
+    pub height: u32,
+    pub left: i32,
+    pub top: i32,
+    pub is_primary: bool,
+    pub adapter_name: String,
+}
+
+/// Parse a null-terminated UTF-16 fixed array (DXGI `DeviceName` / `Description`) to a String.
+fn utf16_to_string(buf: &[u16]) -> String {
+    String::from_utf16_lossy(&buf.iter().copied().take_while(|&c| c != 0).collect::<Vec<_>>())
+}
+
+/// Enumerate every desktop-attached display output across all adapters. Read-only and
+/// reusable by both the GUI picker and the capture loop. Never panics — on any DXGI error
+/// it returns whatever was discovered so far (possibly empty).
+pub fn enumerate_outputs() -> Vec<OutputInfo> {
+    let mut outputs = Vec::new();
+    let factory: IDXGIFactory1 = match unsafe { CreateDXGIFactory1() } {
+        Ok(f) => f,
+        Err(error) => {
+            warn!(error = %error, "CreateDXGIFactory1 failed during output enumeration");
+            return outputs;
+        }
+    };
+
+    let mut adapter_index = 0u32;
+    loop {
+        let adapter = match unsafe { factory.EnumAdapters1(adapter_index) } {
+            Ok(a) => a,
+            Err(_) => break,
+        };
+        let adapter_name = match unsafe { adapter.GetDesc1() } {
+            Ok(desc) => utf16_to_string(&desc.Description),
+            Err(_) => String::new(),
+        };
+
+        let mut output_index = 0u32;
+        loop {
+            let output = match unsafe { adapter.EnumOutputs(output_index) } {
+                Ok(o) => o,
+                Err(_) => break,
+            };
+            if let Ok(desc) = unsafe { output.GetDesc() } {
+                if desc.AttachedToDesktop.as_bool() {
+                    let r = desc.DesktopCoordinates;
+                    outputs.push(OutputInfo {
+                        adapter_index,
+                        output_index,
+                        device_name: utf16_to_string(&desc.DeviceName),
+                        width: (r.right - r.left).max(0) as u32,
+                        height: (r.bottom - r.top).max(0) as u32,
+                        left: r.left,
+                        top: r.top,
+                        is_primary: r.left == 0 && r.top == 0,
+                        adapter_name: adapter_name.clone(),
+                    });
+                }
+            }
+            output_index += 1;
+        }
+        adapter_index += 1;
+    }
+    outputs
+}
+
+/// Resolve which output (index into `outputs`) the capture loop should duplicate for
+/// `target`. `PrimaryAuto` picks the (0,0) output, else the first attached. `Output(name)`
+/// matches the `DeviceName`, falling back to the primary (with a warning) when not found —
+/// e.g. the virtual display driver was disabled. Returns `None` only when `outputs` is empty.
+fn resolve_target(outputs: &[OutputInfo], target: &CaptureTarget) -> Option<usize> {
+    if outputs.is_empty() {
+        return None;
+    }
+    let primary = outputs.iter().position(|o| o.is_primary).unwrap_or(0);
+    match target {
+        CaptureTarget::PrimaryAuto => Some(primary),
+        CaptureTarget::Output(name) => match outputs.iter().position(|o| &o.device_name == name) {
+            Some(i) => Some(i),
+            None => {
+                warn!(
+                    requested = %name,
+                    "Requested capture display not found (driver disabled/removed?) — \
+                     falling back to the primary output"
+                );
+                Some(primary)
+            }
+        },
+    }
+}
+
 /// Starts the DXGI Desktop Duplication capture loop on a dedicated blocking thread.
 /// Returns an `mpsc::Receiver<RawFrame>` that downstream pipeline stages can consume.
 pub fn start_capture(shared: SharedControl, adapter_index: u32) -> mpsc::Receiver<RawFrame> {
@@ -61,52 +158,83 @@ fn run_capture_loop(
     shared: SharedControl,
     adapter_index: u32,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    // --- Create DXGI factory and select the adapter driving the primary output ---
+    // --- Create DXGI factory and select the output to capture ---
     let factory: IDXGIFactory1 = unsafe { CreateDXGIFactory1()? };
 
-    let (adapter, used_adapter_index) = match unsafe { factory.EnumAdapters1(adapter_index) } {
-        Ok(a) => (a, adapter_index),
-        Err(error) => {
-            warn!(
-                requested = adapter_index,
-                error = %error,
-                "EnumAdapters1 failed for requested adapter index, falling back to adapter 0. \
-                 The encoder was selected from the originally-detected adapter's vendor, so on a \
-                 multi-GPU system this fallback may capture a different-vendor GPU than the \
-                 encoder expects — check that the captured adapter and codec below match."
-            );
-            let fallback = unsafe { factory.EnumAdapters1(0)? };
-            (fallback, 0)
-        }
-    };
-    let adapter_desc = unsafe { adapter.GetDesc1()? };
-    let adapter_name = String::from_utf16_lossy(
-        &adapter_desc
-            .Description
-            .iter()
-            .copied()
-            .take_while(|&c| c != 0)
-            .collect::<Vec<_>>(),
-    );
-    if used_adapter_index != adapter_index {
-        warn!(
-            requested = adapter_index,
-            using = used_adapter_index,
-            adapter = %adapter_name,
-            "Capturing on a fallback adapter that differs from the one GPU detection selected — \
-             verify the codec on the Stream tab matches this GPU's vendor"
+    // The capture adapter FOLLOWS the chosen output (which may differ from the
+    // encoder-detection adapter on a multi-GPU system); the encoder stays vendor-based
+    // and independent. `adapter_index` is only the last-resort fallback below.
+    let target = shared.capture_target.lock().clone();
+    let outputs = enumerate_outputs();
+    for o in &outputs {
+        info!(
+            device = %o.device_name,
+            adapter = %o.adapter_name,
+            width = o.width,
+            height = o.height,
+            primary = o.is_primary,
+            "Discovered display output"
         );
     }
-    info!(
-        adapter_index = used_adapter_index,
-        adapter = %adapter_name,
-        "Capture using adapter"
-    );
-    PIPELINE_STATS.lock().set_gpu_name(adapter_name);
 
-    // --- Select primary output (index 0) ---
-    let output: IDXGIOutput = unsafe { adapter.EnumOutputs(0)? };
-    info!("Selected primary display output");
+    let (adapter, output, adapter_name, capture_label) = match resolve_target(&outputs, &target) {
+        Some(idx) => {
+            let chosen = &outputs[idx];
+            let adapter = match unsafe { factory.EnumAdapters1(chosen.adapter_index) } {
+                Ok(a) => a,
+                Err(error) => {
+                    warn!(
+                        adapter_index = chosen.adapter_index,
+                        error = %error,
+                        "EnumAdapters1 failed for the chosen output's adapter — falling back to adapter 0"
+                    );
+                    unsafe { factory.EnumAdapters1(0)? }
+                }
+            };
+            let adapter_name = match unsafe { adapter.GetDesc1() } {
+                Ok(desc) => utf16_to_string(&desc.Description),
+                Err(_) => chosen.adapter_name.clone(),
+            };
+            let output: IDXGIOutput = unsafe { adapter.EnumOutputs(chosen.output_index)? };
+            let label = format!("{} ({}x{})", chosen.device_name, chosen.width, chosen.height);
+            info!(
+                device = %chosen.device_name,
+                adapter = %adapter_name,
+                width = chosen.width,
+                height = chosen.height,
+                "Capture: selected display output"
+            );
+            (adapter, output, adapter_name, label)
+        }
+        None => {
+            // No outputs enumerated (unusual) — preserve the legacy path exactly.
+            warn!("No display outputs enumerated — falling back to the detection adapter's first output");
+            let adapter = match unsafe { factory.EnumAdapters1(adapter_index) } {
+                Ok(a) => a,
+                Err(error) => {
+                    warn!(
+                        requested = adapter_index,
+                        error = %error,
+                        "EnumAdapters1 failed for requested adapter index, falling back to adapter 0"
+                    );
+                    unsafe { factory.EnumAdapters1(0)? }
+                }
+            };
+            let adapter_name = match unsafe { adapter.GetDesc1() } {
+                Ok(desc) => utf16_to_string(&desc.Description),
+                Err(_) => String::new(),
+            };
+            let output: IDXGIOutput = unsafe { adapter.EnumOutputs(0)? };
+            (adapter, output, adapter_name, "primary (auto)".to_string())
+        }
+    };
+
+    info!(adapter = %adapter_name, "Capture using adapter");
+    {
+        let mut stats = PIPELINE_STATS.lock();
+        stats.set_gpu_name(adapter_name);
+        stats.set_capture_display(capture_label);
+    }
 
     // --- Create D3D11 device on the selected adapter ---
     let mut device: Option<ID3D11Device> = None;
@@ -366,5 +494,52 @@ fn get_dirty_rect_count(
     } {
         Ok(()) => actual_size as usize / std::mem::size_of::<RECT>(),
         Err(_) => 0,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn out(name: &str, left: i32, top: i32) -> OutputInfo {
+        OutputInfo {
+            adapter_index: 0,
+            output_index: 0,
+            device_name: name.to_string(),
+            width: 1920,
+            height: 1080,
+            left,
+            top,
+            is_primary: left == 0 && top == 0,
+            adapter_name: "Test GPU".to_string(),
+        }
+    }
+
+    #[test]
+    fn primary_auto_picks_origin_output() {
+        let outputs = vec![out(r"\\.\DISPLAY2", 2560, 0), out(r"\\.\DISPLAY1", 0, 0)];
+        let idx = resolve_target(&outputs, &CaptureTarget::PrimaryAuto).unwrap();
+        assert_eq!(outputs[idx].device_name, r"\\.\DISPLAY1");
+    }
+
+    #[test]
+    fn known_output_is_selected() {
+        let outputs = vec![out(r"\\.\DISPLAY1", 0, 0), out(r"\\.\DISPLAY3", 2560, 0)];
+        let target = CaptureTarget::Output(r"\\.\DISPLAY3".to_string());
+        let idx = resolve_target(&outputs, &target).unwrap();
+        assert_eq!(outputs[idx].device_name, r"\\.\DISPLAY3");
+    }
+
+    #[test]
+    fn unknown_output_falls_back_to_primary() {
+        let outputs = vec![out(r"\\.\DISPLAY1", 0, 0), out(r"\\.\DISPLAY2", 2560, 0)];
+        let target = CaptureTarget::Output(r"\\.\DISPLAY9".to_string());
+        let idx = resolve_target(&outputs, &target).unwrap();
+        assert!(outputs[idx].is_primary);
+    }
+
+    #[test]
+    fn empty_outputs_returns_none() {
+        assert!(resolve_target(&[], &CaptureTarget::PrimaryAuto).is_none());
     }
 }

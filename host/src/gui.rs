@@ -13,7 +13,8 @@ use windows::Win32::System::Registry::{
     REG_SZ,
 };
 
-use crate::control::GuiControl;
+use crate::capture::{enumerate_outputs, OutputInfo};
+use crate::control::{CaptureTarget, GuiControl};
 use crate::logging::{session_log_path, session_log_text};
 use crate::settings::SettingsFile;
 use crate::stats::PIPELINE_STATS;
@@ -79,6 +80,7 @@ struct StatsSnapshot {
     codec_name: String,
     using_software_fallback: bool,
     gpu_name: String,
+    capture_display: String,
     transport_fps: f64,
     transport_bytes_sent: u64,
     transport_packets_sent: u64,
@@ -109,6 +111,7 @@ impl StatsSnapshot {
             codec_name: s.codec_name.clone(),
             using_software_fallback: s.using_software_fallback,
             gpu_name: s.gpu_name.clone(),
+            capture_display: s.capture_display.clone(),
             transport_fps: s.transport_fps,
             transport_bytes_sent: s.transport_bytes_sent,
             transport_packets_sent: s.transport_packets_sent,
@@ -123,6 +126,18 @@ impl StatsSnapshot {
             gpu_temp_c: s.gpu_temp_c,
         }
     }
+}
+
+const CAPTURE_AUTO_LABEL: &str = "Auto (primary)";
+
+/// Combo label for an enumerated output, e.g. `DISPLAY3 · 2732×2048 · +2560,0 · primary`.
+fn format_output_label(o: &OutputInfo) -> String {
+    let short = o.device_name.rsplit('\\').next().unwrap_or(&o.device_name);
+    let primary = if o.is_primary { " · primary" } else { "" };
+    format!(
+        "{} · {}×{} · +{},{}{}",
+        short, o.width, o.height, o.left, o.top, primary
+    )
 }
 
 const ENCODER_AUTO_LABEL: &str = "Auto";
@@ -143,6 +158,10 @@ pub struct AnalyzerApp {
     settings_target_error: Option<String>,
     settings_start_on_boot: bool,
     settings_encoder_choice: String, // display label, e.g. "Auto" or "NVENC"
+    /// DXGI `DeviceName` of the chosen capture display; empty string means auto (primary).
+    settings_capture_display: String,
+    /// Cached enumerated outputs for the capture-display picker; refreshed on demand.
+    available_outputs: Vec<OutputInfo>,
     show_qr_modal: bool,
     qr_cache: Option<(String, QrCode)>,
 }
@@ -210,6 +229,21 @@ impl AnalyzerApp {
             ENCODER_AUTO_LABEL.to_string()
         };
 
+        // Apply the persisted capture display into SharedControl so the next stream restart
+        // honors it (same model as encoder_override — the first pipeline run started before
+        // the GUI loaded settings).
+        let settings_capture_display = match persisted.capture_display.as_deref() {
+            Some(name) if !name.is_empty() => {
+                *control.shared.capture_target.lock() = CaptureTarget::Output(name.to_string());
+                name.to_string()
+            }
+            _ => {
+                *control.shared.capture_target.lock() = CaptureTarget::PrimaryAuto;
+                String::new()
+            }
+        };
+        let available_outputs = enumerate_outputs();
+
         let start_on_boot = if persisted.start_on_boot != read_startup_registry() {
             // Persisted state disagrees with the registry — trust the registry as ground truth.
             read_startup_registry()
@@ -226,6 +260,8 @@ impl AnalyzerApp {
             settings_target_error: None,
             settings_start_on_boot: start_on_boot,
             settings_encoder_choice: encoder_choice,
+            settings_capture_display,
+            available_outputs,
             show_qr_modal: false,
             qr_cache: None,
         }
@@ -267,6 +303,11 @@ impl AnalyzerApp {
                 Some(self.settings_target_ip.trim().to_string())
             },
             encoder_override,
+            capture_display: if self.settings_capture_display.is_empty() {
+                None
+            } else {
+                Some(self.settings_capture_display.clone())
+            },
             start_on_boot: self.settings_start_on_boot,
         };
         file.save();
@@ -452,6 +493,7 @@ impl AnalyzerApp {
                 ui.set_width(ui.available_width());
                 section_header(ui, "Encoder");
                 stat_row(ui, "GPU", value_or_unknown(&snap.gpu_name));
+                stat_row(ui, "Capture display", value_or_unknown(&snap.capture_display));
                 stat_row(ui, "Codec", value_or_unknown(&snap.codec_name));
                 stat_row(
                     ui,
@@ -683,6 +725,70 @@ impl AnalyzerApp {
                 );
                 self.persist_settings();
             }
+
+            ui.add_space(12.0);
+
+            // --- Capture display picker ------------------------------------------
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new("Capture display").color(TEXT).size(13.0));
+                if ghost_button(ui, "Refresh", true).clicked() {
+                    self.available_outputs = enumerate_outputs();
+                    info!(
+                        count = self.available_outputs.len(),
+                        "Re-enumerated display outputs"
+                    );
+                }
+            });
+            let outputs = self.available_outputs.clone();
+            let prev_display = self.settings_capture_display.clone();
+            let selected_text = if self.settings_capture_display.is_empty() {
+                CAPTURE_AUTO_LABEL.to_string()
+            } else if let Some(o) = outputs
+                .iter()
+                .find(|o| o.device_name == self.settings_capture_display)
+            {
+                format_output_label(o)
+            } else {
+                format!("{} (not connected)", self.settings_capture_display)
+            };
+            egui::ComboBox::from_id_salt("capture_display_combo")
+                .selected_text(selected_text)
+                .width(280.0)
+                .show_ui(ui, |ui| {
+                    if ui
+                        .selectable_label(
+                            self.settings_capture_display.is_empty(),
+                            CAPTURE_AUTO_LABEL,
+                        )
+                        .clicked()
+                    {
+                        self.settings_capture_display = String::new();
+                    }
+                    for o in &outputs {
+                        let selected = self.settings_capture_display == o.device_name;
+                        if ui.selectable_label(selected, format_output_label(o)).clicked() {
+                            self.settings_capture_display = o.device_name.clone();
+                        }
+                    }
+                });
+            if self.settings_capture_display != prev_display {
+                *self.control.shared.capture_target.lock() =
+                    if self.settings_capture_display.is_empty() {
+                        CaptureTarget::PrimaryAuto
+                    } else {
+                        CaptureTarget::Output(self.settings_capture_display.clone())
+                    };
+                info!(
+                    display = %self.settings_capture_display,
+                    "Capture display set — takes effect on next stream restart"
+                );
+                self.persist_settings();
+            }
+            ui.label(
+                egui::RichText::new("Applies on next Restart stream")
+                    .color(MUTED)
+                    .size(11.0),
+            );
 
             ui.add_space(12.0);
 
