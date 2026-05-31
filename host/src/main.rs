@@ -46,6 +46,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "Session log file initialized"
     );
 
+    // Never leave a virtual display attached across runs. If a previous run crashed or was
+    // force-killed while streaming the virtual extended display, the VDD device is still enabled
+    // and shows up as a phantom monitor. Disabling it unconditionally at startup guarantees the
+    // managed display only ever exists while EternalMonitor is actively using it.
+    vdd::disable();
+
+    // Belt-and-suspenders: a panic anywhere (GUI, supervisor, pipeline threads) must still tear
+    // the virtual display down before the process unwinds, so a crash can't strand a phantom
+    // monitor. The default panic hook still runs afterwards for logging/backtrace.
+    {
+        let default_hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            vdd::disable();
+            default_hook(info);
+        }));
+    }
+
     let listen_port: u16 = std::env::args()
         .nth(1)
         .and_then(|s| s.parse().ok())
@@ -73,7 +90,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     info!("══════════════════════════════════");
-    info!("  EternalMonitor v0.1.1");
+    info!("  EternalMonitor v0.1.2");
     info!("  GPU:     {} ({})", gpu_info.name, gpu_info.vendor);
     info!("  VRAM:    {} MB", gpu_info.dedicated_vram_mb);
     info!("  Encoder: {}", gpu_info.codec_display_name);

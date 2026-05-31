@@ -1,7 +1,7 @@
 # EternalMonitor release packaging script
 # Usage: .\scripts\package.ps1
 
-$version = "v0.1.1-mirror"
+$version = "v0.1.2-mirror"
 $distDir = "dist"
 $zipName = "EternalMonitor-$version-windows.zip"
 

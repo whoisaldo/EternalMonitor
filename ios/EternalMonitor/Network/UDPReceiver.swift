@@ -156,6 +156,7 @@ final class UDPReceiver {
             seq: header.seq,
             index: header.fragmentIndex,
             count: header.fragmentCount,
+            epoch: header.streamEpoch,
             payload: payload
         )
     }
@@ -174,7 +175,7 @@ final class UDPReceiver {
 ///   [4..6]  fragment_index: u16
 ///   [6..8]  fragment_count: u16
 ///   [8..12] payload_len: u32
-///   [12..16] reserved (zero)
+///   [12..16] stream_epoch: u32  (older hosts send 0 here; treated as "no epoch")
 struct FragmentHeader {
     static let size = 16
 
@@ -182,6 +183,7 @@ struct FragmentHeader {
     let fragmentIndex: UInt16
     let fragmentCount: UInt16
     let payloadLen: UInt32
+    let streamEpoch: UInt32
 
     init?(data: Data) {
         guard data.count >= Self.size else { return nil }
@@ -189,5 +191,6 @@ struct FragmentHeader {
         fragmentIndex = data.withUnsafeBytes { $0.loadUnaligned(fromByteOffset: 4, as: UInt16.self).littleEndian }
         fragmentCount = data.withUnsafeBytes { $0.loadUnaligned(fromByteOffset: 6, as: UInt16.self).littleEndian }
         payloadLen = data.withUnsafeBytes { $0.loadUnaligned(fromByteOffset: 8, as: UInt32.self).littleEndian }
+        streamEpoch = data.withUnsafeBytes { $0.loadUnaligned(fromByteOffset: 12, as: UInt32.self).littleEndian }
     }
 }

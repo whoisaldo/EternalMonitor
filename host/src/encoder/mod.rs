@@ -7,7 +7,7 @@ use std::sync::atomic::Ordering;
 use std::time::Instant;
 
 use tokio::sync::mpsc;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::capture::RawFrame;
 use crate::control::SharedControl;
@@ -102,6 +102,11 @@ fn run_encode_loop(
     let mut encoder_state: Option<EncoderState> = None;
     let mut rx = rx;
     let mut frames_since_last_idr: u64 = 0;
+    // Bounded retries for the AMF startup case where a keyframe is emitted before any SPS/PPS are
+    // available (empty extradata + no inline parameter sets). We nudge another IDR a few times so
+    // a subsequent keyframe carrying inline parameter sets can recover, instead of leaving the
+    // iPad unable to build a format description.
+    let mut amf_startup_idr_retries: u8 = 0;
 
     // Guarantee the very first frame of every pipeline is an IDR for all encoders, so the
     // iPad never sits in `waitingForSyncSample` after a connect or pipeline restart.
@@ -212,11 +217,28 @@ fn run_encode_loop(
                         is_keyframe,
                     );
 
+                    // AMF startup safety net: a keyframe went out but we still have no cached
+                    // SPS/PPS (empty extradata and none inline), so the iPad can't build a format
+                    // description. Nudge another IDR a few times — a later keyframe may carry the
+                    // parameter sets inline and recover the stream.
+                    if is_keyframe
+                        && is_amf_encoder(&encoder_name)
+                        && encoder.h264.needs_parameter_sets()
+                        && amf_startup_idr_retries < 3
+                    {
+                        amf_startup_idr_retries += 1;
+                        warn!(
+                            retry = amf_startup_idr_retries,
+                            "AMF keyframe still lacks SPS/PPS — forcing another IDR to recover"
+                        );
+                        shared.force_next_idr.store(true, Ordering::SeqCst);
+                    }
+
                     PIPELINE_STATS
                         .lock()
                         .record_encode(encode_us, nal_data.len(), current_bitrate);
 
-                    info!(
+                    debug!(
                         frame = raw_frame.frame_number,
                         encode_us,
                         nal_bytes = nal_data.len(),
@@ -761,13 +783,19 @@ fn normalize_h264_payload(
     let has_sps = parsed.units.iter().any(|unit| nal_type(unit) == Some(7));
     let has_pps = parsed.units.iter().any(|unit| nal_type(unit) == Some(8));
     let is_amf = is_amf_encoder(encoder_name);
+    // AMF's forced periodic intra (every AMF_FORCED_INTRA_PERIOD frames) can come back as an
+    // all-I-slice access unit that is NOT an IDR — NAL type 1, not 5 — so `packet_is_key` and
+    // `contains_idr` are both false. The iPad still treats an intra-only access unit as a
+    // random-access point and recreates its decoder on it, so it must carry SPS/PPS too;
+    // otherwise a decoder that lost its parameter sets can never resync on these frames.
+    let intra_only = is_amf && units_are_intra_only(&parsed.units);
 
     // For AMF, prepend cached SPS/PPS on every random-access access unit, even if the encoder
     // already emitted them inline. iPad VideoToolbox is sensitive to GOP-boundary parameter
     // freshness; the iPad now tears down its decoder on every IDR so redundant SPS/PPS are safe.
     // For other encoders, only prepend if the keyframe was missing parameter sets.
     let amf_startup_inject = is_amf && (!has_sps || !has_pps) && state.packet_count == 0;
-    let amf_idr_redundant_prepend = is_amf && (packet_is_key || contains_idr);
+    let amf_idr_redundant_prepend = is_amf && (packet_is_key || contains_idr || intra_only);
     state.packet_count += 1;
 
     let should_prefix_parameter_sets = amf_idr_redundant_prepend
@@ -1071,18 +1099,22 @@ fn diagnostic_capture_path() -> PathBuf {
 }
 
 fn diagnostic_dir() -> PathBuf {
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(dir) = exe.parent() {
-            return dir.join("diagnostics");
-        }
+    // Write under %APPDATA% so the capture works even when the app is installed read-only under
+    // Program Files (the exe directory is not writable by the non-elevated host there).
+    if let Some(dir) = crate::settings::app_data_dir() {
+        return dir.join("diagnostics");
     }
-    PathBuf::from("diagnostics")
+    std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(|dir| dir.join("diagnostics")))
+        .unwrap_or_else(|| PathBuf::from("diagnostics"))
 }
 
 fn find_ffmpeg_exe() -> Option<PathBuf> {
-    let bundled = diagnostic_dir()
-        .parent()
-        .map(|dir| dir.join("ffmpeg.exe"))
+    // ffmpeg.exe is bundled next to the host exe; reading it is fine even under Program Files.
+    let bundled = std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(|dir| dir.join("ffmpeg.exe")))
         .filter(|path| path.is_file());
     if bundled.is_some() {
         return bundled;
@@ -1155,10 +1187,15 @@ fn contains_nal_type(data: &[u8], target: u8) -> bool {
 }
 
 fn access_unit_is_intra_only(data: &[u8]) -> bool {
-    let units = parse_annex_b_units(data);
+    units_are_intra_only(&parse_annex_b_units(data))
+}
+
+/// True if the access unit contains at least one VCL slice and every VCL slice is intra
+/// (IDR, I, or SI) — i.e. it is a random-access point even if not a NAL-type-5 IDR.
+fn units_are_intra_only(units: &[Vec<u8>]) -> bool {
     let mut saw_vcl = false;
 
-    for unit in &units {
+    for unit in units {
         match nal_type(unit) {
             Some(5) => saw_vcl = true,
             Some(1..=4) => {
@@ -1397,6 +1434,31 @@ mod tests {
             vec![
                 0, 0, 0, 1, 0x67, 0x42, 0x00, 0x1E, 0, 0, 0, 1, 0x68, 0xCE, 0, 0, 0, 1, 0x65, 0x88,
                 0x84
+            ]
+        );
+    }
+
+    #[test]
+    fn amf_prepends_parameter_sets_on_forced_non_idr_intra_access_unit() {
+        // AMF's forced periodic intra can be an all-I-slice that is NOT an IDR (NAL type 1,
+        // slice_type I). It is still a random-access point, so it must carry SPS/PPS even though
+        // packet_is_key is false and there is no NAL type 5.
+        let extradata = [
+            1, 66, 0, 30, 0xFF, 0xE1, 0x00, 0x04, 0x67, 0x42, 0x00, 0x1E, 0x01, 0x00, 0x02, 0x68,
+            0xCE,
+        ];
+        // 0x41 = NAL type 1; 0xB8 decodes to an I slice (see access_unit_is_intra_only tests).
+        let payload = [0, 0, 0, 1, 0x41, 0xB8];
+
+        let mut state = H264BitstreamState::default();
+        state.refresh_parameter_sets_from_extradata(Some(extradata.to_vec()));
+        state.packet_count = 90; // mid-stream, not the startup-inject path
+
+        let normalized = normalize_h264_payload(&payload, false, &mut state, "h264_amf");
+        assert_eq!(
+            normalized,
+            vec![
+                0, 0, 0, 1, 0x67, 0x42, 0x00, 0x1E, 0, 0, 0, 1, 0x68, 0xCE, 0, 0, 0, 1, 0x41, 0xB8
             ]
         );
     }

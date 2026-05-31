@@ -6,7 +6,7 @@ use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 use windows::core::Interface;
 
-use crate::control::{CaptureTarget, SharedControl};
+use crate::control::{CaptureTarget, SharedControl, VddStatus};
 use crate::stats::PIPELINE_STATS;
 use windows::Win32::Foundation::RECT;
 use windows::Win32::Graphics::Direct3D::D3D_DRIVER_TYPE_UNKNOWN;
@@ -24,6 +24,12 @@ use windows::Win32::Graphics::Dxgi::{
 
 const ACQUIRE_TIMEOUT_MS: u32 = 16;
 const FPS_WINDOW: usize = 60;
+
+/// When the captured display is static (or a freshly-enabled extended display is still blank),
+/// DXGI delivers no new frames. If a client is connected and we haven't sent anything for this
+/// long, resend the last frame so the encoder emits the pending IDR and the iPad gets a sync
+/// sample instead of timing out on a black screen.
+const IDLE_KEEPALIVE: Duration = Duration::from_millis(750);
 
 fn frame_budget_for(target_fps: u32) -> Duration {
     let fps = target_fps.max(1) as u64;
@@ -139,18 +145,48 @@ fn resolve_target(outputs: &[OutputInfo], target: &CaptureTarget) -> Option<usiz
     }
 }
 
-/// How long to wait for the virtual display to attach after enabling its driver.
-const VDD_ATTACH_TIMEOUT: Duration = Duration::from_secs(6);
+/// How long to wait for the virtual display to attach after enabling its driver. Overridable
+/// via `ETERNAL_VDD_TIMEOUT_SECS` for machines whose driver loads slowly.
+const VDD_ATTACH_TIMEOUT_DEFAULT_SECS: u64 = 10;
 const VDD_POLL_INTERVAL: Duration = Duration::from_millis(120);
 
+fn vdd_attach_timeout() -> Duration {
+    std::env::var("ETERNAL_VDD_TIMEOUT_SECS")
+        .ok()
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .filter(|&secs| secs > 0)
+        .map(Duration::from_secs)
+        .unwrap_or(Duration::from_secs(VDD_ATTACH_TIMEOUT_DEFAULT_SECS))
+}
+
+/// Is an iPad currently registered as a receiver? The virtual display is brought up only while
+/// a client is connected, so an idle PC never shows a phantom second monitor.
+fn client_connected(shared: &SharedControl) -> bool {
+    let addr = *shared.target_addr.lock();
+    !addr.ip().is_unspecified() && addr.port() != 0
+}
+
 /// Reconcile the virtual display device to the requested target and return the concrete
-/// target to capture. `VirtualExtended` enables the bundled driver, waits for its output to
-/// attach, and returns it as an `Output(name)`; any other target disables the driver so no
-/// phantom monitor lingers. Falls back to `PrimaryAuto` if the virtual display can't be
-/// brought up.
-fn reconcile_virtual_display(target: &CaptureTarget) -> CaptureTarget {
+/// target to capture. `VirtualExtended` enables the bundled driver **only once an iPad is
+/// connected**, waits for a genuinely-new output to attach, and returns it as an `Output(name)`;
+/// any other target (and the no-client / failure / timeout cases) disables the driver so no
+/// phantom monitor lingers, falling back to `PrimaryAuto`.
+fn reconcile_virtual_display(target: &CaptureTarget, shared: &SharedControl) -> CaptureTarget {
     match target {
         CaptureTarget::VirtualExtended => {
+            // Defer enabling the VDD until an iPad actually connects. The transport restarts the
+            // pipeline on the first receiver registration, so this runs again with a connected
+            // client at that point and the display comes up then — never while the PC sits idle.
+            if !client_connected(shared) {
+                info!(
+                    "Extended display selected but no iPad has connected yet — leaving the \
+                     virtual display off and mirroring the primary display until a client registers"
+                );
+                crate::vdd::disable();
+                *shared.vdd_status.lock() = VddStatus::WaitingForClient;
+                return CaptureTarget::PrimaryAuto;
+            }
+
             let before: Vec<String> = enumerate_outputs()
                 .into_iter()
                 .map(|o| o.device_name)
@@ -160,34 +196,37 @@ fn reconcile_virtual_display(target: &CaptureTarget) -> CaptureTarget {
                     "Virtual display could not be enabled (installer task missing?) — \
                      capturing the primary display instead"
                 );
+                *shared.vdd_status.lock() = VddStatus::Failed;
                 return CaptureTarget::PrimaryAuto;
             }
-            let deadline = Instant::now() + VDD_ATTACH_TIMEOUT;
+            let deadline = Instant::now() + vdd_attach_timeout();
             while Instant::now() < deadline {
                 std::thread::sleep(VDD_POLL_INTERVAL);
                 let now = enumerate_outputs();
-                let non_primary: Vec<&OutputInfo> =
-                    now.iter().filter(|o| !o.is_primary).collect();
-                if let Some(chosen) = non_primary
-                    .iter()
-                    .find(|o| !before.contains(&o.device_name))
-                    .or_else(|| non_primary.first())
-                {
+                // Accept ONLY a genuinely new non-primary output (the freshly-enabled VDD). Never
+                // grab a pre-existing real second monitor that was attached before we enabled it.
+                if let Some(chosen) = pick_new_virtual_output(&before, &now) {
                     info!(
                         device = %chosen.device_name,
                         width = chosen.width,
                         height = chosen.height,
                         "Virtual display attached — capturing it"
                     );
+                    *shared.vdd_status.lock() = VddStatus::Active;
                     return CaptureTarget::Output(chosen.device_name.clone());
                 }
             }
             warn!("Virtual display did not attach in time — capturing the primary display instead");
+            // enable() succeeded but nothing attached: turn it back off so we don't strand a
+            // half-enabled device as a phantom monitor.
+            crate::vdd::disable();
+            *shared.vdd_status.lock() = VddStatus::Failed;
             CaptureTarget::PrimaryAuto
         }
         other => {
             // Any non-virtual target: ensure the virtual display is off.
             crate::vdd::disable();
+            *shared.vdd_status.lock() = VddStatus::Inactive;
             other.clone()
         }
     }
@@ -222,8 +261,9 @@ fn run_capture_loop(
     // and independent. `adapter_index` is only the last-resort fallback below.
     let requested_target = shared.capture_target.lock().clone();
     // Turn the virtual display on/off to match the request before enumerating, so the
-    // managed virtual output only exists while we're capturing it.
-    let target = reconcile_virtual_display(&requested_target);
+    // managed virtual output only exists while we're capturing it (and only while an iPad
+    // is connected).
+    let target = reconcile_virtual_display(&requested_target, &shared);
     let outputs = enumerate_outputs();
     for o in &outputs {
         info!(
@@ -322,46 +362,40 @@ fn run_capture_loop(
     info!("Desktop duplication active");
 
     // --- Query desktop dimensions from duplication ---
+    // These are `mut` because a mid-stream resolution change surfaces as ACCESS_LOST; the error
+    // handler re-reads the geometry and rebuilds the staging texture / CPU buffer below.
     let dupl_desc = unsafe { duplication.GetDesc() };
-    let tex_width = dupl_desc.ModeDesc.Width;
-    let tex_height = dupl_desc.ModeDesc.Height;
+    let mut tex_width = dupl_desc.ModeDesc.Width;
+    let mut tex_height = dupl_desc.ModeDesc.Height;
     info!(
         width = tex_width,
         height = tex_height,
         "Desktop duplication dimensions"
     );
+    if tex_width == 0 || tex_height == 0 {
+        return Err(format!(
+            "Desktop duplication reported invalid dimensions {tex_width}x{tex_height}"
+        )
+        .into());
+    }
 
     // --- Create staging texture for CPU readback (reused every frame) ---
-    let staging_desc = D3D11_TEXTURE2D_DESC {
-        Width: tex_width,
-        Height: tex_height,
-        MipLevels: 1,
-        ArraySize: 1,
-        Format: DXGI_FORMAT_B8G8R8A8_UNORM,
-        SampleDesc: DXGI_SAMPLE_DESC {
-            Count: 1,
-            Quality: 0,
-        },
-        Usage: D3D11_USAGE_STAGING,
-        BindFlags: 0,
-        CPUAccessFlags: D3D11_CPU_ACCESS_READ.0 as u32,
-        MiscFlags: Default::default(),
-    };
-    let staging_texture: ID3D11Texture2D = unsafe {
+    let mut staging_texture: ID3D11Texture2D = unsafe {
         let mut tex = None;
-        device.CreateTexture2D(&staging_desc, None, Some(&mut tex))?;
+        device.CreateTexture2D(&make_staging_desc(tex_width, tex_height), None, Some(&mut tex))?;
         tex.expect("CreateTexture2D returned None")
     };
     info!("Staging texture created for CPU readback");
 
-    let row_bytes = (tex_width * 4) as usize;
-    let frame_size = row_bytes * tex_height as usize;
-    let mut pixel_buf: Vec<u8> = vec![0u8; frame_size];
+    let mut row_bytes = (tex_width * 4) as usize;
+    let mut pixel_buf: Vec<u8> = vec![0u8; row_bytes * tex_height as usize];
 
     // --- Capture loop state ---
     let mut frame_number: u64 = 0;
     let mut frame_timestamps: VecDeque<Instant> = VecDeque::with_capacity(FPS_WINDOW + 1);
     let mut dirty_rect_buf: Vec<RECT> = Vec::with_capacity(64);
+    // Time of the last frame handed downstream — drives the idle keepalive (T1d).
+    let mut last_send = Instant::now();
 
     // Desktop Duplication never bakes the mouse cursor into the desktop image — it sends
     // the position every frame and the shape only when it changes. Cache the shape and
@@ -428,7 +462,7 @@ fn run_capture_loop(
                     0.0
                 };
 
-                info!(
+                debug!(
                     frame = frame_number,
                     dirty_rects = dirty_count,
                     acquire_us = acquire_us,
@@ -525,6 +559,7 @@ fn run_capture_loop(
                     info!("Channel closed, stopping capture");
                     break;
                 }
+                last_send = now;
             }
             Err(e) if e.code() == DXGI_ERROR_WAIT_TIMEOUT => {
                 // Desktop unchanged — not an error.
@@ -532,11 +567,61 @@ fn run_capture_loop(
                     info!("Capture loop stopping after timeout on running=false");
                     break;
                 }
+                // Idle keepalive: a static or blank (freshly-enabled) display produces no new
+                // frames, so the encoder would never see a frame to turn into the startup IDR and
+                // the iPad would sit on a black screen until it times out. While a client is
+                // connected, resend the last captured image so the encoder emits the pending IDR
+                // and the stream stays alive. pixel_buf holds the last composited frame (zeroed
+                // black before the first real frame, which is still a valid keyframe).
+                if client_connected(&shared) && last_send.elapsed() >= IDLE_KEEPALIVE {
+                    frame_number += 1;
+                    let now = Instant::now();
+                    PIPELINE_STATS.lock().record_capture(tex_width, tex_height);
+                    let raw_frame = RawFrame {
+                        frame_number,
+                        timestamp: now,
+                        data: pixel_buf.clone(),
+                        width: tex_width,
+                        height: tex_height,
+                    };
+                    if tx.blocking_send(raw_frame).is_err() {
+                        info!("Channel closed, stopping capture");
+                        break;
+                    }
+                    last_send = now;
+                }
                 continue;
             }
             Err(e) if e.code() == DXGI_ERROR_ACCESS_LOST => {
                 warn!("Desktop duplication access lost — reinitializing");
                 duplication = unsafe { output1.DuplicateOutput(&device)? };
+                // A resolution/topology change also surfaces as ACCESS_LOST. Re-read the
+                // duplication geometry and rebuild the staging texture + CPU buffer if it changed,
+                // otherwise CopyResource silently no-ops on a size mismatch and the iPad freezes.
+                let new_desc = unsafe { duplication.GetDesc() };
+                let (new_w, new_h) = (new_desc.ModeDesc.Width, new_desc.ModeDesc.Height);
+                if new_w != 0 && new_h != 0 && (new_w != tex_width || new_h != tex_height) {
+                    info!(
+                        old_width = tex_width,
+                        old_height = tex_height,
+                        new_width = new_w,
+                        new_height = new_h,
+                        "Capture resolution changed — rebuilding staging resources"
+                    );
+                    tex_width = new_w;
+                    tex_height = new_h;
+                    row_bytes = (tex_width * 4) as usize;
+                    pixel_buf = vec![0u8; row_bytes * tex_height as usize];
+                    staging_texture = unsafe {
+                        let mut tex = None;
+                        device.CreateTexture2D(
+                            &make_staging_desc(tex_width, tex_height),
+                            None,
+                            Some(&mut tex),
+                        )?;
+                        tex.expect("CreateTexture2D returned None")
+                    };
+                }
                 continue;
             }
             Err(e) => {
@@ -558,6 +643,36 @@ fn run_capture_loop(
     }
 
     Ok(())
+}
+
+/// Choose the freshly-attached virtual output: the first non-primary output whose device name was
+/// not present in `before` (the snapshot taken just before enabling the VDD). Returns `None` when
+/// no new output has appeared yet, so the caller keeps polling instead of grabbing a pre-existing
+/// real second monitor.
+fn pick_new_virtual_output<'a>(before: &[String], now: &'a [OutputInfo]) -> Option<&'a OutputInfo> {
+    now.iter()
+        .filter(|o| !o.is_primary)
+        .find(|o| !before.contains(&o.device_name))
+}
+
+/// Build the BGRA staging-texture descriptor for CPU readback at the given dimensions. Factored
+/// out so the capture loop can recreate it after a mid-stream resolution change.
+fn make_staging_desc(width: u32, height: u32) -> D3D11_TEXTURE2D_DESC {
+    D3D11_TEXTURE2D_DESC {
+        Width: width,
+        Height: height,
+        MipLevels: 1,
+        ArraySize: 1,
+        Format: DXGI_FORMAT_B8G8R8A8_UNORM,
+        SampleDesc: DXGI_SAMPLE_DESC {
+            Count: 1,
+            Quality: 0,
+        },
+        Usage: D3D11_USAGE_STAGING,
+        BindFlags: 0,
+        CPUAccessFlags: D3D11_CPU_ACCESS_READ.0 as u32,
+        MiscFlags: Default::default(),
+    }
 }
 
 /// Query the actual number of dirty rectangles from DXGI for this frame.
@@ -824,5 +939,34 @@ mod tests {
     #[test]
     fn empty_outputs_returns_none() {
         assert!(resolve_target(&[], &CaptureTarget::PrimaryAuto).is_none());
+    }
+
+    #[test]
+    fn picks_only_a_genuinely_new_non_primary_output() {
+        // A real second monitor existed before we enabled the VDD; it must NOT be chosen.
+        let before = vec![r"\\.\DISPLAY1".to_string(), r"\\.\DISPLAY2".to_string()];
+        let now = vec![
+            out(r"\\.\DISPLAY1", 0, 0),
+            out(r"\\.\DISPLAY2", 2560, 0),
+            out(r"\\.\DISPLAY3", -1920, 0), // freshly-attached VDD
+        ];
+        let chosen = pick_new_virtual_output(&before, &now).expect("new output");
+        assert_eq!(chosen.device_name, r"\\.\DISPLAY3");
+    }
+
+    #[test]
+    fn returns_none_when_only_preexisting_second_monitor_present() {
+        // The VDD hasn't attached yet — must keep polling, never grab the existing DISPLAY2.
+        let before = vec![r"\\.\DISPLAY1".to_string(), r"\\.\DISPLAY2".to_string()];
+        let now = vec![out(r"\\.\DISPLAY1", 0, 0), out(r"\\.\DISPLAY2", 2560, 0)];
+        assert!(pick_new_virtual_output(&before, &now).is_none());
+    }
+
+    #[test]
+    fn ignores_a_new_primary_output() {
+        // Even if a new output appears, the primary (origin) one is never the virtual display.
+        let before: Vec<String> = vec![];
+        let now = vec![out(r"\\.\DISPLAY1", 0, 0)];
+        assert!(pick_new_virtual_output(&before, &now).is_none());
     }
 }

@@ -1,7 +1,7 @@
 # EternalMonitor
 
-[![Version](https://img.shields.io/badge/version-v0.1.1--mirror-e8ff47?style=flat&labelColor=111)](https://github.com/whoisaldo/EternalMonitor/releases/tag/v0.1.1-mirror)
-[![Download](https://img.shields.io/badge/download-windows-blue?style=flat&labelColor=111)](https://github.com/whoisaldo/EternalMonitor/releases/download/v0.1.1-mirror/EternalMonitor-v0.1.1-mirror-windows.zip)
+[![Version](https://img.shields.io/badge/version-v0.1.2--mirror-e8ff47?style=flat&labelColor=111)](https://github.com/whoisaldo/EternalMonitor/releases/tag/v0.1.2-mirror)
+[![Download](https://img.shields.io/badge/download-installer-blue?style=flat&labelColor=111)](https://github.com/whoisaldo/EternalMonitor/releases/download/v0.1.2-mirror/EternalMonitor-Setup.exe)
 [![Website](https://img.shields.io/badge/website-eternalmonitor.dev-e8ff47?style=flat&labelColor=111)](https://eternalmonitor.dev)
 
 **Website:** [eternalmonitor.dev](https://eternalmonitor.dev)
@@ -15,7 +15,7 @@ This repo currently contains a working Windows host capture/encode/transport pat
 Implemented now:
 
 - Windows host captures a **selectable display output** (primary by default) with DXGI Desktop Duplication
-- Capture-display picker in the Settings tab — stream any output, including a **virtual extended display** created by a signed Indirect Display Driver, so the iPad can be a true second screen instead of only a mirror
+- Capture-display picker in the Settings tab — stream any output, including a **virtual extended display** created by a signed Indirect Display Driver, so the iPad can be a true second screen instead of only a mirror. The virtual display is brought up **on demand, only while an iPad is connected**, and removed on exit — no phantom monitor when idle
 - Host converts BGRA to YUV420P and can select hardware H.264 encoders per GPU vendor
 - Host advertises an mDNS/DNS-SD service and streams frames over UDP on port `9876`
 - iPad app receives fragmented UDP datagrams, reassembles `FramePacket` payloads, decodes with VideoToolbox, and renders with Metal
@@ -32,8 +32,8 @@ Not done yet:
 
 Known caveat:
 
-- The iPad "Scan network" path may fail to find the host even when direct IP connect works. Treat discovery as incomplete and use manual IP entry when needed.
-- NVIDIA is the current known-good encode/decode path. AMD and Intel encoder paths are present but still being validated against the iPad VideoToolbox decoder.
+- The iPad "Scan network" path may fail to find the host even when direct IP connect works. Treat discovery as incomplete and use manual IP entry (or the QR code) when needed.
+- NVIDIA (NVENC), AMD (AMF), and Intel (QSV) encode paths are implemented and hardened for the iPad VideoToolbox decoder; AMD is the current focus of beta testing. If a hardware encoder can't open, the host falls back to CPU (libx264) and shows a warning banner on the Stream tab.
 
 ## How it works
 
@@ -105,7 +105,7 @@ Tester-facing instructions live in [scripts/QUICKSTART.txt](scripts/QUICKSTART.t
 
 - If the iPad says no complete frame was reassembled, make sure both the Windows host and the iPad app were rebuilt from the same revision. The UDP fragment header changed in the working transport fix.
 - If scan finds nothing, try direct IP connect first. Discovery failure does not necessarily mean streaming is broken.
-- If you're testing on AMD, use the updated `v0.1.1-mirror` host build. The AMF path now includes an April 4, 2026 H.264/VideoToolbox compatibility fix and extra diagnostics for first-packet format mismatches.
+- If you're testing on AMD, use the latest `v0.1.2-mirror` build. The AMF path prepends fresh SPS/PPS on every random-access frame (including forced non-IDR intra frames), recovers the startup keyframe if parameter sets aren't ready, and writes a first-120-packet capture to `%APPDATA%\EternalMonitor\diagnostics\` for offline inspection.
 - If the host binary fails to rebuild on Windows with access denied for `eternal-host.exe`, close the running GUI process first.
 
 ## Reference docs

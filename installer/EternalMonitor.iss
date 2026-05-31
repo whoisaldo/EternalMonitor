@@ -66,9 +66,11 @@ Source: "{#StagingDir}\QUICKSTART.txt";          DestDir: "{app}"; Flags: ignore
 #ifdef IncludeDriver
 ; Third-party Virtual Display Driver setup, bundled so the tester never touches GitHub.
 Source: "{#StagingDir}\driver\*"; DestDir: "{app}\driver"; Flags: ignoreversion recursesubdirs
-; Scripts that register/remove the scheduled tasks the host uses to toggle the display.
+; Scripts that register/remove the scheduled tasks the host uses to toggle the display, plus the
+; toggle script the tasks invoke (it resolves the VDD device at trigger time).
 Source: "scripts\vdd-tasks-setup.ps1";  DestDir: "{app}\scripts"; Flags: ignoreversion
 Source: "scripts\vdd-tasks-remove.ps1"; DestDir: "{app}\scripts"; Flags: ignoreversion
+Source: "scripts\vdd-toggle.ps1";       DestDir: "{app}\scripts"; Flags: ignoreversion
 #endif
 
 [Icons]

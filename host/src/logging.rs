@@ -127,11 +127,17 @@ pub fn session_log_path() -> PathBuf {
 }
 
 fn resolve_session_log_path() -> PathBuf {
-    let base_dir = std::env::current_exe()
-        .ok()
-        .and_then(|exe| exe.parent().map(PathBuf::from))
-        .unwrap_or_else(|| PathBuf::from("."));
-    base_dir.join("logs").join(SESSION_LOG_FILE_NAME)
+    // Prefer %APPDATA%/EternalMonitor/logs so the log is writable even when the app is installed
+    // read-only under Program Files; fall back to the exe directory only if APPDATA is unavailable.
+    let logs_dir = crate::settings::app_data_dir()
+        .or_else(|| {
+            std::env::current_exe()
+                .ok()
+                .and_then(|exe| exe.parent().map(PathBuf::from))
+        })
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join("logs");
+    logs_dir.join(SESSION_LOG_FILE_NAME)
 }
 
 // --- mDNS interface-failure deduper -----------------------------------------

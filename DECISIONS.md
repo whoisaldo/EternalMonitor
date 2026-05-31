@@ -72,8 +72,11 @@ Current reality:
 - There is no selective NACK layer yet
 - There is no USB transport yet
 - The active wire format uses a `16` byte fragment header with `u16` fragment index/count fields
+- The header's final 4 bytes carry a per-pipeline-run `stream_epoch` so the receiver detects a
+  stream restart immediately; the bytes were previously reserved/zero, so older receivers that
+  ignore them remain wire-compatible
 
-That last change fixed large-frame corruption where `fragment_count` overflowed at `255`.
+That `u16` change fixed large-frame corruption where `fragment_count` overflowed at `255`.
 
 Rejected for now:
 
@@ -107,10 +110,29 @@ Current reality:
 
 So discovery is still an incomplete feature, not something to depend on.
 
+## Virtual display
+
+### Bundled third-party Indirect Display Driver, managed on demand
+
+The extended-display feature drives the bundled VirtualDrivers/Virtual-Display-Driver. The host
+does not run elevated, so the installer registers two SYSTEM scheduled tasks (enable/disable) that
+the host triggers via `schtasks /Run` — no per-toggle UAC prompt.
+
+Current reality:
+
+- The device is left disabled by default and is enabled **only once an iPad connects**, then
+  disabled on exit / target change / startup and via a panic hook — so it never lingers as a
+  phantom monitor.
+- The tasks resolve the device at trigger time (name-agnostic) rather than baking a fixed
+  instance id, so they survive driver-version and PnP-enumeration differences.
+
+A first-party signed display driver (removing the third-party dependency) is still a v0.2.0 goal.
+
 ## Deferred decisions
 
 These remain intentionally unresolved until the current WiFi UDP path is hardened:
 
 - USB transport design
-- Virtual display driver integration details
+- First-party signed display driver (today the host manages a bundled third-party VDD)
 - Input relay protocol and host injection mechanism
+- Idle-disconnect teardown of the virtual display (needs a bidirectional iPad heartbeat)

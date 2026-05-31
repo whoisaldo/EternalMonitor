@@ -14,7 +14,7 @@ use windows::Win32::System::Registry::{
 };
 
 use crate::capture::{enumerate_outputs, OutputInfo};
-use crate::control::{CaptureTarget, GuiControl};
+use crate::control::{CaptureTarget, GuiControl, VddStatus};
 use crate::logging::{session_log_path, session_log_text};
 use crate::settings::SettingsFile;
 use crate::stats::PIPELINE_STATS;
@@ -258,6 +258,14 @@ impl AnalyzerApp {
             persisted.start_on_boot
         };
 
+        // If autostart is enabled, refresh the stored HKCU\Run path to the *current* exe location.
+        // After an installer upgrade or a move, the old path would silently fail to launch on boot.
+        if start_on_boot {
+            if let Err(error) = set_startup_registry(true) {
+                warn!(error = %error, "Failed to refresh startup registry path on launch");
+            }
+        }
+
         Self {
             control,
             current_tab: AppTab::Stream,
@@ -443,6 +451,13 @@ impl AnalyzerApp {
         ui.add_space(8.0);
         if snap.using_software_fallback {
             software_fallback_banner(ui);
+            ui.add_space(12.0);
+        }
+        // If the user asked for the extended (virtual) display but it could not be brought up,
+        // capture silently fell back to the primary monitor — say so instead of leaving the
+        // Settings combo claiming "Extended display".
+        if *self.control.shared.vdd_status.lock() == VddStatus::Failed {
+            vdd_failed_banner(ui);
             ui.add_space(12.0);
         }
 
@@ -995,6 +1010,34 @@ fn software_fallback_banner(ui: &mut egui::Ui) {
         });
 }
 
+/// Amber warning banner shown when the user selected the extended (virtual) display but the
+/// managed VDD could not be enabled/attached, so capture fell back to the primary monitor.
+fn vdd_failed_banner(ui: &mut egui::Ui) {
+    egui::Frame::new()
+        .fill(WARN_FILL)
+        .stroke(egui::Stroke::new(1.0, WARN_BORDER))
+        .corner_radius(4.0)
+        .inner_margin(egui::Margin::same(12))
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.label(
+                egui::RichText::new("⚠ Extended display unavailable — mirroring the primary screen")
+                    .color(WARN_AMBER)
+                    .strong()
+                    .size(13.0),
+            );
+            ui.add_space(2.0);
+            ui.label(
+                egui::RichText::new(
+                    "The virtual display driver didn't attach. Reinstall via EternalMonitor-Setup.exe \
+                     so its display task is registered, then Restart stream.",
+                )
+                .color(TEXT)
+                .size(11.0),
+            );
+        });
+}
+
 fn card_frame() -> egui::Frame {
     egui::Frame::new()
         .fill(SURFACE)
@@ -1393,13 +1436,64 @@ fn value_or_unknown(value: &str) -> &str {
 }
 
 pub(crate) fn detect_local_ip(listen_port: u16) -> String {
-    std::net::UdpSocket::bind("0.0.0.0:0")
-        .and_then(|s| {
-            s.connect("8.8.8.8:80")?;
-            s.local_addr()
-        })
-        .map(|a| format!("{}:{}", a.ip(), listen_port))
-        .unwrap_or_else(|_| format!("unknown:{listen_port}"))
+    // Primary: ask the OS which local interface would route toward a public address. This is the
+    // happy path on any machine with a normal default route.
+    if let Ok(addr) = std::net::UdpSocket::bind("0.0.0.0:0").and_then(|s| {
+        s.connect("8.8.8.8:80")?;
+        s.local_addr()
+    }) {
+        let ip = addr.ip();
+        if !ip.is_unspecified() && !ip.is_loopback() {
+            return format!("{}:{}", ip, listen_port);
+        }
+    }
+
+    // Fallback: no default route (isolated LAN / no internet / blocked) — enumerate local
+    // adapters and use the first real LAN IPv4 so the displayed address and QR still work.
+    if let Some(ip) = first_lan_ipv4() {
+        return format!("{}:{}", ip, listen_port);
+    }
+
+    format!("unknown:{listen_port}")
+}
+
+/// Return the first non-loopback IPv4 address bound to a local adapter, via the Win32
+/// IP Helper API. Used only as a fallback when the route-probe trick can't determine the LAN IP.
+fn first_lan_ipv4() -> Option<std::net::Ipv4Addr> {
+    use windows::Win32::NetworkManagement::IpHelper::{GetIpAddrTable, MIB_IPADDRTABLE};
+
+    unsafe {
+        // First call sizes the buffer.
+        let mut size: u32 = 0;
+        let _ = GetIpAddrTable(None, &mut size, false);
+        if size == 0 {
+            return None;
+        }
+        let mut buffer = vec![0u8; size as usize];
+        let table = buffer.as_mut_ptr() as *mut MIB_IPADDRTABLE;
+        if GetIpAddrTable(Some(table), &mut size, false) != 0 {
+            return None;
+        }
+
+        let table = &*table;
+        let rows = std::slice::from_raw_parts(table.table.as_ptr(), table.dwNumEntries as usize);
+        for row in rows {
+            let ip = ipv4_from_inaddr(row.dwAddr);
+            if !ip.is_loopback() && !ip.is_unspecified() {
+                return Some(ip);
+            }
+        }
+    }
+    None
+}
+
+/// Convert a Win32 `MIB_IPADDRROW.dwAddr` (an IPv4 address stored in **network byte order in
+/// memory**) into an `Ipv4Addr`. The four octets sit in memory as `[a, b, c, d]`, and
+/// `to_ne_bytes()` returns exactly those in-memory bytes on any platform, so this yields `a.b.c.d`.
+/// Do NOT switch to `to_be_bytes()`: on little-endian that reorders the octets to `d.c.b.a`
+/// (e.g. 192.168.1.1 -> 1.1.168.192). See the test below.
+fn ipv4_from_inaddr(dword: u32) -> std::net::Ipv4Addr {
+    std::net::Ipv4Addr::from(dword.to_ne_bytes())
 }
 
 fn read_startup_registry() -> bool {
@@ -1513,4 +1607,19 @@ pub fn run_gui(control: GuiControl) -> eframe::Result<()> {
         options,
         Box::new(|cc| Ok(Box::new(AnalyzerApp::new(cc, control)))),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ipv4_from_inaddr;
+    use std::net::Ipv4Addr;
+
+    #[test]
+    fn ipv4_from_inaddr_preserves_network_order_octets() {
+        // Windows stores 192.168.1.1 as the in-memory bytes [192, 168, 1, 1] (network order); the
+        // u32 we read from that memory is from_ne_bytes([192,168,1,1]). Converting back must give
+        // 192.168.1.1 — not the byte-reversed 1.1.168.192 that to_be_bytes() would produce on LE.
+        let dword = u32::from_ne_bytes([192, 168, 1, 1]);
+        assert_eq!(ipv4_from_inaddr(dword), Ipv4Addr::new(192, 168, 1, 1));
+    }
 }

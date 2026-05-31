@@ -92,13 +92,21 @@ impl SettingsFile {
     }
 }
 
-fn settings_path() -> Option<PathBuf> {
-    let appdata = std::env::var("APPDATA").ok().map(PathBuf::from).or_else(|| {
+/// The per-user writable data directory for EternalMonitor (`%APPDATA%/EternalMonitor` on
+/// Windows, `~/Library/Application Support/EternalMonitor` elsewhere). Used for settings, the
+/// session log, and AMF diagnostics so they keep working when the app is installed read-only
+/// under `Program Files`. Returns `None` only if neither `APPDATA` nor `HOME` is set.
+pub fn app_data_dir() -> Option<PathBuf> {
+    let base = std::env::var("APPDATA").ok().map(PathBuf::from).or_else(|| {
         std::env::var("HOME").ok().map(|home| {
             PathBuf::from(home)
                 .join("Library")
                 .join("Application Support")
         })
     })?;
-    Some(appdata.join(APP_FOLDER).join(SETTINGS_FILE_NAME))
+    Some(base.join(APP_FOLDER))
+}
+
+fn settings_path() -> Option<PathBuf> {
+    app_data_dir().map(|dir| dir.join(SETTINGS_FILE_NAME))
 }

@@ -76,7 +76,7 @@ pub fn advertise_service(port: u16) -> Option<ServiceDaemon> {
 }
 
 fn build_service_info(port: u16, host_fqdn: &str, instance_name: &str) -> Option<ServiceInfo> {
-    let properties = [("version", "0.1.1"), ("platform", "windows")];
+    let properties = [("version", "0.1.2"), ("platform", "windows")];
     match ServiceInfo::new(
         SERVICE_TYPE,
         instance_name,

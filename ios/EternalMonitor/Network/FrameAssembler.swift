@@ -9,6 +9,11 @@ final class FrameAssembler {
     private var pending: [UInt32: PendingFrame] = [:]
     private var latestCompletedSeq: UInt32 = 0
     private var cleanupCounter: UInt32 = 0
+    /// The host stamps a per-pipeline-run `stream_epoch` into each fragment header. When it
+    /// changes we know the host restarted (seq reset toward 1) and drop the old stream's state
+    /// immediately — more reliable than inferring a restart from a sequence gap. `nil` until the
+    /// first fragment; `0` from older hosts that don't set it (those rely on `streamRestartGap`).
+    private var currentEpoch: UInt32?
 
     /// A backward jump in sequence numbers larger than this means the host restarted its
     /// pipeline (capture-display switch, resolution change, etc.) and reset seq toward 0.
@@ -26,7 +31,25 @@ final class FrameAssembler {
         }
     }
 
-    func addFragment(seq: UInt32, index: UInt16, count: UInt16, payload: Data) {
+    func addFragment(seq: UInt32, index: UInt16, count: UInt16, epoch: UInt32, payload: Data) {
+        // Primary restart signal: the host's stream epoch increases monotonically per pipeline
+        // run. A HIGHER epoch means a brand-new run — drop all old state instantly so a fast
+        // restart (within the seq-gap window) can't stall the stream. A LOWER epoch is a stale or
+        // reordered fragment from the previous run; drop it (never roll currentEpoch backward, or
+        // late old-run packets would ping-pong the reset against the new run). Older hosts send a
+        // constant 0 here, so this stays a no-op for them and the seq-gap fallback takes over.
+        if let current = currentEpoch {
+            if epoch > current {
+                onDiagnostic?("Stream epoch changed (\(current) -> \(epoch)) — resetting reassembly")
+                reset()
+                currentEpoch = epoch
+            } else if epoch < current {
+                return
+            }
+        } else {
+            currentEpoch = epoch
+        }
+
         if latestCompletedSeq > 0 {
             if seq == latestCompletedSeq {
                 // Duplicate fragment for the frame we just completed — ignore.
@@ -106,6 +129,7 @@ final class FrameAssembler {
         pending.removeAll()
         latestCompletedSeq = 0
         cleanupCounter = 0
+        currentEpoch = nil
     }
 
     private func evictStale() {

@@ -12,7 +12,7 @@ $ErrorActionPreference = "Stop"
 $repo = Split-Path -Parent $PSScriptRoot
 Set-Location $repo
 
-$version = "0.1.1"
+$version = "0.1.2"
 $staging = Join-Path $repo "build\installer-staging"
 $outDir  = Join-Path $repo "build\out"
 

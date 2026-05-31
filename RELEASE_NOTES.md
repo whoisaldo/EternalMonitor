@@ -1,13 +1,38 @@
-## Unreleased
+## EternalMonitor v0.1.2-mirror
 
-### What's new
-- Selectable capture display: a "Capture display" picker in the Settings tab streams any
-  output, including a virtual extended display from a signed Indirect Display Driver — the
-  iPad can be a true second screen, not just a mirror. Default stays primary (no change).
-- Startup banner and Stream tab now show the active capture source.
-- One-step Windows installer (`EternalMonitor-Setup.exe`) that bundles the host, FFmpeg
-  runtime, and the virtual display driver — one double-click + one UAC prompt for testers.
-- Credits/contact added to the Windows GUI and the iPad app Settings.
+Reliability release focused on the AMD encode path and a seamless, on-demand extended display.
+
+### Extended display & virtual-display lifecycle
+- **On-demand only:** the bundled virtual display driver now turns on **only once an iPad
+  actually connects** and is torn down on exit — so an idle PC never shows a phantom second
+  monitor even when "Extended display" is the saved capture target.
+- **Crash-safe:** the virtual display is disabled unconditionally at startup and via a panic
+  hook, so a crash or force-kill can't strand a phantom monitor.
+- **Robust device control:** the installer's enable/disable scheduled tasks now resolve the
+  virtual-display device at trigger time (name-agnostic) instead of baking a guessed device id,
+  and the installer verifies the tasks registered.
+- **Correct output:** on a PC that already has a second monitor, selecting the extended display
+  no longer grabs the wrong screen; and the driver is disabled if it fails to attach.
+- **Idle keepalive:** a blank/static extended display still delivers a first keyframe, so the
+  iPad connects instead of timing out on black.
+
+### AMD / encoding
+- AMF now prepends SPS/PPS on forced non-IDR intra frames (not just IDRs), and retries the
+  startup keyframe if parameter sets aren't available yet — fewer black-screen/desync cases.
+- Configurable virtual-display attach timeout (`ETERNAL_VDD_TIMEOUT_SECS`).
+
+### Diagnostics & networking
+- Session log and the AMF packet capture now write to `%APPDATA%\EternalMonitor\{logs,
+  diagnostics}` so they work under Program Files (they previously failed silently there).
+- Per-frame log spam removed from the hot path.
+- Fragment header now carries a per-run stream epoch for instant restart resync; the iPad's
+  connect timeout extends once data starts flowing on a slow/jittery network.
+- The displayed address / QR fall back to local-adapter enumeration when there's no default
+  route, and the GUI shows a banner if the extended display falls back to mirroring.
+
+### Carried forward from the in-development line
+- Selectable capture display picker (Settings tab), active-capture-source readouts, the one-step
+  Windows installer (`EternalMonitor-Setup.exe`), and GUI/iPad credits.
 
 ---
 

@@ -23,6 +23,24 @@ pub struct SharedControl {
     /// Which display output the capture loop should duplicate, applied on next pipeline
     /// restart. `PrimaryAuto` mirrors the primary monitor (today's behavior).
     pub capture_target: Arc<Mutex<CaptureTarget>>,
+    /// Live status of the managed virtual extended display, surfaced in the GUI so a tester
+    /// can see when an Extended-display request silently fell back to the primary monitor.
+    pub vdd_status: Arc<Mutex<VddStatus>>,
+}
+
+/// Runtime state of the managed virtual extended display.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VddStatus {
+    /// Not using the managed virtual display (mirroring or a real output).
+    Inactive,
+    /// Virtual display requested but not yet active because no iPad has connected. The driver
+    /// is deliberately left off until a receiver registers, so an idle PC shows no phantom monitor.
+    WaitingForClient,
+    /// Virtual display enabled and being captured.
+    Active,
+    /// Virtual display was requested but could not be enabled/attached — capture fell back to
+    /// the primary display.
+    Failed,
 }
 
 /// Selects which display output the capture loop duplicates.
@@ -48,6 +66,7 @@ impl SharedControl {
             force_next_idr: Arc::new(AtomicBool::new(false)),
             encoder_override: Arc::new(Mutex::new(None)),
             capture_target: Arc::new(Mutex::new(CaptureTarget::PrimaryAuto)),
+            vdd_status: Arc::new(Mutex::new(VddStatus::Inactive)),
         }
     }
 

@@ -49,15 +49,17 @@ Step 5 - Mirror vs. extended screen
 By default the iPad MIRRORS your main screen. To use the iPad as a separate
 EXTENDED workspace (drag windows onto it):
 
-1. In the host window, open the "Settings" tab.
-2. Under "Capture display", click "Refresh", then pick the virtual display
-   (it appears in the list once the setup has installed it - it is the one
-   that is NOT your main monitor).
-3. Click "Restart stream".
+1. Connect the iPad first (Steps 3-4 above).
+2. In the host window, open the "Settings" tab.
+3. Under "Capture display", choose "Extended display (iPad)".
+4. Click "Restart stream".
 
 The iPad now shows the extended desktop. Drag a window past the right edge
 of your main screen and it lands on the iPad. To go back to mirroring,
 choose "Auto (primary)" and Restart stream again.
+
+The extra screen only exists while the iPad is connected and using it - when
+you quit EternalMonitor it disappears, so there's no leftover monitor.
 
 If the video is choppy or laggy
 -------------------------------
@@ -83,5 +85,6 @@ What to report back
 -------------------
 If you hit problems, click "Copy logs" on the host's Stream tab and paste
 that into the chat, along with what the iPad showed and which GPU you have
-(shown on the Stream tab). A full log file is also saved in the "logs"
-folder inside the install folder.
+(shown on the Stream tab). A full log file is also saved at
+%APPDATA%\EternalMonitor\logs\eternal-host-session.log  (paste %APPDATA%
+into the Explorer address bar to open that folder).

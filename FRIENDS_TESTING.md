@@ -15,10 +15,14 @@ installer and the extended-display option won't appear.
 
 ## Extended display vs mirror
 
-By default the iPad mirrors the primary screen. To test the iPad as a real extended desktop,
-have the tester open Settings → Capture display → Refresh, pick the virtual display, and click
-Restart stream. Dragging a window past the edge of the main screen should land it on the iPad.
-If no virtual display is listed, the installer's driver step didn't complete — re-run it.
+By default the iPad mirrors the primary screen. To test the iPad as a real extended desktop:
+**connect the iPad first**, then open Settings → Capture display, choose **"Extended display
+(iPad)"**, and click Restart stream. Dragging a window past the edge of the main screen should
+land it on the iPad. The virtual monitor is created **on demand and only while the iPad is
+connected** — there is intentionally no second display when idle, so don't expect to see it in
+Windows Display settings before connecting. If the extended display can't start, the host shows an
+amber "Extended display unavailable" banner and mirrors the primary screen — re-run the installer
+so its display task is registered.
 
 ## Build parity matters
 
@@ -47,9 +51,10 @@ now shows an **amber warning banner** on the Stream tab. CPU encoding is hot and
 1. **GPU + codec** — shown on the host Stream tab (e.g. "NVIDIA … / H.264 (NVENC)"). If the
    codec reads "H.264 (x264)", they're on the CPU fallback.
 2. **Host logs** — "Copy logs" button on the Stream tab, or the full file at
-   `<host-exe-folder>/logs/eternal-host-session.log`.
+   `%APPDATA%\EternalMonitor\logs\eternal-host-session.log` (paste `%APPDATA%` into Explorer's
+   address bar — it expands to `C:\Users\<name>\AppData\Roaming`).
 3. **AMD only** — if streaming is broken on an AMD machine, ask for
-   `<host-exe-folder>/diagnostics/amf-first-120-packets.h264` (the host captures the first
+   `%APPDATA%\EternalMonitor\diagnostics\amf-first-120-packets.h264` (the host captures the first
    120 NAL packets there for offline inspection).
 4. **What the iPad showed** — black screen / frozen / corrupted / "connecting" forever.
 

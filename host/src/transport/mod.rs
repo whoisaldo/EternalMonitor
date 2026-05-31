@@ -2,12 +2,12 @@ pub mod fragment;
 
 use std::net::SocketAddr;
 use std::sync::mpsc as std_mpsc;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::control::{SharedControl, SupervisorCommand};
 use crate::encoder::NALUnit;
@@ -16,6 +16,11 @@ use fragment::{FragmentHeader, HEADER_SIZE, MAX_PAYLOAD_SIZE};
 
 /// Magic bytes that the iPad sends to register itself as a receiver.
 const HELLO_MAGIC: &[u8] = b"ETERNALHELLO";
+
+/// Monotonic per-process counter stamped into each fragment header's `stream_epoch`. Every
+/// `start_sender` (i.e. every pipeline run) gets a fresh value so the iPad can detect a stream
+/// restart (seq reset to ~1) reliably instead of inferring it from a sequence-number gap.
+static STREAM_EPOCH_COUNTER: AtomicU32 = AtomicU32::new(0);
 
 /// Consumes NAL units from the encoder, serializes each as a FlatBuffer FramePacket,
 /// fragments into MTU-safe UDP datagrams, and sends them to the current target address.
@@ -30,8 +35,16 @@ pub async fn start_sender(
     let socket = UdpSocket::bind(bind_addr).await?;
     socket.set_broadcast(true)?;
 
+    // Monotonically increasing per pipeline run. Never 0 — the receiver treats 0 as "legacy host
+    // without epoch support" and falls back to seq-gap restart detection. (Wrap after 2^32 runs is
+    // harmless: the receiver also keeps the seq-gap fallback.)
+    let stream_epoch = STREAM_EPOCH_COUNTER
+        .fetch_add(1, Ordering::Relaxed)
+        .wrapping_add(1)
+        .max(1);
+
     let local_addr = socket.local_addr()?;
-    info!(%local_addr, "UDP transport ready — waiting for iPad to connect");
+    info!(%local_addr, stream_epoch, "UDP transport ready — waiting for iPad to connect");
     PIPELINE_STATS
         .lock()
         .set_target_addr(shared.target_addr.lock().to_string());
@@ -134,6 +147,7 @@ pub async fn start_sender(
                         fragment_index: i as u16,
                         fragment_count,
                         payload_len: chunk.len() as u32,
+                        stream_epoch,
                     };
 
                     let mut dgram = Vec::with_capacity(HEADER_SIZE + chunk.len());
@@ -155,7 +169,7 @@ pub async fn start_sender(
                 );
 
                 let send_us = send_start.elapsed().as_micros();
-                info!(
+                debug!(
                     seq,
                     fragments = fragment_count,
                     total_bytes,

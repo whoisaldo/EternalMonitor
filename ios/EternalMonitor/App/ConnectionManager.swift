@@ -76,6 +76,9 @@ final class ConnectionManager: ObservableObject {
     private var videoDecoder: VideoDecoder?
     private var timeoutTask: Task<Void, Never>?
     private var debugState = ConnectionDebugState()
+    // Whether we've already granted the one-time timeout extension that fires when datagrams
+    // start arriving (so a slow/jittery network gets a fresh window to finish reassembly+decode).
+    private var didExtendTimeout = false
 
     let frameSlot = FrameSlot()
     private var fpsCounter = FPSCounter()
@@ -98,6 +101,7 @@ final class ConnectionManager: ObservableObject {
         state = .connecting
         connectionError = nil
         diagnostics.removeAll()
+        didExtendTimeout = false
         debugState = ConnectionDebugState(host: normalizedHost, port: port)
         record(.info, "connection", "Starting connection to \(normalizedHost):\(port)")
 
@@ -198,6 +202,12 @@ final class ConnectionManager: ObservableObject {
                 self.debugState.datagramBytesReceived += byteCount
                 if self.debugState.datagramsReceived == 1 {
                     self.record(.info, "udp", "First UDP datagram received (\(byteCount) bytes)")
+                    // Data is flowing — grant a fresh full window (once) so a slow/jittery network
+                    // gets time to finish reassembly + decode instead of being cut off mid-handshake.
+                    if self.state == .connecting && !self.didExtendTimeout {
+                        self.didExtendTimeout = true
+                        self.armConnectTimeout(seconds: Self.connectionTimeoutSeconds)
+                    }
                 } else if self.debugState.datagramsReceived % 50 == 0 {
                     self.record(.info, "udp", "Received \(self.debugState.datagramsReceived) UDP datagrams so far")
                 }
@@ -238,9 +248,16 @@ final class ConnectionManager: ObservableObject {
             return
         }
 
-        // Timeout after N seconds
+        // Timeout after N seconds (re-armed once when datagrams start arriving).
+        armConnectTimeout(seconds: Self.connectionTimeoutSeconds)
+    }
+
+    /// (Re)arm the connect-timeout watchdog. Cancels any existing timer and starts a fresh one;
+    /// if we're still `.connecting` when it fires, surface a diagnostic and disconnect.
+    private func armConnectTimeout(seconds: UInt64) {
+        timeoutTask?.cancel()
         timeoutTask = Task { @MainActor in
-            try? await Task.sleep(nanoseconds: Self.connectionTimeoutSeconds * 1_000_000_000)
+            try? await Task.sleep(nanoseconds: seconds * 1_000_000_000)
             if !Task.isCancelled && self.state == .connecting {
                 let summary = self.debugState.timeoutSummary
                 self.record(.error, "timeout", summary)
@@ -258,6 +275,7 @@ final class ConnectionManager: ObservableObject {
     func disconnect() {
         timeoutTask?.cancel()
         timeoutTask = nil
+        didExtendTimeout = false
 
         udpReceiver?.stop()
         videoDecoder?.invalidate()

@@ -53,6 +53,10 @@
 - The Settings tab exposes a capture-display picker; choosing a virtual output created by
   an Indirect Display Driver turns the iPad into an extended desktop instead of a mirror.
   The capture adapter follows the chosen output; encoder selection stays vendor-based.
+- The managed virtual display is brought up **on demand, only once an iPad has connected**, and
+  is disabled on exit / target change / startup (and via a panic hook), so it never lingers as a
+  phantom monitor. If the captured display is idle, the loop resends the last frame so the iPad
+  still receives a startup keyframe.
 - Output format passed downstream: BGRA frame buffer plus frame metadata
 
 This is functional but not yet the final zero-copy path described in earlier docs.
@@ -80,6 +84,10 @@ The encoder emits Annex B H.264 byte streams that are wrapped in `FramePacket`.
   - payload is fragmented into MTU-sized UDP datagrams
   - fragment header is currently `16` bytes
   - fragment index and fragment count are `u16`
+  - the header's final 4 bytes carry a per-pipeline-run `stream_epoch`, so the receiver drops
+    stale reassembly state immediately on a stream restart (seq reset) instead of inferring it
+    from a sequence gap. These bytes were previously reserved/zero, so older receivers that
+    ignore them stay wire-compatible.
 
 The `u16` fragment-count change is important. Older host and iPad builds are not wire-compatible with the current transport fix.
 
