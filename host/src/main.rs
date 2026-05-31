@@ -91,6 +91,29 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         stats.set_codec_name(gpu_info.codec_display_name.clone());
     }
 
+    // Optional encoder override from the environment, applied BEFORE the first pipeline run
+    // so it takes effect without a manual stream restart. Useful for testing a specific
+    // encoder, e.g. `set ETERNAL_ENCODER=h264_amf` to force the AMD path.
+    if let Ok(name) = std::env::var("ETERNAL_ENCODER") {
+        let name = name.trim().to_string();
+        if !name.is_empty() {
+            info!(encoder = %name, "Encoder forced from ETERNAL_ENCODER (no restart needed)");
+            *shared.encoder_override.lock() = Some(name);
+        }
+    }
+    // Optional target FPS override (e.g. ETERNAL_FPS=30) to lighten encode load — useful when
+    // testing a hardware encoder on a weak/integrated GPU.
+    if let Ok(fps) = std::env::var("ETERNAL_FPS") {
+        if let Ok(fps) = fps.trim().parse::<u32>() {
+            if fps > 0 {
+                info!(fps, "Target FPS forced from ETERNAL_FPS");
+                shared
+                    .target_fps
+                    .store(fps, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+    }
+
     let (supervisor_tx, supervisor_rx) = mpsc::channel();
     let gui_control = GuiControl {
         shared: shared.clone(),

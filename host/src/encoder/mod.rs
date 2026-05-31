@@ -349,7 +349,12 @@ fn encoder_options(encoder_name: &str) -> ffmpeg_next::Dictionary<'_> {
             opts.set("latency", "1");
             opts.set("quality", "speed");
             opts.set("profile", "constrained_baseline");
-            opts.set("level", "4.1");
+            // Level must cover the actual frame complexity or strict decoders (Apple
+            // VideoToolbox) reject the stream even though lenient ones (ffmpeg) accept it.
+            // 4.1 only covers ~1080p30; 1080p60 needs 4.2. Declare 5.1 for headroom across
+            // resolutions — over-declaring a level is harmless, under-declaring is fatal.
+            // NVENC works on iPad precisely because it auto-selects an adequate level.
+            opts.set("level", "5.1");
             opts.set("coder", "cavlc");
             // No AUD (NAL 9): the iPad decoder strips AUDs before submitting to VideoToolbox,
             // so emitting them only wastes bytes. One FramePacket == one access unit, so the
