@@ -1,7 +1,7 @@
 # EternalMonitor
 
 ## ⚡ Contribute
-** OPEN TO CONTRIBUTIONS. ** 
+**OPEN TO CONTRIBUTIONS.** 
 
 Whether you want to optimize the network transport layer, refine the Metal rendering pipeline, or improve Windows capture efficiency, your PRs are highly welcome. 
 
