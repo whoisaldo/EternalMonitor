@@ -1,5 +1,14 @@
 # EternalMonitor
 
+## ⚡ Contribute
+** OPEN TO CONTRIBUTIONS.** 
+
+Whether you want to optimize the network transport layer, refine the Metal rendering pipeline, or improve Windows capture efficiency, your PRs are highly welcome. 
+
+Any help would be appreciated! :blush:
+
+> 💬 **Help build this together. Ping me directly on Discord to collaborate:** **`aldobenches285`**
+
 [![Version](https://img.shields.io/badge/version-v0.1.2--mirror-e8ff47?style=flat&labelColor=111)](https://github.com/whoisaldo/EternalMonitor/releases/tag/v0.1.2-mirror)
 [![Download](https://img.shields.io/badge/download-installer-blue?style=flat&labelColor=111)](https://github.com/whoisaldo/EternalMonitor/releases/download/v0.1.2-mirror/EternalMonitor-Setup.exe)
 [![Website](https://img.shields.io/badge/website-eternalmonitor.dev-e8ff47?style=flat&labelColor=111)](https://eternalmonitor.dev)
