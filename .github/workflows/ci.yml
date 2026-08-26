@@ -1,0 +1,85 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  rust-linux:
+    name: Rust (linux, pure crates)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+      - name: Test pure crates
+        run: cargo test -p eternal-proto --locked
+
+  rust-windows:
+    name: Rust (windows, full host)
+    runs-on: windows-2022
+    timeout-minutes: 45
+    env:
+      # ffmpeg-sys-next bindgen needs libclang; preinstalled LLVM on the runner image
+      LIBCLANG_PATH: C:\Program Files\LLVM\bin
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Cache FFmpeg 7.1.1 shared SDK
+        id: ffmpeg-cache
+        uses: actions/cache@v4
+        with:
+          path: C:\ffmpeg
+          key: ffmpeg-7.1.1-full_build-shared
+
+      - name: Download FFmpeg 7.1.1 shared SDK
+        if: steps.ffmpeg-cache.outputs.cache-hit != 'true'
+        shell: pwsh
+        run: |
+          $url = "https://github.com/GyanD/codexffmpeg/releases/download/7.1.1/ffmpeg-7.1.1-full_build-shared.7z"
+          Invoke-WebRequest -Uri $url -OutFile ffmpeg.7z
+          7z x ffmpeg.7z -oC:\ffmpeg-extract | Out-Null
+          Move-Item C:\ffmpeg-extract\ffmpeg-7.1.1-full_build-shared C:\ffmpeg
+
+      - name: Configure FFmpeg environment
+        shell: pwsh
+        run: |
+          "FFMPEG_DIR=C:\ffmpeg" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "C:\ffmpeg\bin" | Out-File -FilePath $env:GITHUB_PATH -Append
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build workspace
+        run: cargo build --workspace --locked
+
+      - name: Test workspace
+        run: cargo test --workspace --locked
+
+  ios-build:
+    name: iOS (simulator build)
+    runs-on: macos-15
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install XcodeGen
+        run: brew install xcodegen
+      - name: Generate Xcode project
+        working-directory: ios
+        run: xcodegen generate
+      - name: Build for iOS Simulator
+        working-directory: ios
+        run: |
+          set -o pipefail
+          xcodebuild build \
+            -project EternalMonitor.xcodeproj \
+            -scheme EternalMonitor \
+            -destination 'generic/platform=iOS Simulator' \
+            CODE_SIGNING_ALLOWED=NO | tail -50
