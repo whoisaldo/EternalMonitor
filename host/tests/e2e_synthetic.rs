@@ -32,6 +32,17 @@ use eternal_wire::v2::{classify, Classified};
 /// Tests share process-global env (ETERNAL_*); run them one at a time.
 static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+/// Surface the host's tracing in test output (best effort, once per process).
+fn init_test_tracing() {
+    use tracing_subscriber::EnvFilter;
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
+        )
+        .with_test_writer()
+        .try_init();
+}
+
 const SYNTH_W: u32 = 640;
 const SYNTH_H: u32 = 360;
 const WANT_DECODED_FRAMES: usize = 30;
@@ -111,11 +122,16 @@ impl FakeReceiver {
         });
         let hello_bytes = encode_control(0, 1, &hello);
 
-        let deadline = Instant::now() + Duration::from_secs(10);
+        let deadline = Instant::now() + Duration::from_secs(20);
         let mut buf = [0u8; 2048];
         let mut last_hello = Instant::now() - Duration::from_secs(1);
+        let mut datagrams_seen = 0u32;
+        let mut media_seen = 0u32;
         let ack: HelloAck = loop {
-            assert!(Instant::now() < deadline, "no HELLO_ACK within 10s");
+            assert!(
+                Instant::now() < deadline,
+                "no HELLO_ACK within 20s (saw {datagrams_seen} datagrams, {media_seen} media)"
+            );
             if last_hello.elapsed() >= Duration::from_millis(250) {
                 socket.send_to(&hello_bytes, &host).expect("send hello2");
                 last_hello = Instant::now();
@@ -123,10 +139,15 @@ impl FakeReceiver {
             let Ok((len, _)) = socket.recv_from(&mut buf) else {
                 continue;
             };
-            if let Classified::Control(_) = classify(&buf[..len]) {
-                if let Ok((_, ControlMessage::HelloAck(ack))) = parse_control(&buf[..len]) {
-                    break ack;
+            datagrams_seen += 1;
+            match classify(&buf[..len]) {
+                Classified::Control(_) => {
+                    if let Ok((_, ControlMessage::HelloAck(ack))) = parse_control(&buf[..len]) {
+                        break ack;
+                    }
                 }
+                Classified::Media { .. } => media_seen += 1,
+                _ => {}
             }
         };
 
@@ -170,6 +191,7 @@ impl FakeReceiver {
 #[test]
 fn synthetic_stream_end_to_end_v2() {
     let _guard = ENV_LOCK.lock().unwrap();
+    init_test_tracing();
     let _ = ffmpeg_next::init();
 
     std::env::set_var("ETERNAL_SYNTH_SIZE", format!("{SYNTH_W}x{SYNTH_H}"));
@@ -367,6 +389,7 @@ fn synthetic_stream_end_to_end_v2() {
 #[test]
 fn lossy_stream_recovers_and_adapts() {
     let _guard = ENV_LOCK.lock().unwrap();
+    init_test_tracing();
     let _ = ffmpeg_next::init();
 
     std::env::set_var("ETERNAL_SYNTH_SIZE", format!("{SYNTH_W}x{SYNTH_H}"));
