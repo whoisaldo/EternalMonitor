@@ -1,7 +1,8 @@
 [package]
-name = "eternal-proto"
-version = "0.1.0"
+name = "eternal-wire"
+version = "0.2.0"
 edition = "2021"
 
 [dependencies]
 flatbuffers = "24.12"
+tracing = "0.1"

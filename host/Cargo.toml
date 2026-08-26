@@ -4,7 +4,7 @@ version = "0.1.2"
 edition = "2021"
 
 [dependencies]
-eternal-proto = { path = "../proto" }
+eternal-wire = { path = "../proto" }
 ffmpeg-next = { version = "7", features = ["codec", "format", "software-scaling"] }
 libc = "0.2"
 tokio = { version = "1", features = ["full"] }
