@@ -28,27 +28,27 @@ so its display task is registered.
 
 The host and iPad app must be from the **same release**. v0.2.0's protocol v2
 is a deliberate clean break: a v0.1.x app meeting a v0.2.0 host (or the
-reverse) won't stream — each side shows an explicit "update the other half"
+reverse) won't stream. Each side shows an explicit "update the other half"
 message instead of corrupted video, so at least the failure is obvious. Hand
 out the matching TestFlight build and installer together.
 
-## New in v0.2.0 — things worth testing on purpose
+## New in v0.2.0, worth testing on purpose
 
-- **Input relay**: tap/drag/two-finger scroll/hold-for-right-click/Pencil
-  should feel like a trackpad. Check multi-monitor setups (clicks must land
-  on the captured screen) and the "Control PC with touch" toggle off (host
-  must ignore touches).
-- **HEVC**: flip "Prefer HEVC" in host Settings mid-stream; the codec on the
-  iPad's Settings HOST module should flip to HEVC within a second, and back.
-  If video breaks only in HEVC on some GPU, that encoder's HEVC path is the
-  bug — collect logs and turn the toggle off.
-- **Recovery**: kill the host mid-stream (Task Manager) and relaunch — the
-  iPad should show SIGNAL LOST and reconnect by itself. Walk to the edge of
-  WiFi range — the picture should coarsen (bitrate stepping down) rather
-  than freeze, and recover afterwards.
-- **Extended display resolution**: with "Match extended display to the
-  iPad's resolution" on (default), the virtual display should come up at the
-  iPad's native aspect — no letterboxing on the iPad.
+- Input relay: tap, drag, two-finger scroll, hold for right-click, and the
+  Pencil should feel like a trackpad. Check multi-monitor setups (clicks
+  must land on the captured screen) and the "Control PC with touch" toggle
+  off (the host must ignore touches).
+- HEVC: flip "Prefer HEVC" in host Settings mid-stream. The codec in the
+  iPad's Settings HOST module should flip to HEVC within a second, and
+  back. If video breaks only in HEVC on some GPU, that encoder's HEVC path
+  is the bug; collect logs and turn the toggle off.
+- Recovery: kill the host mid-stream (Task Manager) and relaunch. The iPad
+  should show SIGNAL LOST and reconnect by itself. Walk to the edge of WiFi
+  range; the picture should coarsen (bitrate stepping down) rather than
+  freeze, and recover afterwards.
+- Extended display resolution: with "Match extended display to the iPad's
+  resolution" on (the default), the virtual display should come up at the
+  iPad's native aspect, with no letterboxing on the iPad.
 
 ## Cover all three GPU vendors
 
@@ -90,9 +90,10 @@ now shows an **amber warning banner** on the Stream tab. CPU encoding is hot and
 
 ## Known limitations (so you don't chase ghosts)
 
-No audio, no USB transport, and no retransmit of lost packets — loss shows as
-a brief artifact or frame skip, then the stream self-heals with a requested
-keyframe (and steps the bitrate down if loss persists). Sustained stutter on
-a clean network IS reportable now; on hotel/guest WiFi it's still the
-network. HEVC is experimental and off by default — if a stream misbehaves,
-confirm the codec on the Stream tab before filing it as a general bug.
+No audio, no USB transport, and no retransmit of lost packets. Loss shows
+as a brief artifact or frame skip, then the stream self-heals with a
+requested keyframe and steps the bitrate down if loss persists. Sustained
+stutter on a clean network IS reportable now; on hotel or guest WiFi it's
+still the network. HEVC is experimental and off by default, so if a stream
+misbehaves, confirm the codec on the Stream tab before filing it as a
+general bug.

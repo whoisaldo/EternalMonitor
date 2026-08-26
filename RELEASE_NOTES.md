@@ -1,14 +1,14 @@
 ## EternalMonitor v0.2.0
 
-A ground-up revamp of the streaming core. **Clean break: the v0.2.0 host and
-iPad app only work with each other** — each side shows a clear "update the
+A ground-up revamp of the streaming core. Clean break: the v0.2.0 host and
+iPad app only work with each other. Each side shows a clear "update the
 other half" message if it meets a v0.1.x peer.
 
 ### Control the PC from the iPad
 - Tap to click, drag to move the mouse, two-finger scroll, half-second hold
   for a right-click, Apple Pencil with pressure. On by default ("Control PC
-  with touch" in the iPad Settings), negotiated per session — the host never
-  injects for a session that didn't ask.
+  with touch" in the iPad Settings) and negotiated per session; the host
+  never injects for a session that didn't ask.
 - While control is on, a three-finger tap toggles the stats HUD.
 
 ### Protocol v2
@@ -16,28 +16,28 @@ other half" message if it meets a v0.1.x peer.
   second device, instant reconnect takeover, liveness tracking, and clean
   goodbyes (including when the app is backgrounded).
 - Host heartbeats, client receiver reports, keyframe requests, and NTP-style
-  clock sync — the HUD's latency number is now a real end-to-end measurement.
+  clock sync. The HUD's latency number is now a real end-to-end measurement.
 - Media is raw Annex B in a fixed 32-byte header; FlatBuffers is gone.
 
 ### Reliability
-- Adaptive bitrate: the host slider is now the **ceiling**; the stream steps
+- Adaptive bitrate: the host slider is now the ceiling, and the stream steps
   down under loss and back up when the network recovers.
 - Keyframe recovery after loss (client-requested, host rate-limited), packet
   pacing on keyframe bursts, and automatic reconnect with backoff after
   "SIGNAL LOST".
 - Host supervisor v2: an encoder crash auto-restarts the pipeline in about a
-  second and the iPad resumes on the same session — no reconnect, no
+  second and the iPad resumes on the same session, with no reconnect and no
   re-handshake. Wedge watchdogs catch silent stalls.
 
 ### Video
-- **HEVC/H.265** as an experimental opt-in ("Prefer HEVC" on the host):
+- HEVC/H.265 as an experimental opt-in ("Prefer HEVC" on the host):
   negotiated per client, live mid-session codec switching, automatic H.264
   fallback.
 - Real capture-time PTS (rate control finally sees true frame cadence), NV12
   decode output with proper BT.601/709 handling, aspect-fit rendering, and
   draw-on-demand (no more free-running 120 Hz redraw).
-- The extended (virtual) display now offers the **iPad's native resolution
-  and refresh rate**, and tears down when the client disconnects.
+- The extended (virtual) display now offers the iPad's native resolution
+  and refresh rate, and tears down when the client disconnects.
 
 ### Quality of life
 - Settings apply from the first frame (including headless runs), atomic
