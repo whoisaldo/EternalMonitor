@@ -37,6 +37,11 @@ pub struct SharedControl {
     pub hb_capture_loop_ms: Arc<AtomicU64>,
     pub hb_capture_frame_ms: Arc<AtomicU64>,
     pub hb_encode_frame_ms: Arc<AtomicU64>,
+    /// Desktop-space rectangle of the output currently being captured, set by
+    /// the capture stage at (re)init. The input relay maps the client's
+    /// normalized touch coordinates onto this rect. `None` until the first
+    /// capture stage comes up.
+    pub capture_geometry: Arc<Mutex<Option<crate::input::CaptureGeometry>>>,
     /// The client session. Lives here (not in the transport task) so a
     /// pipeline restart — crash recovery, virtual-display toggle, settings
     /// change — does NOT force the iPad through a fresh handshake: the new
@@ -88,6 +93,7 @@ impl SharedControl {
             hb_capture_loop_ms: Arc::new(AtomicU64::new(0)),
             hb_capture_frame_ms: Arc::new(AtomicU64::new(0)),
             hb_encode_frame_ms: Arc::new(AtomicU64::new(0)),
+            capture_geometry: Arc::new(Mutex::new(None)),
             session: Arc::new(Mutex::new(crate::transport::session::Session::new({
                 use std::hash::{BuildHasher, Hasher};
                 std::collections::hash_map::RandomState::new()

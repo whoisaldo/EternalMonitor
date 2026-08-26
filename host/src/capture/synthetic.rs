@@ -61,6 +61,12 @@ pub fn run_capture_loop(
     let mut frame_number: u64 = 0;
 
     info!(width, height, "Synthetic capture source active");
+    *shared.capture_geometry.lock() = Some(crate::input::CaptureGeometry {
+        left: 0,
+        top: 0,
+        width,
+        height,
+    });
 
     // Absolute-deadline pacing. `thread::sleep` is NOT trusted for the fine
     // pacing here: macOS timer coalescing can stretch a 16 ms sleep past

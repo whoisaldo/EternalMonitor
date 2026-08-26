@@ -99,6 +99,10 @@ struct FakeReceiver {
 
 impl FakeReceiver {
     fn connect(host_port: u16) -> Self {
+        Self::connect_with_caps(host_port, 0)
+    }
+
+    fn connect_with_caps(host_port: u16, feature_caps: u16) -> Self {
         let socket = UdpSocket::bind("127.0.0.1:0").expect("receiver socket");
         socket
             .set_read_timeout(Some(Duration::from_millis(150)))
@@ -112,7 +116,7 @@ impl FakeReceiver {
             client_nonce: 0xE2E0_0001,
             listen_port,
             decoder_caps: CAP_DECODE_H264,
-            feature_caps: 0,
+            feature_caps,
             screen_px_w: 2420,
             screen_px_h: 1668,
             screen_pt_w: 1210,
@@ -508,6 +512,177 @@ fn lossy_stream_recovers_and_adapts() {
     );
 
     std::env::remove_var("ETERNAL_DROP");
+
+    shared.stop();
+    supervisor_tx
+        .send(SupervisorCommand::Shutdown)
+        .expect("send shutdown");
+    let (done_tx, done_rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = supervisor.join();
+        let _ = done_tx.send(());
+    });
+    done_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("supervisor must shut down within 5s");
+}
+
+/// Input relay, wire to injection: a client that asked for input in HELLO2
+/// sends touches/scrolls; the host maps them through the synthetic capture
+/// geometry and "injects" them into the off-Windows recorder. Duplicate edges
+/// (sent twice for loss tolerance) must inject exactly once.
+#[cfg(not(windows))]
+#[test]
+fn input_relay_maps_touches_end_to_end() {
+    use eternal_host::input::{recorder, Injection, KIND_SCROLL, KIND_TOUCH};
+    use eternal_wire::v2::control::{InputEvent, FEATURE_WANTS_INPUT};
+
+    let _guard = ENV_LOCK.lock().unwrap();
+    init_test_tracing();
+    let _ = ffmpeg_next::init();
+
+    std::env::set_var("ETERNAL_SYNTH_SIZE", format!("{SYNTH_W}x{SYNTH_H}"));
+    std::env::set_var("ETERNAL_CAPTURE", "synthetic");
+    std::env::remove_var("ETERNAL_DROP");
+
+    let listen_port = free_udp_port();
+    let shared = SharedControl::new(listen_port, pipeline::DEFAULT_BITRATE_BPS);
+    *shared.encoder_override.lock() = Some("libx264".to_string());
+    let gpu_info = GpuInfo::software_fallback();
+
+    let (supervisor_tx, supervisor_rx) = mpsc::channel();
+    let supervisor_shared = shared.clone();
+    let supervisor_tx_clone = supervisor_tx.clone();
+    let supervisor = std::thread::spawn(move || {
+        eternal_host::supervisor::run(
+            listen_port,
+            supervisor_shared,
+            gpu_info,
+            supervisor_tx_clone,
+            supervisor_rx,
+        );
+    });
+
+    let mut receiver = FakeReceiver::connect_with_caps(listen_port, FEATURE_WANTS_INPUT);
+
+    // Wait for one completed frame: capture is then certainly up, which means
+    // the capture geometry the relay maps through has been published.
+    let deadline = Instant::now() + DEADLINE;
+    let mut reassembler = Reassembler::new();
+    let mut datagram = [0u8; 2048];
+    let mut highest_seq = 0u32;
+    'media: loop {
+        assert!(Instant::now() < deadline, "no media before input phase");
+        receiver.maybe_report(highest_seq, 0);
+        let Ok((len, _)) = receiver.socket.recv_from(&mut datagram) else {
+            continue;
+        };
+        if let Classified::Media { .. } = classify(&datagram[..len]) {
+            let (header, payload) = MediaHeader::decode(&datagram[..len]).unwrap();
+            highest_seq = highest_seq.max(header.frame_seq);
+            if let AddOutcome::Completed(_) = reassembler.add_fragment(
+                header.frame_seq,
+                header.frag_index,
+                header.frag_count,
+                header.stream_epoch,
+                payload,
+                Instant::now(),
+            ) {
+                break 'media;
+            }
+        }
+    }
+
+    let _ = recorder::take(); // start the assertion window clean
+
+    let base = InputEvent {
+        input_ver: 1,
+        kind: KIND_TOUCH,
+        phase: 0, // began
+        buttons: 1,
+        event_id: 1,
+        x_norm: 0,
+        y_norm: 0,
+        pressure_x1000: 0,
+        scroll_dx: 0,
+        scroll_dy: 0,
+        keycode: 0,
+        modifiers: 0,
+        client_time_us: 0,
+    };
+
+    // Tap the top-left corner: began ×2 (edge redundancy), ended ×2.
+    receiver.send(&ControlMessage::InputEvent(base));
+    receiver.send(&ControlMessage::InputEvent(base));
+    let ended = InputEvent {
+        phase: 2,
+        event_id: 2,
+        ..base
+    };
+    receiver.send(&ControlMessage::InputEvent(ended));
+    receiver.send(&ControlMessage::InputEvent(ended));
+    // Drag to the bottom-right corner (a move), then a two-finger scroll up.
+    receiver.send(&ControlMessage::InputEvent(InputEvent {
+        phase: 1,
+        event_id: 3,
+        x_norm: 65_535,
+        y_norm: 65_535,
+        ..base
+    }));
+    receiver.send(&ControlMessage::InputEvent(InputEvent {
+        kind: KIND_SCROLL,
+        phase: 1,
+        event_id: 4,
+        x_norm: 32_768,
+        y_norm: 32_768,
+        buttons: 0,
+        scroll_dy: -40,
+        ..base
+    }));
+
+    // Give the loopback datagrams a moment to be routed and injected. The
+    // scroll event was sent last, so once its two injections appear (7 total)
+    // everything before it has been processed; a short settle then catches
+    // any wrongly-injected duplicate.
+    let inject_deadline = Instant::now() + Duration::from_secs(5);
+    while recorder::peek().len() < 7 && Instant::now() < inject_deadline {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    std::thread::sleep(Duration::from_millis(150));
+    let recorded = recorder::take();
+    assert!(
+        recorded.len() >= 7,
+        "expected 7 injections within 5s, got {recorded:?}"
+    );
+
+    // Tap at (0,0): move + left down, then move + left up — exactly once
+    // despite each edge arriving twice.
+    assert_eq!(
+        &recorded[..4],
+        &[
+            Injection::MoveAbs { x: 0, y: 0 },
+            Injection::LeftDown { x: 0, y: 0 },
+            Injection::MoveAbs { x: 0, y: 0 },
+            Injection::LeftUp { x: 0, y: 0 },
+        ],
+        "tap must inject exactly one click (recorded: {recorded:?})"
+    );
+    // Drag to the far corner maps to the absolute-space maximum.
+    assert_eq!(
+        recorded[4],
+        Injection::MoveAbs {
+            x: 65_535,
+            y: 65_535
+        }
+    );
+    // Scroll: pointer placed at ~center, then a wheel tick down.
+    let Injection::MoveAbs { x, y } = recorded[5] else {
+        panic!("expected scroll pointer move, got {:?}", recorded[5]);
+    };
+    assert!((i32::from(x) - 32_768).unsigned_abs() < 300, "scroll x {x}");
+    assert!((i32::from(y) - 32_768).unsigned_abs() < 300, "scroll y {y}");
+    assert_eq!(recorded[6], Injection::Wheel { delta: -120 });
+    assert_eq!(recorded.len(), 7, "no extra injections: {recorded:?}");
 
     shared.stop();
     supervisor_tx

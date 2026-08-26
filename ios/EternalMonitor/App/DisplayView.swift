@@ -13,15 +13,27 @@ struct DisplayView: View {
             Color.black.ignoresSafeArea()
 
             // Full-bleed video
-            MetalView()
-                .ignoresSafeArea()
-                .onTapGesture(count: 3) {
+            if connectionManager.sessionWantsInput {
+                // Input relay active: every 1-2 finger gesture belongs to the
+                // PC; a three-finger tap (via the relay layer) drives the HUD.
+                MetalView()
+                    .ignoresSafeArea()
+                TouchRelayView(onToggleHUD: {
                     showHUD.toggle()
                     scheduleHUDDismiss()
-                }
-                .onTapGesture(count: 1) {
-                    if showHUD { withAnimation(.easeOut(duration: 0.25)) { showHUD = false } }
-                }
+                })
+                .ignoresSafeArea()
+            } else {
+                MetalView()
+                    .ignoresSafeArea()
+                    .onTapGesture(count: 3) {
+                        showHUD.toggle()
+                        scheduleHUDDismiss()
+                    }
+                    .onTapGesture(count: 1) {
+                        if showHUD { withAnimation(.easeOut(duration: 0.25)) { showHUD = false } }
+                    }
+            }
 
             // Viewfinder registration marks frame the picture (fade with the HUD).
             if showHUD {
