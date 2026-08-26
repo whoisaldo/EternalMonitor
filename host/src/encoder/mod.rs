@@ -10,11 +10,11 @@ use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 
 use eternal_wire::h264::{
-    access_unit_is_intra_only, contains_nal_type, describe_extradata_format, hex_prefix,
-    is_amf_encoder, normalize_h264_payload, parameter_sets_from_extradata, H264BitstreamState,
+    contains_nal_type, describe_extradata_format, hex_prefix, is_amf_encoder,
+    normalize_h264_payload_with_info, parameter_sets_from_extradata, H264BitstreamState,
 };
 
-use crate::capture::RawFrame;
+use crate::capture::FrameSlot;
 use crate::control::SharedControl;
 use crate::gpu::GpuInfo;
 use crate::stats::PIPELINE_STATS;
@@ -34,26 +34,27 @@ pub struct NALUnit {
     pub is_keyframe: bool,
 }
 
-/// Starts the H.264 encode loop on a dedicated blocking thread.
-/// Consumes `RawFrame`s from the capture stage and produces `NALUnit`s.
-pub fn start_encoder(
-    rx: mpsc::Receiver<RawFrame>,
+/// Runs the H.264 encode loop on the CURRENT thread until the capture slot
+/// closes or stop is requested. The supervisor spawns and monitors this.
+pub fn run_encode_stage(
+    frames: FrameSlot,
+    tx: mpsc::Sender<NALUnit>,
     shared: SharedControl,
     gpu: GpuInfo,
-) -> mpsc::Receiver<NALUnit> {
-    let (tx, nal_rx) = mpsc::channel::<NALUnit>(CHANNEL_CAPACITY);
-
-    tokio::task::spawn_blocking(move || {
-        if let Err(e) = run_encode_loop(rx, tx, shared, gpu) {
-            error!(error = %e, "Encode loop exited with error");
-        }
-    });
-
-    nal_rx
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let result = run_encode_loop(frames, tx, shared, gpu);
+    if let Err(ref e) = result {
+        error!(error = %e, "Encode loop exited with error");
+    }
+    result
 }
 
+/// Capacity of the encoded-output channel (lossless: encoded frames are never
+/// dropped — a lost P-frame corrupts until the next IDR).
+pub const NAL_CHANNEL_CAPACITY: usize = CHANNEL_CAPACITY;
+
 fn run_encode_loop(
-    rx: mpsc::Receiver<RawFrame>,
+    frames: FrameSlot,
     tx: mpsc::Sender<NALUnit>,
     shared: SharedControl,
     gpu: GpuInfo,
@@ -103,7 +104,6 @@ fn run_encode_loop(
     }
 
     let mut encoder_state: Option<EncoderState> = None;
-    let mut rx = rx;
     let mut frames_since_last_idr: u64 = 0;
     // Bounded retries for the AMF startup case where a keyframe is emitted before any SPS/PPS are
     // available (empty extradata + no inline parameter sets). We nudge another IDR a few times so
@@ -117,10 +117,24 @@ fn run_encode_loop(
     // iPad never sits in `waitingForSyncSample` after a connect or pipeline restart.
     shared.force_next_idr.store(true, Ordering::SeqCst);
 
-    while let Some(raw_frame) = rx.blocking_recv() {
+    // Test-harness fault injection: die after N encoded frames so the E2E can
+    // prove the supervisor's auto-restart. Consumed once (self-clearing) so
+    // the restarted generation streams normally.
+    let fault_after: Option<u64> = std::env::var("ETERNAL_FAULT_ENCODER_AFTER")
+        .ok()
+        .and_then(|v| v.trim().parse().ok());
+
+    while let Some(raw_frame) = frames.blocking_take() {
         if !shared.running.load(Ordering::SeqCst) {
             info!("Encoder loop stopping on running=false");
             break;
+        }
+
+        if let Some(after) = fault_after {
+            if raw_frame.frame_number >= after {
+                std::env::remove_var("ETERNAL_FAULT_ENCODER_AFTER");
+                return Err("injected encoder fault (ETERNAL_FAULT_ENCODER_AFTER)".into());
+            }
         }
 
         if raw_frame.data.is_empty() {
@@ -269,16 +283,15 @@ fn run_encode_loop(
 
                     let packet_bytes = encoder.packet.data().unwrap_or_default();
                     let packet_is_key = encoder.packet.is_key();
-                    let nal_data = normalize_h264_payload(
+                    let (nal_data, au_info) = normalize_h264_payload_with_info(
                         packet_bytes,
                         packet_is_key,
                         &mut encoder.h264,
                         &encoder_name,
                     );
-                    let intra_only_access_unit = access_unit_is_intra_only(&nal_data);
                     let is_keyframe = packet_is_key
-                        || contains_nal_type(&nal_data, 5)
-                        || (is_amf_encoder(&encoder_name) && intra_only_access_unit);
+                        || au_info.contains_idr
+                        || (is_amf_encoder(&encoder_name) && au_info.intra_only);
                     encoder.observe_amf_diagnostics(
                         &nal_data,
                         raw_frame.frame_number,
@@ -306,6 +319,7 @@ fn run_encode_loop(
                     PIPELINE_STATS
                         .lock()
                         .record_encode(encode_us, nal_data.len(), current_bitrate);
+                    crate::capture::heartbeat(&shared.hb_encode_frame_ms);
 
                     debug!(
                         frame = raw_frame.frame_number,
@@ -410,7 +424,8 @@ impl EncoderState {
             ffmpeg_next::format::Pixel::YUV420P,
             width,
             height,
-            ffmpeg_next::software::scaling::Flags::BILINEAR,
+            // 1:1 scale — the "filter" only converts colorspace, so take the fast path.
+            ffmpeg_next::software::scaling::Flags::FAST_BILINEAR,
         )?;
         info!("swscale BGRA->YUV420P context created");
 

@@ -576,8 +576,12 @@ impl AnalyzerApp {
                 copy_logs_button.on_hover_text("No recent log lines have been captured yet.");
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if danger_button(ui, "Stop").clicked() {
-                    self.control.shared.stop();
+                if snap.pipeline_running {
+                    if danger_button(ui, "Stop").clicked() {
+                        self.control.request_stop();
+                    }
+                } else if amber_button(ui, "Start").clicked() {
+                    self.control.request_start();
                 }
             });
         });

@@ -5,15 +5,15 @@
 
 use std::collections::VecDeque;
 use std::sync::atomic::Ordering;
-use std::time::Instant;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
-use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 use windows::core::Interface;
 
 use super::{
-    client_connected, frame_budget_for, reconcile_virtual_display, resolve_target, OutputInfo,
-    RawFrame, ACQUIRE_TIMEOUT_MS, FPS_WINDOW, IDLE_KEEPALIVE,
+    client_connected, frame_budget_for, heartbeat, reconcile_virtual_display, resolve_target,
+    FrameSlot, OutputInfo, RawFrame, ACQUIRE_TIMEOUT_MS, FPS_WINDOW, IDLE_KEEPALIVE,
 };
 use crate::control::SharedControl;
 use crate::stats::PIPELINE_STATS;
@@ -97,7 +97,7 @@ pub fn enumerate_outputs() -> Vec<OutputInfo> {
 /// Enumerate adapters, select the output to duplicate, create duplication,
 /// and pull frames at the target fps. Runs on a blocking thread — never call from async context.
 pub fn run_capture_loop(
-    tx: mpsc::Sender<RawFrame>,
+    slot: &FrameSlot,
     shared: SharedControl,
     adapter_index: u32,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -243,7 +243,12 @@ pub fn run_capture_loop(
     info!("Staging texture created for CPU readback");
 
     let mut row_bytes = (tex_width * 4) as usize;
-    let mut pixel_buf: Vec<u8> = vec![0u8; row_bytes * tex_height as usize];
+    let mut frame_bytes = row_bytes * tex_height as usize;
+    // Buffer recycling (see synthetic.rs): steady state re-uses one buffer.
+    let mut spare: Option<Arc<Vec<u8>>> = None;
+    // The last published frame, shared for keepalive resends without a copy.
+    // Starts as a black frame so a static screen still yields a startup IDR.
+    let mut last_frame: Arc<Vec<u8>> = Arc::new(vec![0u8; frame_bytes]);
 
     // --- Capture loop state ---
     let mut frame_number: u64 = 0;
@@ -265,6 +270,7 @@ pub fn run_capture_loop(
             info!("Capture loop stopping on running=false");
             break;
         }
+        heartbeat(&shared.hb_capture_loop_ms);
 
         let frame_start = Instant::now();
         let frame_budget = frame_budget_for(shared.target_fps.load(Ordering::SeqCst));
@@ -325,8 +331,10 @@ pub fn run_capture_loop(
                     "Frame acquired"
                 );
 
-                // --- Copy desktop texture to staging and read pixels ---
-                let bgra_data = if let Some(ref resource) = desktop_resource {
+                // --- Copy desktop texture to staging and read pixels into a
+                // recycled buffer (the readback is the ONLY full-frame copy) ---
+                let frame_data: Option<Arc<Vec<u8>>> = if let Some(ref resource) = desktop_resource
+                {
                     match resource.cast::<ID3D11Texture2D>() {
                         Ok(desktop_texture) => {
                             unsafe {
@@ -337,6 +345,12 @@ pub fn run_capture_loop(
                             unsafe {
                                 duplication.ReleaseFrame()?;
                             }
+
+                            let mut pixel_buf =
+                                match spare.take().and_then(|arc| Arc::try_unwrap(arc).ok()) {
+                                    Some(buf) if buf.len() == frame_bytes => buf,
+                                    _ => vec![0u8; frame_bytes],
+                                };
 
                             // Map staging texture for CPU read
                             let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
@@ -382,39 +396,41 @@ pub fn run_capture_loop(
                                 );
                             }
 
-                            pixel_buf.clone()
+                            Some(Arc::new(pixel_buf))
                         }
                         Err(e) => {
                             warn!(error = %e, "Failed to cast IDXGIResource to ID3D11Texture2D");
                             unsafe {
                                 duplication.ReleaseFrame()?;
                             }
-                            Vec::new()
+                            None
                         }
                     }
                 } else {
                     unsafe {
                         duplication.ReleaseFrame()?;
                     }
-                    Vec::new()
+                    None
                 };
 
-                // Record stats
-                PIPELINE_STATS.lock().record_capture(tex_width, tex_height);
+                if let Some(data) = frame_data {
+                    // Record stats
+                    PIPELINE_STATS.lock().record_capture(tex_width, tex_height);
+                    heartbeat(&shared.hb_capture_frame_ms);
 
-                // Send downstream
-                let raw_frame = RawFrame {
-                    frame_number,
-                    timestamp: now,
-                    data: bgra_data,
-                    width: tex_width,
-                    height: tex_height,
-                };
-                if tx.blocking_send(raw_frame).is_err() {
-                    info!("Channel closed, stopping capture");
-                    break;
+                    slot.publish(RawFrame {
+                        frame_number,
+                        timestamp: now,
+                        data: Arc::clone(&data),
+                        width: tex_width,
+                        height: tex_height,
+                    });
+                    // The displaced spare (if any) plus last_frame keep at most
+                    // two buffers alive; steady state recycles them.
+                    spare = Some(Arc::clone(&last_frame));
+                    last_frame = data;
+                    last_send = now;
                 }
-                last_send = now;
             }
             Err(e) if e.code() == DXGI_ERROR_WAIT_TIMEOUT => {
                 // Desktop unchanged — not an error.
@@ -432,24 +448,54 @@ pub fn run_capture_loop(
                     frame_number += 1;
                     let now = Instant::now();
                     PIPELINE_STATS.lock().record_capture(tex_width, tex_height);
-                    let raw_frame = RawFrame {
+                    heartbeat(&shared.hb_capture_frame_ms);
+                    slot.publish(RawFrame {
                         frame_number,
                         timestamp: now,
-                        data: pixel_buf.clone(),
+                        data: Arc::clone(&last_frame),
                         width: tex_width,
                         height: tex_height,
-                    };
-                    if tx.blocking_send(raw_frame).is_err() {
-                        info!("Channel closed, stopping capture");
-                        break;
-                    }
+                    });
                     last_send = now;
                 }
                 continue;
             }
             Err(e) if e.code() == DXGI_ERROR_ACCESS_LOST => {
                 warn!("Desktop duplication access lost — reinitializing");
-                duplication = unsafe { output1.DuplicateOutput(&device)? };
+                // Transient E_ACCESSDENIED is normal during UAC prompts,
+                // Ctrl+Alt+Del, fullscreen transitions, and driver resets:
+                // retry with backoff instead of dying on the first failure.
+                let mut reinit = None;
+                let delays_ms = [100u64, 250, 500, 1000, 2000];
+                for attempt in 0..15 {
+                    if !shared.running.load(Ordering::SeqCst) {
+                        break;
+                    }
+                    // Keep the watchdog quiet: this wait IS the recovery.
+                    heartbeat(&shared.hb_capture_loop_ms);
+                    match unsafe { output1.DuplicateOutput(&device) } {
+                        Ok(d) => {
+                            reinit = Some(d);
+                            break;
+                        }
+                        Err(retry_error) => {
+                            let delay = delays_ms[attempt.min(delays_ms.len() - 1)];
+                            debug!(
+                                attempt,
+                                error = %retry_error,
+                                delay_ms = delay,
+                                "DuplicateOutput retry failed"
+                            );
+                            std::thread::sleep(Duration::from_millis(delay));
+                        }
+                    }
+                }
+                let Some(new_duplication) = reinit else {
+                    return Err(
+                        "desktop duplication could not be reacquired after ~20s of retries".into(),
+                    );
+                };
+                duplication = new_duplication;
                 // A resolution/topology change also surfaces as ACCESS_LOST. Re-read the
                 // duplication geometry and rebuild the staging texture + CPU buffer if it changed,
                 // otherwise CopyResource silently no-ops on a size mismatch and the iPad freezes.
@@ -466,7 +512,9 @@ pub fn run_capture_loop(
                     tex_width = new_w;
                     tex_height = new_h;
                     row_bytes = (tex_width * 4) as usize;
-                    pixel_buf = vec![0u8; row_bytes * tex_height as usize];
+                    frame_bytes = row_bytes * tex_height as usize;
+                    spare = None;
+                    last_frame = Arc::new(vec![0u8; frame_bytes]);
                     staging_texture = unsafe {
                         let mut tex = None;
                         device.CreateTexture2D(

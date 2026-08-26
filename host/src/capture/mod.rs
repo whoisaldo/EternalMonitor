@@ -6,9 +6,10 @@
 //! file is portable policy: output selection, pacing, and the virtual-display
 //! reconciliation that decides *what* to capture.
 
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use tokio::sync::mpsc;
+use parking_lot::{Condvar, Mutex};
 use tracing::error;
 #[cfg(windows)]
 use tracing::{info, warn};
@@ -38,14 +39,89 @@ pub(crate) fn frame_budget_for(target_fps: u32) -> Duration {
     Duration::from_micros(1_000_000 / fps)
 }
 
-/// Frame data sent downstream for encoding/transport.
+/// Frame data sent downstream for encoding/transport. The pixels are shared
+/// (`Arc`) so keepalive resends and the capture loop's buffer reuse never copy
+/// a full frame again — the staging-texture readback is the only full-frame
+/// copy left on the capture side.
 #[derive(Debug, Clone)]
 pub struct RawFrame {
     pub frame_number: u64,
     pub timestamp: Instant,
-    pub data: Vec<u8>,
+    pub data: Arc<Vec<u8>>,
     pub width: u32,
     pub height: u32,
+}
+
+/// Latest-wins handoff from capture to encoder: a 1-deep mailbox. Publishing
+/// displaces an unconsumed older frame, so the encoder always works on the
+/// freshest picture instead of draining a backlog (the old 4-deep channel
+/// could queue ~67ms of latency under load). Encoded output downstream still
+/// uses a lossless channel — dropping an ENCODED P-frame corrupts the GOP,
+/// dropping an unencoded capture frame just skips a tick.
+pub struct FrameSlot {
+    inner: Arc<SlotInner>,
+}
+
+struct SlotInner {
+    state: Mutex<SlotState>,
+    condvar: Condvar,
+}
+
+#[derive(Default)]
+struct SlotState {
+    frame: Option<RawFrame>,
+    closed: bool,
+}
+
+impl FrameSlot {
+    fn new() -> Self {
+        Self {
+            inner: Arc::new(SlotInner {
+                state: Mutex::new(SlotState::default()),
+                condvar: Condvar::new(),
+            }),
+        }
+    }
+
+    fn handle(&self) -> FrameSlot {
+        FrameSlot {
+            inner: Arc::clone(&self.inner),
+        }
+    }
+
+    pub fn publish(&self, frame: RawFrame) {
+        let mut state = self.inner.state.lock();
+        state.frame = Some(frame); // displaces any unconsumed frame
+        self.inner.condvar.notify_one();
+    }
+
+    pub fn close(&self) {
+        let mut state = self.inner.state.lock();
+        state.closed = true;
+        self.inner.condvar.notify_all();
+    }
+
+    /// Blocks until a frame is available or the producer closed the slot.
+    pub fn blocking_take(&self) -> Option<RawFrame> {
+        let mut state = self.inner.state.lock();
+        loop {
+            if let Some(frame) = state.frame.take() {
+                return Some(frame);
+            }
+            if state.closed {
+                return None;
+            }
+            self.inner.condvar.wait(&mut state);
+        }
+    }
+}
+
+/// Stamp a watchdog heartbeat (ms on the process clock).
+pub(crate) fn heartbeat(atomic: &std::sync::atomic::AtomicU64) {
+    atomic.store(
+        crate::clock::host_now_us() / 1000,
+        std::sync::atomic::Ordering::Relaxed,
+    );
 }
 
 /// A desktop-attached display output discovered via DXGI, usable as a capture source.
@@ -203,44 +279,56 @@ pub(crate) fn reconcile_virtual_display(
     }
 }
 
-/// Starts the capture loop on a dedicated blocking thread and returns the frame stream.
-/// The backend is DXGI on Windows (unless `ETERNAL_CAPTURE=synthetic`) and the synthetic
-/// test pattern everywhere else.
-pub fn start_capture(shared: SharedControl, adapter_index: u32) -> mpsc::Receiver<RawFrame> {
-    let (tx, rx) = mpsc::channel::<RawFrame>(4);
-
-    tokio::task::spawn_blocking(move || {
-        let result = run_platform_loop(tx, shared, adapter_index);
-        if let Err(e) = result {
-            error!(error = %e, "Capture loop exited with error");
+/// Runs the platform capture loop on the CURRENT thread until stop/close,
+/// publishing frames into `slot`. The supervisor spawns and monitors this.
+pub fn run_capture_stage(
+    slot: FrameSlot,
+    shared: SharedControl,
+    adapter_index: u32,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    struct CloseOnExit(FrameSlot);
+    impl Drop for CloseOnExit {
+        fn drop(&mut self) {
+            self.0.close();
         }
-    });
+    }
+    let guard = CloseOnExit(slot.handle());
+    let result = run_platform_loop(&guard.0, shared, adapter_index);
+    if let Err(ref e) = result {
+        error!(error = %e, "Capture loop exited with error");
+    }
+    result
+}
 
-    rx
+/// A producer/consumer pair for the capture→encoder handoff.
+pub fn frame_slot() -> (FrameSlot, FrameSlot) {
+    let producer = FrameSlot::new();
+    let consumer = producer.handle();
+    (producer, consumer)
 }
 
 #[cfg(windows)]
 fn run_platform_loop(
-    tx: mpsc::Sender<RawFrame>,
+    slot: &FrameSlot,
     shared: SharedControl,
     adapter_index: u32,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let synthetic_requested =
         std::env::var("ETERNAL_CAPTURE").is_ok_and(|v| v.trim().eq_ignore_ascii_case("synthetic"));
     if synthetic_requested {
-        synthetic::run_capture_loop(tx, shared)
+        synthetic::run_capture_loop(slot, shared)
     } else {
-        dxgi::run_capture_loop(tx, shared, adapter_index)
+        dxgi::run_capture_loop(slot, shared, adapter_index)
     }
 }
 
 #[cfg(not(windows))]
 fn run_platform_loop(
-    tx: mpsc::Sender<RawFrame>,
+    slot: &FrameSlot,
     shared: SharedControl,
     _adapter_index: u32,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    synthetic::run_capture_loop(tx, shared)
+    synthetic::run_capture_loop(slot, shared)
 }
 
 /// Choose the freshly-attached virtual output: the first non-primary output whose device name was
