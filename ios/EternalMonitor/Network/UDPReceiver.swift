@@ -14,9 +14,6 @@ final class UDPReceiver {
     var onHelloFailure: ((String) -> Void)?
     var onDatagramReceived: ((Int) -> Void)?
     var onDatagramIgnored: ((String) -> Void)?
-    // surface the sequence number of every fragment so the
-    // ConnectionQualityTracker can compute rolling packet loss.
-    var onFragmentSeq: ((UInt32) -> Void)?
 
     private var connection: NWConnection?
     private let queue = DispatchQueue(label: "com.eternal.udp", qos: .userInteractive)
@@ -176,7 +173,6 @@ final class UDPReceiver {
         let payloadEnd = payloadStart + Int(header.payloadLen)
         guard payloadEnd <= data.count else { return }
 
-        onFragmentSeq?(header.seq)
         let payload = data.subdata(in: payloadStart..<payloadEnd)
         assembler?.addFragment(
             seq: header.seq,

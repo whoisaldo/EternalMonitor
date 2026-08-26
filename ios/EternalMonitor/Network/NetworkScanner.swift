@@ -141,19 +141,23 @@ extension NetworkScanner: NetServiceBrowserDelegate, NetServiceDelegate {
             print("[mDNS] Found: \(host.name) at \(host.address):\(host.port)")
             hosts.removeAll { $0.name == host.name || $0.address == host.address }
             hosts.append(host)
-            hosts.sort(by: Self.hostQualityCompare)
+            // Resolve the local subnet ONCE per sort — the old comparator called
+            // getifaddrs() for every comparison, a syscall storm on the MainActor.
+            let subnet = Self.primaryIPv4Subnet()
+            hosts.sort { Self.hostQualityCompare($0, $1, ourSubnet: subnet) }
             statusMessage = "Found \(hosts.count) host\(hosts.count == 1 ? "" : "s")"
         }
     }
 
     /// Prefer IPv4 over IPv6, then prefer same-subnet over different-subnet, then alpha by name.
-    private static func hostQualityCompare(_ a: DiscoveredHost, _ b: DiscoveredHost) -> Bool {
+    private static func hostQualityCompare(
+        _ a: DiscoveredHost, _ b: DiscoveredHost, ourSubnet: String?
+    ) -> Bool {
         let aV4 = a.address.contains(".")
         let bV4 = b.address.contains(".")
         if aV4 != bV4 {
             return aV4 // IPv4 first
         }
-        let ourSubnet = primaryIPv4Subnet()
         if let prefix = ourSubnet {
             let aSame = a.address.hasPrefix(prefix)
             let bSame = b.address.hasPrefix(prefix)

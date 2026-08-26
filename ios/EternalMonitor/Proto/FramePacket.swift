@@ -41,42 +41,45 @@ struct FramePacket {
             guard vtableSize >= 4, vtableStart + vtableSize <= buffer.count else { return nil }
             let fieldCount = (vtableSize - 4) / 2  // subtract vtableSize + objectSize header
 
-            // Helper: read field offset from vtable slot
-            func fieldOffset(_ vtSlot: Int) -> Int? {
+            // Helper: read field offset from vtable slot. `size` is the width of the
+            // value that will be read there — the bounds check must cover the WHOLE
+            // read, not just its first byte (a crafted vtable pointing a u64 read at
+            // count-1 would otherwise read 7 bytes past the buffer).
+            func fieldOffset(_ vtSlot: Int, size: Int) -> Int? {
                 let slotIndex = (vtSlot - 4) / 2  // VT offsets start at 4, each is 2 bytes
                 guard slotIndex < fieldCount else { return nil }
                 let off = Int(load(base, offset: vtableStart + 4 + slotIndex * 2) as UInt16)
                 guard off != 0 else { return nil }
                 let absolute = tableStart + off
-                guard absolute >= 0, absolute < buffer.count else { return nil }
+                guard absolute >= 0, absolute + size <= buffer.count else { return nil }
                 return absolute
             }
 
             // seq (uint32) — VT 4
-            guard let seqOff = fieldOffset(4) else { return nil }
+            guard let seqOff = fieldOffset(4, size: 4) else { return nil }
             let seq: UInt32 = load(base, offset: seqOff)
 
             // timestamp_us (uint64) — VT 6
             let timestampUs: UInt64
-            if let off = fieldOffset(6) {
+            if let off = fieldOffset(6, size: 8) {
                 timestampUs = load(base, offset: off)
             } else {
                 timestampUs = 0
             }
 
             // data ([ubyte] vector) — VT 8
-            guard let dataVecOffPos = fieldOffset(8) else { return nil }
+            guard let dataVecOffPos = fieldOffset(8, size: 4) else { return nil }
             let dataVecRelOffset = Int(load(base, offset: dataVecOffPos) as UInt32)
             let dataVecStart = dataVecOffPos + dataVecRelOffset
             guard dataVecStart >= 0, dataVecStart + 4 <= buffer.count else { return nil }
             let dataLen = Int(load(base, offset: dataVecStart) as UInt32)
             let dataStart = dataVecStart + 4
-            guard dataStart + dataLen <= buffer.count else { return nil }
+            guard dataLen >= 0, dataStart + dataLen <= buffer.count else { return nil }
             let data = Data(bytes: base + dataStart, count: dataLen)
 
             // width (uint32) — VT 10
             let width: UInt32
-            if let off = fieldOffset(10) {
+            if let off = fieldOffset(10, size: 4) {
                 width = load(base, offset: off)
             } else {
                 width = 0
@@ -84,7 +87,7 @@ struct FramePacket {
 
             // height (uint32) — VT 12
             let height: UInt32
-            if let off = fieldOffset(12) {
+            if let off = fieldOffset(12, size: 4) {
                 height = load(base, offset: off)
             } else {
                 height = 0
@@ -92,8 +95,7 @@ struct FramePacket {
 
             // is_keyframe (bool) — VT 14
             let isKeyframe: Bool
-            if let off = fieldOffset(14) {
-                guard off < buffer.count else { return nil }
+            if let off = fieldOffset(14, size: 1) {
                 isKeyframe = (base + off).load(as: UInt8.self) != 0
             } else {
                 isKeyframe = false
