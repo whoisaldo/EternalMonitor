@@ -15,10 +15,13 @@ permissions:
 env:
   CARGO_TERM_COLOR: always
   # The bundled Virtual Display Driver (VirtualDrivers/Virtual-Display-Driver,
-  # MIT). Pinned: the installer's scheduled tasks and lifecycle handling are
-  # verified against this exact version.
+  # MIT). Pinned by tag AND by the asset's SHA-256: upstream ships this setup
+  # wrapper unsigned (the driver files inside are the signed part), so exact-
+  # bytes pinning is the supply-chain gate — a re-tagged or replaced asset
+  # fails the build loudly.
   VDD_RELEASE_TAG: "25.5.2"
   VDD_ASSET: "Virtual.Display.Driver-v25.05.03-setup-x64.exe"
+  VDD_SHA256: "ca10b85babecfb636c85b3f04d2306968d4f940dd3dd35767f866207bfba846e"
 
 jobs:
   windows-installer:
@@ -64,22 +67,29 @@ jobs:
           Invoke-WebRequest -Uri "https://raw.githubusercontent.com/VirtualDrivers/Virtual-Display-Driver/$env:VDD_RELEASE_TAG/LICENSE" `
               -OutFile (Join-Path $dest "LICENSE-VirtualDisplayDriver.txt")
 
-      - name: Verify the driver's Authenticode signature
+      - name: Verify the driver against the pinned SHA-256
         shell: pwsh
         run: |
-          $sig = Get-AuthenticodeSignature "installer\vendor\vdd\$env:VDD_ASSET"
-          Write-Host "Signature status: $($sig.Status)  Signer: $($sig.SignerCertificate.Subject)"
-          if ($sig.Status -ne "Valid") {
-              throw "Driver signature is '$($sig.Status)' — refusing to release an unverified driver."
+          $path = "installer\vendor\vdd\$env:VDD_ASSET"
+          $hash = (Get-FileHash $path -Algorithm SHA256).Hash.ToLower()
+          Write-Host "Downloaded: $hash"
+          Write-Host "Pinned:     $env:VDD_SHA256"
+          if ($hash -ne $env:VDD_SHA256) {
+              throw "Driver asset hash mismatch — upstream bytes changed; re-vet the driver before updating the pin."
           }
+          # Informational: upstream's setup wrapper is unsigned today (the
+          # driver files inside are the signed part). If this ever reports
+          # Valid, tighten this step into a hard signature check too.
+          $sig = Get-AuthenticodeSignature $path
+          Write-Host "Authenticode status (informational): $($sig.Status)"
 
       - name: Install Inno Setup
         shell: pwsh
         run: choco install innosetup -y --no-progress
 
-      - name: Build the installer (strict driver signature)
+      - name: Build the installer
         shell: pwsh
-        run: .\scripts\build-installer.ps1 -StrictSignature
+        run: .\scripts\build-installer.ps1
 
       - name: Compute SHA-256
         id: hash

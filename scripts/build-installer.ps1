@@ -9,9 +9,10 @@
 # Without it, the build still succeeds and produces an app-only installer.
 
 param(
-    # Release builds (CI) pass this: an unsigned or invalidly-signed bundled
-    # driver then FAILS the build instead of warning. Local developer builds
-    # keep the warning so an unsigned test driver doesn't block iteration.
+    # Fail the build on a driver whose Authenticode signature isn't Valid.
+    # Today's upstream setup wrapper is unsigned (CI pins its SHA-256 in
+    # release.yml instead), so leave this off unless you are bundling a
+    # signed driver build and want the signature enforced.
     [switch]$StrictSignature
 )
 
