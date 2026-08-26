@@ -1,6 +1,6 @@
 use std::net::SocketAddr;
-use std::sync::mpsc as std_mpsc;
 use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::mpsc as std_mpsc;
 use std::time::{Duration, Instant};
 
 use tokio::net::UdpSocket;

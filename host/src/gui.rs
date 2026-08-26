@@ -1,18 +1,10 @@
-use std::ffi::OsStr;
 use std::net::SocketAddr;
-use std::os::windows::ffi::OsStrExt;
 
 use eframe::egui;
 use qrcode::{Color as QrModuleColor, QrCode};
 use tracing::{info, warn};
-use windows::core::{w, PCWSTR};
-use windows::Win32::Foundation::{ERROR_FILE_NOT_FOUND, ERROR_SUCCESS};
-use windows::Win32::System::Registry::{
-    RegCloseKey, RegCreateKeyExW, RegDeleteValueW, RegOpenKeyExW, RegQueryValueExW, RegSetValueExW,
-    HKEY, HKEY_CURRENT_USER, KEY_READ, KEY_SET_VALUE, REG_OPEN_CREATE_OPTIONS, REG_OPTION_NON_VOLATILE,
-    REG_SZ,
-};
 
+use crate::autostart::{first_lan_ipv4, read_startup_registry, set_startup_registry};
 use crate::capture::{enumerate_outputs, OutputInfo};
 use crate::control::{CaptureTarget, GuiControl, VddStatus};
 use crate::logging::{session_log_path, session_log_text};
@@ -56,9 +48,6 @@ const SPARKLINE_FILL_ALPHA: u8 = 22;
 const WARN_AMBER: egui::Color32 = egui::Color32::from_rgb(255, 210, 63);
 const WARN_FILL: egui::Color32 = egui::Color32::from_rgb(38, 33, 10);
 const WARN_BORDER: egui::Color32 = egui::Color32::from_rgb(96, 80, 24);
-
-const RUN_KEY_PATH: PCWSTR = w!("Software\\Microsoft\\Windows\\CurrentVersion\\Run");
-const RUN_VALUE_NAME: PCWSTR = w!("EternalMonitor");
 
 #[derive(PartialEq, Eq, Clone, Copy)]
 enum AppTab {
@@ -286,7 +275,9 @@ impl AnalyzerApp {
         match self.settings_target_ip.trim().parse::<SocketAddr>() {
             Ok(target_addr) => {
                 *self.control.shared.target_addr.lock() = target_addr;
-                PIPELINE_STATS.lock().set_target_addr(target_addr.to_string());
+                PIPELINE_STATS
+                    .lock()
+                    .set_target_addr(target_addr.to_string());
                 self.settings_target_error = None;
                 info!(target = %target_addr, "Transport target updated from GUI");
                 self.persist_settings();
@@ -371,14 +362,18 @@ impl eframe::App for AnalyzerApp {
         self.draw_sidebar(ctx, &snap);
 
         egui::CentralPanel::default()
-            .frame(egui::Frame::new().fill(BG).inner_margin(egui::Margin::same(16)))
+            .frame(
+                egui::Frame::new()
+                    .fill(BG)
+                    .inner_margin(egui::Margin::same(16)),
+            )
             .show(ctx, |ui| {
-            egui::ScrollArea::vertical().show(ui, |ui| match self.current_tab {
-                AppTab::Stream => self.draw_stream_tab(ui, &snap),
-                AppTab::Performance => self.draw_performance_tab(ui, &snap),
-                AppTab::Settings => self.draw_settings_tab(ui),
+                egui::ScrollArea::vertical().show(ui, |ui| match self.current_tab {
+                    AppTab::Stream => self.draw_stream_tab(ui, &snap),
+                    AppTab::Performance => self.draw_performance_tab(ui, &snap),
+                    AppTab::Settings => self.draw_settings_tab(ui),
+                });
             });
-        });
 
         if self.show_qr_modal {
             self.draw_qr_modal(ctx, &snap);
@@ -496,7 +491,13 @@ impl AnalyzerApp {
 
         // ── Live readouts ────────────────────────────────────────────────────
         ui.horizontal(|ui| {
-            readout_card(ui, "Frame rate", &format!("{:.0}", snap.capture_fps), "fps", ACCENT);
+            readout_card(
+                ui,
+                "Frame rate",
+                &format!("{:.0}", snap.capture_fps),
+                "fps",
+                ACCENT,
+            );
             readout_card(
                 ui,
                 "Encode",
@@ -504,8 +505,20 @@ impl AnalyzerApp {
                 "ms",
                 TEXT,
             );
-            readout_card(ui, "Latency", &format!("{:.0}", snap.latency_ms), "ms", GREEN);
-            readout_card(ui, "Bitrate", &format!("{:.1}", snap.bandwidth_mbps), "mbps", ACCENT);
+            readout_card(
+                ui,
+                "Latency",
+                &format!("{:.0}", snap.latency_ms),
+                "ms",
+                GREEN,
+            );
+            readout_card(
+                ui,
+                "Bitrate",
+                &format!("{:.1}", snap.bandwidth_mbps),
+                "mbps",
+                ACCENT,
+            );
         });
 
         ui.add_space(12.0);
@@ -515,7 +528,11 @@ impl AnalyzerApp {
                 ui.set_width(ui.available_width());
                 section_header(ui, "Encoder");
                 stat_row(ui, "GPU", value_or_unknown(&snap.gpu_name));
-                stat_row(ui, "Capture display", value_or_unknown(&snap.capture_display));
+                stat_row(
+                    ui,
+                    "Capture display",
+                    value_or_unknown(&snap.capture_display),
+                );
                 stat_row(ui, "Codec", value_or_unknown(&snap.codec_name));
                 stat_row(
                     ui,
@@ -580,10 +597,34 @@ impl AnalyzerApp {
 
         // Capture / Encode / Transport FPS · Bandwidth
         ui.horizontal(|ui| {
-            readout_card(ui, "Capture", &format!("{:.0}", snap.capture_fps), "fps", ACCENT);
-            readout_card(ui, "Encode", &format!("{:.0}", snap.encode_fps), "fps", ACCENT);
-            readout_card(ui, "Transport", &format!("{:.0}", snap.transport_fps), "fps", ACCENT);
-            readout_card(ui, "Bandwidth", &format!("{:.1}", snap.bandwidth_mbps), "mbps", GREEN);
+            readout_card(
+                ui,
+                "Capture",
+                &format!("{:.0}", snap.capture_fps),
+                "fps",
+                ACCENT,
+            );
+            readout_card(
+                ui,
+                "Encode",
+                &format!("{:.0}", snap.encode_fps),
+                "fps",
+                ACCENT,
+            );
+            readout_card(
+                ui,
+                "Transport",
+                &format!("{:.0}", snap.transport_fps),
+                "fps",
+                ACCENT,
+            );
+            readout_card(
+                ui,
+                "Bandwidth",
+                &format!("{:.1}", snap.bandwidth_mbps),
+                "mbps",
+                GREEN,
+            );
         });
 
         ui.add_space(12.0);
@@ -592,21 +633,9 @@ impl AnalyzerApp {
         card_frame().show(ui, |ui| {
             ui.set_width(ui.available_width());
             section_header(ui, "Session totals");
-            stat_row(
-                ui,
-                "Frames sent",
-                &snap.encode_frame_count.to_string(),
-            );
-            stat_row(
-                ui,
-                "Bytes sent",
-                &format_bytes(snap.transport_bytes_sent),
-            );
-            stat_row(
-                ui,
-                "Packets sent",
-                &snap.transport_packets_sent.to_string(),
-            );
+            stat_row(ui, "Frames sent", &snap.encode_frame_count.to_string());
+            stat_row(ui, "Bytes sent", &format_bytes(snap.transport_bytes_sent));
+            stat_row(ui, "Packets sent", &snap.transport_packets_sent.to_string());
             stat_row(
                 ui,
                 "Fragments sent",
@@ -615,7 +644,15 @@ impl AnalyzerApp {
             stat_row(ui, "Frames captured", &snap.capture_frame_count.to_string());
             stat_row(ui, "Uptime", &format_uptime(snap.uptime_secs));
             stat_row(ui, "Target", value_or_unknown(&snap.target_addr));
-            stat_row(ui, "mDNS", if snap.mdns_active { "Active" } else { "Inactive" });
+            stat_row(
+                ui,
+                "mDNS",
+                if snap.mdns_active {
+                    "Active"
+                } else {
+                    "Inactive"
+                },
+            );
             let gpu_temp = snap
                 .gpu_temp_c
                 .map(|t| format!("{:.1} °C", t))
@@ -830,19 +867,21 @@ impl AnalyzerApp {
 
             ui.add_space(12.0);
 
-            // --- Start on Windows startup ----------------------------------------
-            let prev_boot = self.settings_start_on_boot;
-            ui.checkbox(
-                &mut self.settings_start_on_boot,
-                egui::RichText::new("Start on Windows startup").color(TEXT).size(13.0),
-            );
-            if self.settings_start_on_boot != prev_boot {
-                if let Err(error) = set_startup_registry(self.settings_start_on_boot) {
-                    self.settings_start_on_boot = prev_boot;
-                    self.settings_target_error = Some(error);
-                } else {
-                    self.settings_target_error = None;
-                    self.persist_settings();
+            // --- Start on Windows startup (Windows-only concept) ------------------
+            if cfg!(windows) {
+                let prev_boot = self.settings_start_on_boot;
+                ui.checkbox(
+                    &mut self.settings_start_on_boot,
+                    egui::RichText::new("Start on Windows startup").color(TEXT).size(13.0),
+                );
+                if self.settings_start_on_boot != prev_boot {
+                    if let Err(error) = set_startup_registry(self.settings_start_on_boot) {
+                        self.settings_start_on_boot = prev_boot;
+                        self.settings_target_error = Some(error);
+                    } else {
+                        self.settings_target_error = None;
+                        self.persist_settings();
+                    }
                 }
             }
         });
@@ -864,7 +903,12 @@ impl AnalyzerApp {
                     .monospace(),
             );
             ui.add_space(8.0);
-            credit_link(ui, "Developer", "github.com/whoisaldo", "https://github.com/whoisaldo");
+            credit_link(
+                ui,
+                "Developer",
+                "github.com/whoisaldo",
+                "https://github.com/whoisaldo",
+            );
             credit_link(
                 ui,
                 "Repository",
@@ -1137,7 +1181,10 @@ fn danger_button(ui: &mut egui::Ui, text: &str) -> egui::Response {
         v.widgets.hovered.fg_stroke = egui::Stroke::new(1.0, RED);
         ui.add(
             egui::Button::new(
-                egui::RichText::new(text.to_uppercase()).size(12.0).monospace().strong(),
+                egui::RichText::new(text.to_uppercase())
+                    .size(12.0)
+                    .monospace()
+                    .strong(),
             )
             .corner_radius(4.0)
             .min_size(egui::vec2(0.0, 30.0)),
@@ -1145,7 +1192,6 @@ fn danger_button(ui: &mut egui::Ui, text: &str) -> egui::Response {
     })
     .inner
 }
-
 
 fn logo_widget(ui: &mut egui::Ui) {
     // Signal-level mark: three ascending amber bars (like a transmit meter).
@@ -1156,7 +1202,8 @@ fn logo_widget(ui: &mut egui::Ui) {
     let base_y = start.y + 22.0;
     for (i, h) in heights.iter().enumerate() {
         let x = start.x + i as f32 * (bar_w + gap);
-        let rect = egui::Rect::from_min_max(egui::pos2(x, base_y - h), egui::pos2(x + bar_w, base_y));
+        let rect =
+            egui::Rect::from_min_max(egui::pos2(x, base_y - h), egui::pos2(x + bar_w, base_y));
         ui.painter().rect_filled(rect, 1.0, ACCENT);
     }
     ui.add_space(28.0);
@@ -1207,8 +1254,7 @@ fn status_pill(ui: &mut egui::Ui, ctx: &egui::Context, running: bool, target_add
                 } else {
                     RED
                 };
-                let (rect, _) =
-                    ui.allocate_exact_size(egui::vec2(8.0, 8.0), egui::Sense::hover());
+                let (rect, _) = ui.allocate_exact_size(egui::vec2(8.0, 8.0), egui::Sense::hover());
                 ui.painter().circle_filled(rect.center(), 4.0, dot_color);
                 ui.add_space(2.0);
 
@@ -1294,9 +1340,19 @@ fn section_header(ui: &mut egui::Ui, text: &str) {
 
 fn stat_row(ui: &mut egui::Ui, label: &str, value: &str) {
     ui.horizontal(|ui| {
-        ui.label(egui::RichText::new(label).color(MUTED).size(11.0).monospace());
+        ui.label(
+            egui::RichText::new(label)
+                .color(MUTED)
+                .size(11.0)
+                .monospace(),
+        );
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            ui.label(egui::RichText::new(value).color(TEXT).size(11.0).monospace());
+            ui.label(
+                egui::RichText::new(value)
+                    .color(TEXT)
+                    .size(11.0)
+                    .monospace(),
+            );
         });
     });
 }
@@ -1304,10 +1360,18 @@ fn stat_row(ui: &mut egui::Ui, label: &str, value: &str) {
 /// A credits row: muted label on the left, an amber clickable link on the right.
 fn credit_link(ui: &mut egui::Ui, label: &str, text: &str, url: &str) {
     ui.horizontal(|ui| {
-        ui.label(egui::RichText::new(label).color(MUTED).size(11.0).monospace());
+        ui.label(
+            egui::RichText::new(label)
+                .color(MUTED)
+                .size(11.0)
+                .monospace(),
+        );
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             ui.hyperlink_to(
-                egui::RichText::new(text).color(ACCENT).size(11.0).monospace(),
+                egui::RichText::new(text)
+                    .color(ACCENT)
+                    .size(11.0)
+                    .monospace(),
                 url,
             )
             .on_hover_text(url);
@@ -1334,16 +1398,25 @@ fn draw_sparkline(ui: &mut egui::Ui, data: &[f64], height: f32, color: egui::Col
     );
 
     // Grid graticule
-    let grid = egui::Stroke::new(1.0, egui::Color32::from_rgba_unmultiplied(255, 255, 255, 10));
+    let grid = egui::Stroke::new(
+        1.0,
+        egui::Color32::from_rgba_unmultiplied(255, 255, 255, 10),
+    );
     let cols = 8;
     let rows = 4;
     for c in 1..cols {
         let x = rect.left() + rect.width() * c as f32 / cols as f32;
-        painter.line_segment([egui::pos2(x, rect.top()), egui::pos2(x, rect.bottom())], grid);
+        painter.line_segment(
+            [egui::pos2(x, rect.top()), egui::pos2(x, rect.bottom())],
+            grid,
+        );
     }
     for r in 1..rows {
         let y = rect.top() + rect.height() * r as f32 / rows as f32;
-        painter.line_segment([egui::pos2(rect.left(), y), egui::pos2(rect.right(), y)], grid);
+        painter.line_segment(
+            [egui::pos2(rect.left(), y), egui::pos2(rect.right(), y)],
+            grid,
+        );
     }
 
     if data.len() < 2 {
@@ -1373,8 +1446,12 @@ fn draw_sparkline(ui: &mut egui::Ui, data: &[f64], height: f32, color: egui::Col
         .collect();
 
     // Area fill under the trace
-    let fill_color =
-        egui::Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), SPARKLINE_FILL_ALPHA);
+    let fill_color = egui::Color32::from_rgba_unmultiplied(
+        color.r(),
+        color.g(),
+        color.b(),
+        SPARKLINE_FILL_ALPHA,
+    );
     let baseline = rect.bottom();
     let mut fill_points = vec![egui::pos2(points[0].x, baseline)];
     fill_points.extend_from_slice(&points);
@@ -1387,8 +1464,14 @@ fn draw_sparkline(ui: &mut egui::Ui, data: &[f64], height: f32, color: egui::Col
 
     // Glow underlay + crisp trace on top
     let glow = egui::Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), 60);
-    painter.add(egui::Shape::line(points.clone(), egui::Stroke::new(4.0, glow)));
-    painter.add(egui::Shape::line(points.clone(), egui::Stroke::new(1.5, color)));
+    painter.add(egui::Shape::line(
+        points.clone(),
+        egui::Stroke::new(4.0, glow),
+    ));
+    painter.add(egui::Shape::line(
+        points.clone(),
+        egui::Stroke::new(1.5, color),
+    ));
 
     // Bright dot at the latest sample
     if let Some(last) = points.last() {
@@ -1399,7 +1482,10 @@ fn draw_sparkline(ui: &mut egui::Ui, data: &[f64], height: f32, color: egui::Col
     painter.text(
         egui::pos2(rect.right() - 6.0, rect.top() + 5.0),
         egui::Align2::RIGHT_TOP,
-        format!("pk {max_val:.1}  ·  now {:.1}", data.last().copied().unwrap_or(0.0)),
+        format!(
+            "pk {max_val:.1}  ·  now {:.1}",
+            data.last().copied().unwrap_or(0.0)
+        ),
         egui::FontId::monospace(10.0),
         MUTED2,
     );
@@ -1435,7 +1521,7 @@ fn value_or_unknown(value: &str) -> &str {
     }
 }
 
-pub(crate) fn detect_local_ip(listen_port: u16) -> String {
+pub fn detect_local_ip(listen_port: u16) -> String {
     // Primary: ask the OS which local interface would route toward a public address. This is the
     // happy path on any machine with a normal default route.
     if let Ok(addr) = std::net::UdpSocket::bind("0.0.0.0:0").and_then(|s| {
@@ -1457,137 +1543,6 @@ pub(crate) fn detect_local_ip(listen_port: u16) -> String {
     format!("unknown:{listen_port}")
 }
 
-/// Return the first non-loopback IPv4 address bound to a local adapter, via the Win32
-/// IP Helper API. Used only as a fallback when the route-probe trick can't determine the LAN IP.
-fn first_lan_ipv4() -> Option<std::net::Ipv4Addr> {
-    use windows::Win32::NetworkManagement::IpHelper::{GetIpAddrTable, MIB_IPADDRTABLE};
-
-    unsafe {
-        // First call sizes the buffer.
-        let mut size: u32 = 0;
-        let _ = GetIpAddrTable(None, &mut size, false);
-        if size == 0 {
-            return None;
-        }
-        let mut buffer = vec![0u8; size as usize];
-        let table = buffer.as_mut_ptr() as *mut MIB_IPADDRTABLE;
-        if GetIpAddrTable(Some(table), &mut size, false) != 0 {
-            return None;
-        }
-
-        let table = &*table;
-        let rows = std::slice::from_raw_parts(table.table.as_ptr(), table.dwNumEntries as usize);
-        for row in rows {
-            let ip = ipv4_from_inaddr(row.dwAddr);
-            if !ip.is_loopback() && !ip.is_unspecified() {
-                return Some(ip);
-            }
-        }
-    }
-    None
-}
-
-/// Convert a Win32 `MIB_IPADDRROW.dwAddr` (an IPv4 address stored in **network byte order in
-/// memory**) into an `Ipv4Addr`. The four octets sit in memory as `[a, b, c, d]`, and
-/// `to_ne_bytes()` returns exactly those in-memory bytes on any platform, so this yields `a.b.c.d`.
-/// Do NOT switch to `to_be_bytes()`: on little-endian that reorders the octets to `d.c.b.a`
-/// (e.g. 192.168.1.1 -> 1.1.168.192). See the test below.
-fn ipv4_from_inaddr(dword: u32) -> std::net::Ipv4Addr {
-    std::net::Ipv4Addr::from(dword.to_ne_bytes())
-}
-
-fn read_startup_registry() -> bool {
-    match open_run_key(KEY_READ) {
-        Ok(key) => {
-            let result = unsafe {
-                RegQueryValueExW(
-                    key.0,
-                    RUN_VALUE_NAME,
-                    None,
-                    None,
-                    None,
-                    Some(&mut 0u32),
-                )
-            };
-            result == ERROR_SUCCESS
-        }
-        Err(_) => false,
-    }
-}
-
-fn set_startup_registry(enabled: bool) -> Result<(), String> {
-    if enabled {
-        let exe_path = std::env::current_exe().map_err(|error| error.to_string())?;
-        let key = create_run_key()?;
-        let exe_path = utf16_bytes(exe_path.as_os_str());
-        let status = unsafe { RegSetValueExW(key.0, RUN_VALUE_NAME, 0, REG_SZ, Some(&exe_path)) };
-        if status == ERROR_SUCCESS {
-            info!("Startup registry updated");
-            Ok(())
-        } else {
-            Err(format!("Failed to set startup entry: {:?}", status))
-        }
-    } else {
-        let key = open_run_key(KEY_SET_VALUE)?;
-        let status = unsafe { RegDeleteValueW(key.0, RUN_VALUE_NAME) };
-        if status == ERROR_SUCCESS || status == ERROR_FILE_NOT_FOUND {
-            info!("Startup registry updated");
-            Ok(())
-        } else {
-            Err(format!("Failed to remove startup entry: {:?}", status))
-        }
-    }
-}
-
-fn create_run_key() -> Result<OwnedRegKey, String> {
-    let mut key = HKEY::default();
-    let status = unsafe {
-        RegCreateKeyExW(
-            HKEY_CURRENT_USER,
-            RUN_KEY_PATH,
-            0,
-            PCWSTR::null(),
-            REG_OPEN_CREATE_OPTIONS(REG_OPTION_NON_VOLATILE.0),
-            KEY_SET_VALUE,
-            None,
-            &mut key,
-            None,
-        )
-    };
-    if status == ERROR_SUCCESS {
-        Ok(OwnedRegKey(key))
-    } else {
-        Err(format!("Failed to open Run key: {:?}", status))
-    }
-}
-
-fn open_run_key(access: windows::Win32::System::Registry::REG_SAM_FLAGS) -> Result<OwnedRegKey, String> {
-    let mut key = HKEY::default();
-    let status = unsafe { RegOpenKeyExW(HKEY_CURRENT_USER, RUN_KEY_PATH, 0, access, &mut key) };
-    if status == ERROR_SUCCESS {
-        Ok(OwnedRegKey(key))
-    } else {
-        Err(format!("Failed to open Run key: {:?}", status))
-    }
-}
-
-fn utf16_bytes(value: &OsStr) -> Vec<u8> {
-    let wide: Vec<u16> = value.encode_wide().chain(std::iter::once(0)).collect();
-    let len = wide.len() * std::mem::size_of::<u16>();
-    let ptr = wide.as_ptr() as *const u8;
-    unsafe { std::slice::from_raw_parts(ptr, len) }.to_vec()
-}
-
-struct OwnedRegKey(HKEY);
-
-impl Drop for OwnedRegKey {
-    fn drop(&mut self) {
-        unsafe {
-            let _ = RegCloseKey(self.0);
-        }
-    }
-}
-
 /// Launch the GUI window. Blocks the calling thread.
 pub fn run_gui(control: GuiControl) -> eframe::Result<()> {
     let icon = eframe::icon_data::from_png_bytes(include_bytes!("../assets/icon_256.png"))
@@ -1607,19 +1562,4 @@ pub fn run_gui(control: GuiControl) -> eframe::Result<()> {
         options,
         Box::new(|cc| Ok(Box::new(AnalyzerApp::new(cc, control)))),
     )
-}
-
-#[cfg(test)]
-mod tests {
-    use super::ipv4_from_inaddr;
-    use std::net::Ipv4Addr;
-
-    #[test]
-    fn ipv4_from_inaddr_preserves_network_order_octets() {
-        // Windows stores 192.168.1.1 as the in-memory bytes [192, 168, 1, 1] (network order); the
-        // u32 we read from that memory is from_ne_bytes([192,168,1,1]). Converting back must give
-        // 192.168.1.1 — not the byte-reversed 1.1.168.192 that to_be_bytes() would produce on LE.
-        let dword = u32::from_ne_bytes([192, 168, 1, 1]);
-        assert_eq!(ipv4_from_inaddr(dword), Ipv4Addr::new(192, 168, 1, 1));
-    }
 }

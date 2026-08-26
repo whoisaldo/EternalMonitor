@@ -97,13 +97,16 @@ impl SettingsFile {
 /// session log, and AMF diagnostics so they keep working when the app is installed read-only
 /// under `Program Files`. Returns `None` only if neither `APPDATA` nor `HOME` is set.
 pub fn app_data_dir() -> Option<PathBuf> {
-    let base = std::env::var("APPDATA").ok().map(PathBuf::from).or_else(|| {
-        std::env::var("HOME").ok().map(|home| {
-            PathBuf::from(home)
-                .join("Library")
-                .join("Application Support")
-        })
-    })?;
+    let base = std::env::var("APPDATA")
+        .ok()
+        .map(PathBuf::from)
+        .or_else(|| {
+            std::env::var("HOME").ok().map(|home| {
+                PathBuf::from(home)
+                    .join("Library")
+                    .join("Application Support")
+            })
+        })?;
     Some(base.join(APP_FOLDER))
 }
 
