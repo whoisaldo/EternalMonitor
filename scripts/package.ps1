@@ -1,12 +1,32 @@
-# EternalMonitor release packaging script
+# EternalMonitor release packaging script (zip, no installer)
 # Usage: .\scripts\package.ps1
+#
+# FFmpeg runtime location: set the FFMPEG_DIR environment variable (the same
+# one the build itself uses). If unset, falls back to .cargo\config.toml for
+# developer machines that pin it there.
 
-$version = "v0.1.2-mirror"
+$ErrorActionPreference = "Stop"
+$repo = Split-Path -Parent $PSScriptRoot
+Set-Location $repo
+
+$version = [regex]::Match((Get-Content -Raw "host\Cargo.toml"), 'version\s*=\s*"([^"]+)"').Groups[1].Value
+if (-not $version) { throw "Could not read the package version from host\Cargo.toml" }
 $distDir = "dist"
-$zipName = "EternalMonitor-$version-windows.zip"
+$zipName = "EternalMonitor-v$version-windows.zip"
+
+function Resolve-FfmpegDir {
+    if ($env:FFMPEG_DIR) { return $env:FFMPEG_DIR }
+    if (Test-Path ".cargo\config.toml") {
+        $cargoConfig = Get-Content -Raw ".cargo\config.toml"
+        $m = [regex]::Match($cargoConfig, 'FFMPEG_DIR\s*=\s*\{\s*value\s*=\s*"([^"]+)"')
+        if (-not $m.Success) { $m = [regex]::Match($cargoConfig, 'FFMPEG_DIR\s*=\s*"([^"]+)"') }
+        if ($m.Success) { return $m.Groups[1].Value }
+    }
+    throw "FFMPEG_DIR is not set. Point it at your FFmpeg 7.1 shared SDK (the folder containing bin\avcodec-*.dll)."
+}
 
 Write-Host "[1/5] Building release binary..."
-cargo build --release -p eternal-host
+cargo build --release --locked -p eternal-host
 if ($LASTEXITCODE -ne 0) { exit 1 }
 
 Write-Host "[2/5] Preparing dist/..."
@@ -15,15 +35,7 @@ New-Item -ItemType Directory -Path $distDir | Out-Null
 
 Write-Host "[3/5] Copying files..."
 Copy-Item "target\release\eternal-host.exe" "$distDir\EternalMonitor-host.exe"
-$cargoConfig = Get-Content -Raw ".cargo\config.toml"
-$ffmpegMatch = [regex]::Match($cargoConfig, 'FFMPEG_DIR\s*=\s*\{\s*value\s*=\s*"([^"]+)"')
-if (-not $ffmpegMatch.Success) {
-    $ffmpegMatch = [regex]::Match($cargoConfig, 'FFMPEG_DIR\s*=\s*"([^"]+)"')
-}
-if (-not $ffmpegMatch.Success) {
-    throw "Could not resolve FFMPEG_DIR from .cargo/config.toml"
-}
-$ffmpegBin = (Join-Path $ffmpegMatch.Groups[1].Value "bin")
+$ffmpegBin = Join-Path (Resolve-FfmpegDir) "bin"
 Copy-Item "$ffmpegBin\*.dll" "$distDir\"
 Copy-Item "$ffmpegBin\ffmpeg.exe" "$distDir\"
 Copy-Item "README.md" "$distDir\"

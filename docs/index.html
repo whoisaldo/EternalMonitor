@@ -53,8 +53,8 @@
       </div>
       <div class="hero-trust">
         <span class="trust-signal">60fps</span>
-        <span class="trust-signal">H.264 Hardware Encode</span>
-        <span class="trust-signal">120Hz ProMotion</span>
+        <span class="trust-signal">Hardware H.264 / HEVC</span>
+        <span class="trust-signal">Touch &amp; Pencil control</span>
       </div>
     </div>
   </section>
@@ -63,8 +63,8 @@
   <section class="stats-bar reveal">
     <div class="container stats-grid">
       <div class="stat">
-        <span class="stat-value">&lt;20ms</span>
-        <span class="stat-label">latency</span>
+        <span class="stat-value">2-way</span>
+        <span class="stat-label">video out, input back</span>
       </div>
       <div class="stat">
         <span class="stat-value">60fps</span>
@@ -86,13 +86,13 @@
     <div class="container">
       <div class="section-header reveal">
         <h2>How it works</h2>
-        <p>Three steps. No drivers to install, no account to create.</p>
+        <p>Three steps. One installer sets up everything &mdash; no account to create.</p>
       </div>
       <div class="steps-grid reveal">
         <div class="step">
           <div class="step-number">1</div>
           <h3>Run the host</h3>
-          <p>Launch EternalMonitor on your Windows PC. It captures your display with DXGI and encodes with hardware H.264 (NVIDIA, AMD, or Intel).</p>
+          <p>Launch EternalMonitor on your Windows PC. It captures your display with DXGI and encodes on the GPU &mdash; H.264 by default, HEVC opt-in (NVIDIA, AMD, or Intel).</p>
         </div>
         <div class="step">
           <div class="step-number">2</div>
@@ -102,7 +102,7 @@
         <div class="step">
           <div class="step-number">3</div>
           <h3>Start streaming</h3>
-          <p>Your iPad is now a second display. Frames are streamed over UDP, decoded with VideoToolbox, and rendered with Metal.</p>
+          <p>Your iPad is now a second display you can touch: tap to click, drag, scroll, use the Pencil. The stream adapts its bitrate to your WiFi, recovers from loss, and shows its real measured latency in the HUD.</p>
         </div>
       </div>
     </div>
@@ -145,8 +145,8 @@
   <section class="limitations reveal">
     <div class="container">
       <div class="limitations-card">
-        <span class="limitations-badge">v0.1.2 Preview</span>
-        <p>v0.1.2 adds an on-demand extended display (via a bundled virtual display driver) and hardened multi-vendor encoding (NVIDIA/AMD/Intel). A first-party display driver, USB transport, and touch input are on the roadmap.</p>
+        <span class="limitations-badge">v0.2.0</span>
+        <p>v0.2.0 rebuilds the streaming core: a real session protocol, adaptive bitrate and loss recovery, touch/Pencil control of the PC, opt-in HEVC, and an extended display that matches the iPad's native resolution. Audio, USB transport, and a first-party display driver are on the roadmap.</p>
       </div>
     </div>
   </section>
@@ -165,17 +165,17 @@
           </div>
           <span class="badge badge-green">Done</span>
         </div>
-        <div class="milestone">
+        <div class="milestone milestone--done">
           <div class="milestone-info">
             <span class="milestone-version">v0.2.0</span>
-            <span class="milestone-name">Extend + USB</span>
+            <span class="milestone-name">Extend + Control</span>
           </div>
-          <span class="badge badge-muted">Upcoming</span>
+          <span class="badge badge-green">Done</span>
         </div>
         <div class="milestone">
           <div class="milestone-info">
             <span class="milestone-version">v0.3.0</span>
-            <span class="milestone-name">Touch input</span>
+            <span class="milestone-name">Audio + USB</span>
           </div>
           <span class="badge badge-muted">Upcoming</span>
         </div>
