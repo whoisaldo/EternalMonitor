@@ -2,13 +2,16 @@ use std::sync::mpsc;
 
 use eternal_host::control::{GuiControl, SharedControl};
 use eternal_host::pipeline::{self, DEFAULT_BITRATE_BPS};
-use eternal_host::{capture, discovery, gpu, gui, logging, stats, vdd};
+use eternal_host::{capture, clock, discovery, gpu, gui, logging, stats, vdd};
 use tracing::{error, info};
 use tracing_subscriber::fmt::writer::MakeWriterExt;
 use tracing_subscriber::prelude::*;
 use tracing_subscriber::EnvFilter;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Anchor the process-wide media clock before anything else runs.
+    clock::init();
+
     let env_filter =
         EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info,mdns_sd=warn"));
     let stdout_layer = tracing_subscriber::fmt::layer()

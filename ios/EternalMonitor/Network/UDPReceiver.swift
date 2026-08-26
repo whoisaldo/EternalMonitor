@@ -1,42 +1,51 @@
 import Foundation
 import Network
+import os
 
-/// Receives UDP datagrams on a specified port, parses FragmentHeader, and feeds fragments
-/// to the FrameAssembler. Uses a single UDP connection bound to the local listening port
-/// so HELLO registration and frame reception happen on the same socket.
+/// One UDP socket to the host: media fragments in, control datagrams both
+/// ways. Binds an EPHEMERAL local port (advertised to the host in HELLO2);
+/// demuxes inbound traffic by the v2 wire prefix — media goes to the
+/// `FrameAssembler`, control to the `ControlChannel`.
 final class UDPReceiver {
+    /// The host's control/media port we connect to.
     let port: UInt16
     var assembler: FrameAssembler?
+    var onControlDatagram: ((Data) -> Void)?
     var onConnectionEstablished: (() -> Void)?
     var onError: ((String) -> Void)?
     var onListenerReady: ((UInt16) -> Void)?
-    var onHelloAttempt: ((Int, Int, String, UInt16) -> Void)?
-    var onHelloFailure: ((String) -> Void)?
     var onDatagramReceived: ((Int) -> Void)?
     var onDatagramIgnored: ((String) -> Void)?
 
+    /// Media datagrams must carry this session id (set after HELLO_ACK);
+    /// 0 = no session yet, drop all media.
+    private let acceptedSessionId = OSAllocatedUnfairLock<UInt32>(initialState: 0)
+    /// Count of v1-shaped datagrams (legacy host detection): 16+ bytes that
+    /// classify as neither v2 nor the legacy hello.
+    private let unknownDatagramCount = OSAllocatedUnfairLock<Int>(initialState: 0)
+
     private var connection: NWConnection?
     private let queue = DispatchQueue(label: "com.eternal.udp", qos: .userInteractive)
-    private var expectedRemoteHost: String?
-    private var didEstablishConnection = false
 
     init(port: UInt16) {
         self.port = port
     }
 
-    /// Start listening for UDP datagrams from `host` and send a HELLO registration
-    /// so the host knows where to stream frames.
-    ///
-    /// The local port is EPHEMERAL (the OS picks it) and advertised to the host
-    /// inside the HELLO payload. Binding to the host's port — the old behavior —
-    /// gained nothing (the host streams to whatever port HELLO names) and made
-    /// the bind collide with anything else on that port, including the host
-    /// itself when both run on one machine (the simulator E2E).
+    var controlQueue: DispatchQueue { queue }
+
+    func setAcceptedSessionId(_ id: UInt32) {
+        acceptedSessionId.withLock { $0 = id }
+    }
+
+    /// v1-shaped datagrams observed (used to tell "old host" apart from "no host").
+    var legacyLookingDatagrams: Int {
+        unknownDatagramCount.withLock { $0 }
+    }
+
+    /// Start the socket toward `host`. HELLO2 is the ControlChannel's job once
+    /// `onListenerReady` reports the ephemeral local port.
     @discardableResult
     func start(host: String) -> Bool {
-        expectedRemoteHost = Self.normalizeHost(host)
-        didEstablishConnection = false
-
         let params = NWParameters.udp
 
         guard let remotePort = NWEndpoint.Port(rawValue: port) else {
@@ -51,16 +60,11 @@ final class UDPReceiver {
             switch state {
             case .ready:
                 let actualPort = self.localPort() ?? 0
-                print("[UDPReceiver] Listening on ephemeral port \(actualPort)")
+                print("[UDPReceiver] Socket ready, ephemeral port \(actualPort)")
                 self.onListenerReady?(actualPort)
-                self.sendHello(to: host, listeningOn: actualPort)
-                if !self.didEstablishConnection {
-                    self.didEstablishConnection = true
-                    self.onConnectionEstablished?()
-                }
+                self.onConnectionEstablished?()
                 self.receiveLoop()
             case .waiting(let error):
-                // Path not viable yet (permission prompt pending, interface down).
                 print("[UDPReceiver] Connection waiting: \(error)")
                 self.onError?("UDP path not ready: \(error.localizedDescription)")
             case .failed(let error):
@@ -79,6 +83,11 @@ final class UDPReceiver {
         return true
     }
 
+    /// Send one datagram to the host (control plane). Safe from any thread.
+    func send(_ data: Data) {
+        connection?.send(content: data, completion: .contentProcessed { _ in })
+    }
+
     /// The ephemeral local port the OS assigned to this connection's socket.
     private func localPort() -> UInt16? {
         guard case .hostPort(_, let port)? = connection?.currentPath?.localEndpoint else {
@@ -87,57 +96,21 @@ final class UDPReceiver {
         return port.rawValue
     }
 
-    private static let helloMagic = "ETERNALHELLO".data(using: .utf8)!
-
-    /// Build HELLO payload: magic bytes + 2-byte LE listening port.
-    private func helloPayload(listeningOn listenPort: UInt16) -> Data {
-        var data = Self.helloMagic
-        var lePort = listenPort.littleEndian
-        data.append(Data(bytes: &lePort, count: 2))
-        return data
-    }
-
-    /// Send a HELLO registration packet to the host so it streams frames to us.
-    /// Sends multiple times to handle packet loss.
-    private func sendHello(to host: String, listeningOn listenPort: UInt16) {
-        guard connection != nil else {
-            onHelloFailure?("UDP connection not available")
-            return
-        }
-        let payload = helloPayload(listeningOn: listenPort)
-        let attempts = 3
-        for i in 0..<attempts {
-            let delay = DispatchTime.now() + .milliseconds(i * 200)
-            queue.asyncAfter(deadline: delay) { [weak self] in
-                guard let self, let connection = self.connection else { return }
-                self.onHelloAttempt?(i + 1, attempts, host, self.port)
-                connection.send(content: payload, completion: .contentProcessed { [weak self] error in
-                    if let error {
-                        print("[UDPReceiver] HELLO send error: \(error)")
-                        self?.onHelloFailure?(error.localizedDescription)
-                    } else {
-                        print("[UDPReceiver] HELLO sent to \(host) advertising port \(listenPort)")
-                    }
-                })
-            }
-        }
-    }
-
     func stop() {
         // Break the handler → connection reference before cancel so each
         // connect/disconnect cycle can actually deallocate the NWConnection.
         connection?.stateUpdateHandler = nil
         connection?.cancel()
         connection = nil
-        expectedRemoteHost = nil
-        didEstablishConnection = false
+        acceptedSessionId.withLock { $0 = 0 }
+        unknownDatagramCount.withLock { $0 = 0 }
     }
 
     // MARK: - Receive loop
 
     private func receiveLoop() {
         guard let connection else { return }
-        connection.receiveMessage { [weak self] content, _, isComplete, error in
+        connection.receiveMessage { [weak self] content, _, _, error in
             guard let self else { return }
 
             if let error {
@@ -155,11 +128,8 @@ final class UDPReceiver {
                 return
             }
 
-            if let data = content, data.count >= FragmentHeader.size {
-                self.onDatagramReceived?(data.count)
+            if let data = content {
                 self.handleDatagram(data)
-            } else if let data = content {
-                self.onDatagramIgnored?("Ignored short UDP datagram (\(data.count) bytes)")
             }
 
             // Continue receiving
@@ -168,51 +138,39 @@ final class UDPReceiver {
     }
 
     private func handleDatagram(_ data: Data) {
-        guard let header = FragmentHeader(data: data) else { return }
-        let payloadStart = FragmentHeader.size
-        let payloadEnd = payloadStart + Int(header.payloadLen)
-        guard payloadEnd <= data.count else { return }
-
-        let payload = data.subdata(in: payloadStart..<payloadEnd)
-        assembler?.addFragment(
-            seq: header.seq,
-            index: header.fragmentIndex,
-            count: header.fragmentCount,
-            epoch: header.streamEpoch,
-            payload: payload
-        )
-    }
-
-    private static func normalizeHost(_ host: String) -> String {
-        host.trimmingCharacters(in: CharacterSet(charactersIn: "[]"))
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-            .lowercased()
-    }
-}
-
-// MARK: - FragmentHeader
-
-/// Wire format (little-endian, 16 bytes):
-///   [0..4]  seq: u32
-///   [4..6]  fragment_index: u16
-///   [6..8]  fragment_count: u16
-///   [8..12] payload_len: u32
-///   [12..16] stream_epoch: u32  (older hosts send 0 here; treated as "no epoch")
-struct FragmentHeader {
-    static let size = 16
-
-    let seq: UInt32
-    let fragmentIndex: UInt16
-    let fragmentCount: UInt16
-    let payloadLen: UInt32
-    let streamEpoch: UInt32
-
-    init?(data: Data) {
-        guard data.count >= Self.size else { return nil }
-        seq = data.withUnsafeBytes { $0.loadUnaligned(fromByteOffset: 0, as: UInt32.self).littleEndian }
-        fragmentIndex = data.withUnsafeBytes { $0.loadUnaligned(fromByteOffset: 4, as: UInt16.self).littleEndian }
-        fragmentCount = data.withUnsafeBytes { $0.loadUnaligned(fromByteOffset: 6, as: UInt16.self).littleEndian }
-        payloadLen = data.withUnsafeBytes { $0.loadUnaligned(fromByteOffset: 8, as: UInt32.self).littleEndian }
-        streamEpoch = data.withUnsafeBytes { $0.loadUnaligned(fromByteOffset: 12, as: UInt32.self).littleEndian }
+        switch Wire.classify(data) {
+        case .media:
+            onDatagramReceived?(data.count)
+            guard let (header, payloadRange) = MediaHeader.decode(data) else {
+                onDatagramIgnored?("Dropped malformed media datagram (\(data.count) bytes)")
+                return
+            }
+            let expected = acceptedSessionId.withLock { $0 }
+            guard header.sessionId == expected, expected != 0 else {
+                onDatagramIgnored?("Dropped media for foreign session \(header.sessionId)")
+                return
+            }
+            assembler?.addFragment(
+                seq: header.frameSeq,
+                index: header.fragIndex,
+                count: header.fragCount,
+                epoch: header.streamEpoch,
+                isKeyframe: header.isKeyframe,
+                captureTimestampUs: header.captureTimestampUs,
+                payload: data.subdata(in: payloadRange)
+            )
+        case .control:
+            onControlDatagram?(data)
+        case .legacyHello:
+            // The host never sends this; ignore.
+            break
+        case .unknown:
+            if data.count >= 16 {
+                // Looks like v1 media from an old host — count it so the app
+                // can say "update the Windows host" instead of "no host found".
+                unknownDatagramCount.withLock { $0 += 1 }
+            }
+            onDatagramIgnored?("Ignored unrecognized datagram (\(data.count) bytes)")
+        }
     }
 }

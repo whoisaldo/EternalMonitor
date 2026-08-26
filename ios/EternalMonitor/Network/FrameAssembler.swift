@@ -8,7 +8,9 @@ import Foundation
 /// balloon memory. (`eternal-wire`'s `reassembly.rs` mirrors these semantics
 /// for the host-side tests; this file is the specification.)
 final class FrameAssembler {
-    var onFrameAssembled: ((Data) -> Void)?
+    /// Completed access unit: raw Annex B payload + the frame metadata every
+    /// fragment carried (protocol v2 repeats it per datagram).
+    var onFrameAssembled: ((Data, _ seq: UInt32, _ captureTimestampUs: UInt64, _ isKeyframe: Bool) -> Void)?
     var onDiagnostic: ((String) -> Void)?
 
     /// A frame may span at most this many fragments (~1.4 MB at 1384-byte
@@ -38,6 +40,8 @@ final class FrameAssembler {
 
     struct PendingFrame {
         let fragmentCount: UInt16
+        let isKeyframe: Bool
+        let captureTimestampUs: UInt64
         var fragments: [UInt16: Data]
         var byteCount: Int
         let createdAt: UInt64  // mach_absolute_time
@@ -47,7 +51,15 @@ final class FrameAssembler {
         }
     }
 
-    func addFragment(seq: UInt32, index: UInt16, count: UInt16, epoch: UInt32, payload: Data) {
+    func addFragment(
+        seq: UInt32,
+        index: UInt16,
+        count: UInt16,
+        epoch: UInt32,
+        isKeyframe: Bool,
+        captureTimestampUs: UInt64,
+        payload: Data
+    ) {
         // Primary restart signal: the host's stream epoch increases monotonically per pipeline
         // run. A HIGHER epoch means a brand-new run — drop all old state instantly so a fast
         // restart (within the seq-gap window) can't stall the stream. A LOWER epoch is a stale or
@@ -111,6 +123,8 @@ final class FrameAssembler {
             enforceCapacityForNewFrame(incoming: seq)
             pending[seq] = PendingFrame(
                 fragmentCount: count,
+                isKeyframe: isKeyframe,
+                captureTimestampUs: captureTimestampUs,
                 fragments: [:],
                 byteCount: 0,
                 createdAt: mach_absolute_time()
@@ -146,7 +160,7 @@ final class FrameAssembler {
                 removePending(staleSeq)
             }
 
-            onFrameAssembled?(assembled)
+            onFrameAssembled?(assembled, seq, frame.captureTimestampUs, frame.isKeyframe)
             evictStale()
             return
         }

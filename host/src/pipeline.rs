@@ -4,7 +4,6 @@
 
 use std::sync::mpsc;
 use std::thread::JoinHandle;
-use std::time::Instant;
 
 use tracing::{error, info};
 
@@ -106,18 +105,11 @@ pub async fn run_pipeline(
         return;
     }
 
-    let pipeline_epoch = Instant::now();
     let capture_rx = capture::start_capture(shared.clone(), gpu_info.adapter_index);
     let nal_rx = encoder::start_encoder(capture_rx, shared.clone(), gpu_info);
 
-    if let Err(e) = transport::start_sender(
-        nal_rx,
-        listen_port,
-        pipeline_epoch,
-        shared.clone(),
-        supervisor_tx,
-    )
-    .await
+    if let Err(e) =
+        transport::start_sender(nal_rx, listen_port, shared.clone(), supervisor_tx).await
     {
         error!(error = %e, "Transport sender exited with error");
     }

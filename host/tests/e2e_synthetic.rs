@@ -1,13 +1,16 @@
-//! End-to-end pipeline test: the REAL supervisor + capture(synthetic) +
-//! encoder(libx264) + UDP transport, talked to by a fake receiver that speaks
-//! the same wire protocol as the iPad — including the registration handshake
-//! that triggers a full pipeline restart, exactly like a first iPad connect.
+//! End-to-end pipeline test over protocol v2: the REAL supervisor +
+//! capture(synthetic) + encoder(libx264) + UDP transport, talked to by a fake
+//! receiver speaking the same wire protocol as the iPad.
 //!
-//! Proves, on any dev machine or CI runner with FFmpeg: frames flow through
-//! capture → encode → fragment → UDP → reassembly → FlatBuffer parse → H.264
-//! decode, the first delivered frame is a parameter-set-bearing keyframe, and
-//! the decoded pictures carry advancing frame counters (i.e. the video path
-//! is real, not just bytes moving).
+//! Proves, on any dev machine or CI runner with FFmpeg:
+//! - HELLO2/HELLO_ACK session establishment (nonzero session id, host timing),
+//! - media flows as v2 datagrams stamped with that session id,
+//! - the first delivered frame is a parameter-set-bearing keyframe,
+//! - decoded pictures carry advancing frame counters (real video end to end),
+//! - host heartbeats arrive while streaming,
+//! - a client KEYFRAME_REQUEST forces an IDR ahead of the natural GOP,
+//! - BYE stops the media stream promptly,
+//! - shutdown is bounded.
 
 use std::net::UdpSocket;
 use std::sync::mpsc;
@@ -17,10 +20,14 @@ use eternal_host::capture::synthetic::decode_frame_counter_from_luma;
 use eternal_host::control::{SharedControl, SupervisorCommand};
 use eternal_host::gpu::GpuInfo;
 use eternal_host::pipeline;
-use eternal_wire::frame::parse_frame_packet;
 use eternal_wire::h264::contains_nal_type;
 use eternal_wire::reassembly::{AddOutcome, Reassembler};
-use eternal_wire::v1_fragment::{FragmentHeader, HEADER_SIZE};
+use eternal_wire::v2::control::{
+    encode_control, parse_control, ByeReason, ControlMessage, Hello2, HelloAck, HelloStatus,
+    KeyframeReason, KeyframeRequest, ReceiverReport, CAP_DECODE_H264,
+};
+use eternal_wire::v2::media::MediaHeader;
+use eternal_wire::v2::{classify, Classified};
 
 const SYNTH_W: u32 = 640;
 const SYNTH_H: u32 = 360;
@@ -67,11 +74,100 @@ impl H264TestDecoder {
     }
 }
 
+/// The fake iPad: one socket, HELLO2 handshake, media reassembly, reports.
+struct FakeReceiver {
+    socket: UdpSocket,
+    host: String,
+    session_id: u32,
+    msg_seq: u32,
+    last_report: Instant,
+}
+
+impl FakeReceiver {
+    fn connect(host_port: u16) -> Self {
+        let socket = UdpSocket::bind("127.0.0.1:0").expect("receiver socket");
+        socket
+            .set_read_timeout(Some(Duration::from_millis(150)))
+            .expect("read timeout");
+        let listen_port = socket.local_addr().unwrap().port();
+        let host = format!("127.0.0.1:{host_port}");
+
+        let hello = ControlMessage::Hello2(Hello2 {
+            proto_min: 2,
+            proto_max: 2,
+            client_nonce: 0xE2E0_0001,
+            listen_port,
+            decoder_caps: CAP_DECODE_H264,
+            feature_caps: 0,
+            screen_px_w: 2420,
+            screen_px_h: 1668,
+            screen_pt_w: 1210,
+            screen_pt_h: 834,
+            refresh_hz: 120,
+            device_name: "E2E fake iPad".to_string(),
+        });
+        let hello_bytes = encode_control(0, 1, &hello);
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut buf = [0u8; 2048];
+        let mut last_hello = Instant::now() - Duration::from_secs(1);
+        let ack: HelloAck = loop {
+            assert!(Instant::now() < deadline, "no HELLO_ACK within 10s");
+            if last_hello.elapsed() >= Duration::from_millis(250) {
+                socket.send_to(&hello_bytes, &host).expect("send hello2");
+                last_hello = Instant::now();
+            }
+            let Ok((len, _)) = socket.recv_from(&mut buf) else {
+                continue;
+            };
+            if let Classified::Control(_) = classify(&buf[..len]) {
+                if let Ok((_, ControlMessage::HelloAck(ack))) = parse_control(&buf[..len]) {
+                    break ack;
+                }
+            }
+        };
+
+        assert_eq!(ack.status, HelloStatus::Ok);
+        assert_ne!(ack.session_id, 0, "an OK ack must carry a session id");
+        assert_eq!(ack.accepted_version, 2);
+        assert_eq!(ack.liveness_timeout_ms, 3000);
+        assert!(!ack.host_name.is_empty());
+
+        Self {
+            socket,
+            host,
+            session_id: ack.session_id,
+            msg_seq: 1,
+            last_report: Instant::now(),
+        }
+    }
+
+    fn send(&mut self, message: &ControlMessage) {
+        self.msg_seq += 1;
+        let bytes = encode_control(self.session_id, self.msg_seq, message);
+        self.socket
+            .send_to(&bytes, &self.host)
+            .expect("send control");
+    }
+
+    /// Keep the host's liveness window open (reports double as keepalive).
+    fn maybe_report(&mut self, highest_seq: u32, frames_complete: u32) {
+        if self.last_report.elapsed() >= Duration::from_millis(400) {
+            self.last_report = Instant::now();
+            self.send(&ControlMessage::ReceiverReport(ReceiverReport {
+                stream_epoch: 0,
+                highest_seq,
+                frames_complete,
+                ..Default::default()
+            }));
+        }
+    }
+}
+
 #[test]
-fn synthetic_stream_end_to_end() {
+fn synthetic_stream_end_to_end_v2() {
     let _ = ffmpeg_next::init();
 
-    // Deterministic pipeline: synthetic source at a small size, software encoder.
     std::env::set_var("ETERNAL_SYNTH_SIZE", format!("{SYNTH_W}x{SYNTH_H}"));
     std::env::set_var("ETERNAL_CAPTURE", "synthetic");
 
@@ -80,8 +176,6 @@ fn synthetic_stream_end_to_end() {
     *shared.encoder_override.lock() = Some("libx264".to_string());
     let gpu_info = GpuInfo::software_fallback();
 
-    // Run the REAL supervisor so the registration-triggered pipeline restart
-    // path is exercised, not mocked.
     let (supervisor_tx, supervisor_rx) = mpsc::channel();
     let supervisor_shared = shared.clone();
     let supervisor_tx_clone = supervisor_tx.clone();
@@ -95,17 +189,7 @@ fn synthetic_stream_end_to_end() {
         );
     });
 
-    // ---- Fake iPad ----
-    let receiver = UdpSocket::bind("127.0.0.1:0").expect("receiver socket");
-    receiver
-        .set_read_timeout(Some(Duration::from_millis(200)))
-        .expect("read timeout");
-    let receiver_port = receiver.local_addr().unwrap().port();
-
-    // Register like the iPad does: ETERNALHELLO + listen port, sent a few times.
-    let mut hello = Vec::from(*b"ETERNALHELLO");
-    hello.extend_from_slice(&receiver_port.to_le_bytes());
-    let host_addr = format!("127.0.0.1:{listen_port}");
+    let mut receiver = FakeReceiver::connect(listen_port);
 
     let deadline = Instant::now() + DEADLINE;
     let mut reassembler = Reassembler::new();
@@ -114,88 +198,145 @@ fn synthetic_stream_end_to_end() {
 
     let mut first_frame_checked = false;
     let mut decoded_counters: Vec<u64> = Vec::new();
-    let mut last_hello = Instant::now() - Duration::from_secs(1);
+    let mut heartbeats_seen = 0u32;
+    let mut keyframe_requested_at: Option<u64> = None;
+    let mut forced_keyframe_seen = false;
+    let mut highest_seq = 0u32;
 
-    while decoded_counters.len() < WANT_DECODED_FRAMES {
+    while decoded_counters.len() < WANT_DECODED_FRAMES
+        || !forced_keyframe_seen
+        || heartbeats_seen == 0
+    {
         assert!(
             Instant::now() < deadline,
-            "timed out with {} decoded frames (reassembly counters: {:?})",
+            "timed out: {} decoded frames, forced_keyframe_seen={forced_keyframe_seen}, \
+             heartbeats={heartbeats_seen} (reassembly: {:?})",
             decoded_counters.len(),
             reassembler.counters()
         );
 
-        // Re-send HELLO until media starts flowing (covers the restart window
-        // where the transport socket is briefly down — same as the iPad's 3x
-        // HELLO burst, just more persistent).
-        if decoded_counters.is_empty() && last_hello.elapsed() >= Duration::from_millis(300) {
-            receiver.send_to(&hello, &host_addr).expect("send hello");
-            last_hello = Instant::now();
-        }
+        receiver.maybe_report(highest_seq, decoded_counters.len() as u32);
 
-        let (len, _) = match receiver.recv_from(&mut datagram) {
-            Ok(ok) => ok,
-            Err(_) => continue, // timeout — loop re-sends hello / re-checks deadline
-        };
-        if len < HEADER_SIZE {
+        let Ok((len, _)) = receiver.socket.recv_from(&mut datagram) else {
             continue;
-        }
+        };
+        let bytes = &datagram[..len];
 
-        let header_bytes: [u8; HEADER_SIZE] = datagram[..HEADER_SIZE].try_into().unwrap();
-        let header = FragmentHeader::from_bytes(&header_bytes);
-        let payload = &datagram[HEADER_SIZE..len];
-
-        let outcome = reassembler.add_fragment(
-            header.seq,
-            header.fragment_index,
-            header.fragment_count,
-            header.stream_epoch,
-            payload,
-            Instant::now(),
-        );
-
-        if let AddOutcome::Completed(frame_bytes) = outcome {
-            let packet = parse_frame_packet(&frame_bytes).expect("valid FramePacket");
-            assert_eq!(packet.width, SYNTH_W);
-            assert_eq!(packet.height, SYNTH_H);
-
-            if !first_frame_checked {
-                first_frame_checked = true;
-                assert!(
-                    packet.is_keyframe,
-                    "first delivered frame must be a keyframe"
-                );
-                assert!(
-                    contains_nal_type(&packet.data, 7),
-                    "startup keyframe must carry an SPS"
-                );
-                assert!(
-                    contains_nal_type(&packet.data, 8),
-                    "startup keyframe must carry a PPS"
-                );
-                assert!(
-                    contains_nal_type(&packet.data, 5),
-                    "startup keyframe must carry an IDR slice"
-                );
+        match classify(bytes) {
+            Classified::Control(_) => {
+                if let Ok((_, ControlMessage::Heartbeat(hb))) = parse_control(bytes) {
+                    heartbeats_seen += 1;
+                    assert_eq!(hb.stream_config.width, SYNTH_W as u16);
+                    assert_eq!(hb.stream_config.height, SYNTH_H as u16);
+                }
             }
-
-            for counter in decoder.decode(&packet.data) {
-                // The counter equals the capture-side frame number (mod 24 bits).
+            Classified::Media { .. } => {
+                let (header, payload) = MediaHeader::decode(bytes).expect("valid media datagram");
                 assert_eq!(
-                    counter,
-                    packet.seq as u64 & 0xFF_FFFF,
-                    "decoded frame counter must match the wire sequence number"
+                    header.session_id, receiver.session_id,
+                    "media must be stamped with the negotiated session id"
                 );
-                decoded_counters.push(counter);
+                highest_seq = highest_seq.max(header.frame_seq);
+
+                let outcome = reassembler.add_fragment(
+                    header.frame_seq,
+                    header.frag_index,
+                    header.frag_count,
+                    header.stream_epoch,
+                    payload,
+                    Instant::now(),
+                );
+                let AddOutcome::Completed(frame_bytes) = outcome else {
+                    continue;
+                };
+
+                // v2 media payload is raw Annex B — no FlatBuffer wrapper.
+                if !first_frame_checked {
+                    first_frame_checked = true;
+                    assert!(
+                        header.is_keyframe,
+                        "first delivered frame must be a keyframe"
+                    );
+                    assert!(
+                        contains_nal_type(&frame_bytes, 7),
+                        "startup keyframe must carry an SPS"
+                    );
+                    assert!(
+                        contains_nal_type(&frame_bytes, 8),
+                        "startup keyframe must carry a PPS"
+                    );
+                    assert!(
+                        contains_nal_type(&frame_bytes, 5),
+                        "startup keyframe must carry an IDR slice"
+                    );
+                }
+
+                if keyframe_requested_at.is_none() && decoded_counters.len() >= 5 {
+                    // Ask for an IDR mid-GOP. x264's natural GOP is 30, so a
+                    // keyframe well before seq+25 proves the request worked.
+                    keyframe_requested_at = Some(header.frame_seq as u64);
+                    receiver.send(&ControlMessage::KeyframeRequest(KeyframeRequest {
+                        stream_epoch: header.stream_epoch,
+                        last_complete_seq: header.frame_seq,
+                        reason: KeyframeReason::GapLoss,
+                    }));
+                }
+                if let Some(at) = keyframe_requested_at {
+                    if header.is_keyframe
+                        && header.frame_seq as u64 > at
+                        && (header.frame_seq as u64) < at + 25
+                    {
+                        forced_keyframe_seen = true;
+                    }
+                }
+
+                for counter in decoder.decode(&frame_bytes) {
+                    assert_eq!(
+                        counter,
+                        header.frame_seq as u64 & 0xFF_FFFF,
+                        "decoded frame counter must match the wire sequence number"
+                    );
+                    decoded_counters.push(counter);
+                }
             }
+            other => panic!("unexpected datagram from host: {other:?}"),
         }
     }
 
-    // Counters must advance monotonically — real video, in order.
+    assert!(
+        heartbeats_seen >= 1,
+        "host heartbeats must arrive while streaming"
+    );
     for pair in decoded_counters.windows(2) {
         assert!(
             pair[1] > pair[0],
             "decoded frame counters must strictly increase: {:?}",
             pair
+        );
+    }
+
+    // ---- BYE stops the media stream promptly ----
+    receiver.send(&ControlMessage::Bye(ByeReason::UserDisconnect));
+    receiver.send(&ControlMessage::Bye(ByeReason::UserDisconnect));
+
+    let quiet_deadline = Instant::now() + Duration::from_secs(3);
+    let mut last_media = Instant::now();
+    loop {
+        match receiver.socket.recv_from(&mut datagram) {
+            Ok((len, _)) => {
+                if matches!(classify(&datagram[..len]), Classified::Media { .. }) {
+                    last_media = Instant::now();
+                }
+            }
+            Err(_) => {
+                if last_media.elapsed() >= Duration::from_millis(800) {
+                    break; // media stream went quiet after BYE
+                }
+            }
+        }
+        assert!(
+            Instant::now() < quiet_deadline,
+            "media kept flowing more than 3s after BYE"
         );
     }
 

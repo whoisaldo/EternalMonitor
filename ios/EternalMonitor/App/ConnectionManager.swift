@@ -74,6 +74,7 @@ final class ConnectionManager: ObservableObject {
 
     private var udpReceiver: UDPReceiver?
     private var frameAssembler: FrameAssembler?
+    private var controlChannel: ControlChannel?
     private var videoDecoder: VideoDecoder?
     private var timeoutTask: Task<Void, Never>?
     private var statsFlushTask: Task<Void, Never>?
@@ -87,6 +88,9 @@ final class ConnectionManager: ObservableObject {
     private var didExtendTimeout = false
 
     let frameSlot = FrameSlot()
+    /// Lets hot-path closures reach the CURRENT control channel without
+    /// retaining self (rebuilt each connect).
+    private let controlChannelBox = ControlChannelBox()
     private var fpsCounter = FPSCounter()
 
     static let connectionTimeoutSeconds: UInt64 = 10
@@ -165,12 +169,10 @@ final class ConnectionManager: ObservableObject {
             }
         }
 
-        decoder.onNeedsKeyframe = { [weak self] in
-            Task { @MainActor in
-                // Protocol v2 turns this into a keyframe request to the host;
-                // until then the stream recovers on the next natural IDR.
-                self?.record(.warning, "decode", "Decoder needs a keyframe to resume")
-            }
+        decoder.onNeedsKeyframe = { [weak controlChannelBox] in
+            controlChannelBox?.value?.sendKeyframeRequest(
+                streamEpoch: 0, lastCompleteSeq: 0, reason: .decodeError
+            )
         }
 
         decoder.onEvent = { [weak self] message in
@@ -179,37 +181,106 @@ final class ConnectionManager: ObservableObject {
             }
         }
 
-        assembler.onFrameAssembled = { [weak self, weak decoder] data in
+        assembler.onFrameAssembled = { [weak self, weak decoder] data, seq, captureTsUs, isKeyframe in
             guard let self else { return }
             self.streamCounters.recordAssembled(bytes: data.count)
-
-            guard let decoder else { return }
-            guard let packet = FramePacket.deserialize(from: data) else {
-                Task { @MainActor in
-                    self.record(.warning, "proto", "Failed to parse reassembled payload (\(data.count) bytes) as FramePacket")
-                }
-                return
-            }
             self.streamCounters.recordParsed()
-            decoder.decode(packet: packet)
+            decoder?.decode(packet: FramePacket(
+                seq: seq,
+                timestampUs: captureTsUs,
+                data: data,
+                width: 0,
+                height: 0,
+                isKeyframe: isKeyframe
+            ))
         }
 
         receiver.assembler = assembler
-        receiver.onListenerReady = { [weak self] actualPort in
-            Task { @MainActor in
-                self?.debugState.listenerReadyPort = actualPort
-                self?.record(.info, "udp", "Listener ready on port \(actualPort)")
-            }
-        }
-        receiver.onHelloAttempt = { [weak self] attempt, total, host, port in
+
+        let channel = ControlChannel(queue: receiver.controlQueue, send: { [weak receiver] data in
+            receiver?.send(data)
+        })
+        controlChannelBox.value = channel
+        channel.reportProvider = { ReceiverReport() }
+        channel.onHelloAttempt = { [weak self] attempt, total in
             Task { @MainActor in
                 self?.debugState.helloAttempts = attempt
-                self?.record(.info, "udp", "HELLO attempt \(attempt)/\(total) to \(host):\(port)")
+                self?.record(.info, "ctrl", "HELLO2 attempt \(attempt)/\(total) to \(normalizedHost):\(port)")
             }
         }
-        receiver.onHelloFailure = { [weak self] message in
+        channel.onDiagnostic = { [weak self] message in
             Task { @MainActor in
-                self?.record(.warning, "udp", "HELLO send failed: \(message)")
+                self?.record(.info, "ctrl", message)
+            }
+        }
+        channel.onSessionEstablished = { [weak self, weak receiver] info in
+            receiver?.setAcceptedSessionId(info.sessionId)
+            Task { @MainActor in
+                guard let self else { return }
+                self.record(
+                    .info, "ctrl",
+                    "Connected to \(info.hostName): \(info.streamConfig.width)x\(info.streamConfig.height) @ \(info.streamConfig.fps)fps"
+                )
+            }
+        }
+        channel.onRejected = { [weak self] status in
+            Task { @MainActor in
+                guard let self else { return }
+                switch status {
+                case .busy:
+                    self.connectionError = "The host is busy with another device."
+                case .versionUnsupported:
+                    self.connectionError = "Protocol mismatch — update the Windows host and this app."
+                default:
+                    self.connectionError = "The host refused the connection."
+                }
+                self.record(.error, "ctrl", self.connectionError ?? "rejected")
+                self.disconnect()
+            }
+        }
+        channel.onHandshakeTimeout = { [weak self, weak receiver] in
+            Task { @MainActor in
+                guard let self else { return }
+                if let receiver, receiver.legacyLookingDatagrams > 0 {
+                    self.connectionError =
+                        "The host is running v0.1.x — update EternalMonitor on the PC."
+                    self.record(.error, "ctrl", "Legacy v1 host detected")
+                    self.disconnect()
+                } else {
+                    self.record(.warning, "ctrl", "HELLO2 handshake got no reply yet")
+                }
+            }
+        }
+        channel.onBye = { [weak self] reason in
+            Task { @MainActor in
+                guard let self else { return }
+                self.connectionError = "The host ended the session."
+                self.record(.info, "ctrl", "Host BYE (\(reason))")
+                self.disconnect()
+            }
+        }
+        channel.onHeartbeat = { _ in
+            // Liveness watchdog lands with the reliability phase.
+        }
+
+        receiver.onControlDatagram = { [weak channel] data in
+            channel?.handleControl(data)
+        }
+        receiver.onListenerReady = { [weak self, weak channel] actualPort in
+            channel?.startHandshake(
+                listenPort: actualPort,
+                identity: ControlChannel.ClientIdentity(
+                    deviceName: UIDevice.current.name,
+                    screenPxW: UInt16(clamping: Int(UIScreen.main.nativeBounds.width)),
+                    screenPxH: UInt16(clamping: Int(UIScreen.main.nativeBounds.height)),
+                    screenPtW: UInt16(clamping: Int(UIScreen.main.bounds.width)),
+                    screenPtH: UInt16(clamping: Int(UIScreen.main.bounds.height)),
+                    refreshHz: UInt8(clamping: UIScreen.main.maximumFramesPerSecond)
+                )
+            )
+            Task { @MainActor in
+                self?.debugState.listenerReadyPort = actualPort
+                self?.record(.info, "udp", "Socket ready on ephemeral port \(actualPort)")
             }
         }
         receiver.onDatagramReceived = { [streamCounters] byteCount in
@@ -238,6 +309,7 @@ final class ConnectionManager: ObservableObject {
 
         self.videoDecoder = decoder
         self.frameAssembler = assembler
+        self.controlChannel = channel
         self.udpReceiver = receiver
 
         guard receiver.start(host: normalizedHost) else {
@@ -312,6 +384,15 @@ final class ConnectionManager: ObservableObject {
         disconnect()
     }
 
+    /// The app is leaving the foreground: say goodbye so the host stops
+    /// streaming promptly instead of waiting out its liveness window.
+    func handleAppBackgrounded() {
+        guard state != .disconnected else { return }
+        controlChannel?.sendBye(.appBackground)
+        record(.info, "ctrl", "App backgrounded — sent BYE and disconnected")
+        disconnect()
+    }
+
     func disconnect() {
         timeoutTask?.cancel()
         timeoutTask = nil
@@ -320,12 +401,16 @@ final class ConnectionManager: ObservableObject {
         _ = streamCounters.drain()
         didExtendTimeout = false
 
-        // Teardown order matters: stop the socket first (no new input), then shut
+        // Say goodbye first (fire-and-forget), then stop the socket, then shut
         // the decoder down on its own queue (provably after any in-flight decode).
+        controlChannel?.sendBye(.userDisconnect)
+        controlChannel?.stop()
         udpReceiver?.stop()
         videoDecoder?.shutdown()
         frameAssembler?.reset()
 
+        controlChannel = nil
+        controlChannelBox.value = nil
         udpReceiver = nil
         frameAssembler = nil
         videoDecoder = nil
@@ -357,6 +442,17 @@ private extension DiagnosticLevel {
         case .error:
             return .error
         }
+    }
+}
+
+// MARK: - Control channel box
+
+/// Thread-safe holder so non-MainActor closures can reach the live channel.
+final class ControlChannelBox: @unchecked Sendable {
+    private let lock = OSAllocatedUnfairLock<ControlChannel?>(initialState: nil)
+    var value: ControlChannel? {
+        get { lock.withLock { $0 } }
+        set { lock.withLock { $0 = newValue } }
     }
 }
 

@@ -11,12 +11,15 @@ final class FrameAssemblerTests: XCTestCase {
         assembler = FrameAssembler()
         completed = []
         diagnostics = []
-        assembler.onFrameAssembled = { [weak self] data in self?.completed.append(data) }
+        assembler.onFrameAssembled = { [weak self] data, _, _, _ in self?.completed.append(data) }
         assembler.onDiagnostic = { [weak self] message in self?.diagnostics.append(message) }
     }
 
     private func add(seq: UInt32, index: UInt16, count: UInt16, epoch: UInt32 = 1, byte: UInt8) {
-        assembler.addFragment(seq: seq, index: index, count: count, epoch: epoch, payload: Data([byte]))
+        assembler.addFragment(
+            seq: seq, index: index, count: count, epoch: epoch,
+            isKeyframe: false, captureTimestampUs: 0, payload: Data([byte])
+        )
     }
 
     func testAssemblesInOrderAndOutOfOrder() {

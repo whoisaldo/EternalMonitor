@@ -4,5 +4,4 @@ version = "0.2.0"
 edition = "2021"
 
 [dependencies]
-flatbuffers = "24.12"
 tracing = "0.1"
