@@ -4,6 +4,7 @@ import SwiftUI
 struct EternalMonitorApp: App {
     @StateObject private var connectionManager = ConnectionManager()
     @StateObject private var settings = AppSettings()
+    @Environment(\.scenePhase) private var scenePhase
 
     init() {
         FontRegistry.shared.registerBundledFonts()
@@ -22,6 +23,14 @@ struct EternalMonitorApp: App {
                         connectionManager.connect(host: target.host, port: target.port)
                     }
                 }
+        }
+        .onChange(of: scenePhase) { _, phase in
+            // A backgrounded app cannot keep receiving UDP; tell the host
+            // goodbye so it stops streaming (and can tear the virtual display
+            // down) instead of timing out on liveness.
+            if phase == .background {
+                connectionManager.handleAppBackgrounded()
+            }
         }
     }
 }

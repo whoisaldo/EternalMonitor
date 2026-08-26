@@ -3,6 +3,7 @@
 
 pub mod autostart;
 pub mod capture;
+pub mod clock;
 pub mod control;
 pub mod discovery;
 pub mod encoder;
