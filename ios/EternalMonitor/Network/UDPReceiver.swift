@@ -29,41 +29,47 @@ final class UDPReceiver {
 
     /// Start listening for UDP datagrams from `host` and send a HELLO registration
     /// so the host knows where to stream frames.
+    ///
+    /// The local port is EPHEMERAL (the OS picks it) and advertised to the host
+    /// inside the HELLO payload. Binding to the host's port — the old behavior —
+    /// gained nothing (the host streams to whatever port HELLO names) and made
+    /// the bind collide with anything else on that port, including the host
+    /// itself when both run on one machine (the simulator E2E).
     @discardableResult
     func start(host: String) -> Bool {
         expectedRemoteHost = Self.normalizeHost(host)
         didEstablishConnection = false
 
         let params = NWParameters.udp
-        params.allowLocalEndpointReuse = true
-        params.requiredLocalEndpoint = NWEndpoint.hostPort(
-            host: .ipv4(.any),
-            port: NWEndpoint.Port(rawValue: port)!
-        )
 
-        let endpoint = NWEndpoint.hostPort(
-            host: NWEndpoint.Host(host),
-            port: NWEndpoint.Port(rawValue: port)!
-        )
+        guard let remotePort = NWEndpoint.Port(rawValue: port) else {
+            onError?("Invalid port \(port)")
+            return false
+        }
+        let endpoint = NWEndpoint.hostPort(host: NWEndpoint.Host(host), port: remotePort)
 
         let connection = NWConnection(to: endpoint, using: params)
         connection.stateUpdateHandler = { [weak self] state in
             guard let self else { return }
             switch state {
             case .ready:
-                let actualPort = self.port
-                print("[UDPReceiver] Listening on port \(actualPort)")
+                let actualPort = self.localPort() ?? 0
+                print("[UDPReceiver] Listening on ephemeral port \(actualPort)")
                 self.onListenerReady?(actualPort)
-                self.sendHello(to: host)
+                self.sendHello(to: host, listeningOn: actualPort)
                 if !self.didEstablishConnection {
                     self.didEstablishConnection = true
                     self.onConnectionEstablished?()
                 }
                 self.receiveLoop()
+            case .waiting(let error):
+                // Path not viable yet (permission prompt pending, interface down).
+                print("[UDPReceiver] Connection waiting: \(error)")
+                self.onError?("UDP path not ready: \(error.localizedDescription)")
             case .failed(let error):
                 print("[UDPReceiver] Connection failed: \(error)")
                 self.onError?("UDP connection failed: \(error.localizedDescription)")
-                connection.cancel()
+                self.connection?.cancel()
             case .cancelled:
                 break
             default:
@@ -76,36 +82,44 @@ final class UDPReceiver {
         return true
     }
 
+    /// The ephemeral local port the OS assigned to this connection's socket.
+    private func localPort() -> UInt16? {
+        guard case .hostPort(_, let port)? = connection?.currentPath?.localEndpoint else {
+            return nil
+        }
+        return port.rawValue
+    }
+
     private static let helloMagic = "ETERNALHELLO".data(using: .utf8)!
 
     /// Build HELLO payload: magic bytes + 2-byte LE listening port.
-    private func helloPayload() -> Data {
+    private func helloPayload(listeningOn listenPort: UInt16) -> Data {
         var data = Self.helloMagic
-        var lePort = port.littleEndian
+        var lePort = listenPort.littleEndian
         data.append(Data(bytes: &lePort, count: 2))
         return data
     }
 
     /// Send a HELLO registration packet to the host so it streams frames to us.
     /// Sends multiple times to handle packet loss.
-    private func sendHello(to host: String) {
-        guard let connection else {
+    private func sendHello(to host: String, listeningOn listenPort: UInt16) {
+        guard connection != nil else {
             onHelloFailure?("UDP connection not available")
             return
         }
-        let payload = helloPayload()
+        let payload = helloPayload(listeningOn: listenPort)
         let attempts = 3
         for i in 0..<attempts {
             let delay = DispatchTime.now() + .milliseconds(i * 200)
             queue.asyncAfter(deadline: delay) { [weak self] in
-                guard let self else { return }
+                guard let self, let connection = self.connection else { return }
                 self.onHelloAttempt?(i + 1, attempts, host, self.port)
-                connection.send(content: payload, completion: .contentProcessed { error in
+                connection.send(content: payload, completion: .contentProcessed { [weak self] error in
                     if let error {
                         print("[UDPReceiver] HELLO send error: \(error)")
-                        self.onHelloFailure?(error.localizedDescription)
+                        self?.onHelloFailure?(error.localizedDescription)
                     } else {
-                        print("[UDPReceiver] HELLO sent to \(host):\(self.port)")
+                        print("[UDPReceiver] HELLO sent to \(host) advertising port \(listenPort)")
                     }
                 })
             }
@@ -113,6 +127,9 @@ final class UDPReceiver {
     }
 
     func stop() {
+        // Break the handler → connection reference before cancel so each
+        // connect/disconnect cycle can actually deallocate the NWConnection.
+        connection?.stateUpdateHandler = nil
         connection?.cancel()
         connection = nil
         expectedRemoteHost = nil
@@ -128,7 +145,16 @@ final class UDPReceiver {
 
             if let error {
                 print("[UDPReceiver] Receive error: \(error)")
+                // A transient error (ICMP port-unreachable while the host
+                // restarts its pipeline, a path blip) must not silently kill
+                // reception forever — re-arm after a short delay as long as the
+                // connection object is still live.
                 self.onError?("UDP receive error: \(error.localizedDescription)")
+                if self.connection != nil {
+                    self.queue.asyncAfter(deadline: .now() + .milliseconds(100)) { [weak self] in
+                        self?.receiveLoop()
+                    }
+                }
                 return
             }
 

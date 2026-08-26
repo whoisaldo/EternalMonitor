@@ -36,7 +36,13 @@ targets:
     platform: iOS
     sources:
       - path: EternalMonitorTests
-      # Golden wire vectors shared byte-for-byte with `cargo test -p eternal-wire`.
+        excludes:
+          - "Fixtures"
+      # Decoder fixtures (tiny H.264 streams) and the golden wire vectors
+      # shared byte-for-byte with `cargo test -p eternal-wire`.
+      - path: EternalMonitorTests/Fixtures
+        type: folder
+        buildPhase: resources
       - path: ../proto/testdata
         type: folder
         buildPhase: resources
