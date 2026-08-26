@@ -1,30 +1,33 @@
 import Foundation
 import VideoToolbox
 import CoreMedia
+import os
 
 /// Verbose per-frame decode logging. Off by default — these prints run on the decode hot path
 /// (every submitted access unit and every decoded frame) and cause noticeable jank at 60 fps.
 /// Flip to `true` only when debugging the decode pipeline.
 private let verboseDecodeLogging = false
 
-/// Recreate the VTDecompressionSession on every IDR. This is the heavy "AMD recovery" hammer:
-/// it re-inits the hardware decoder ~2×/second (GOP≈30), which trades smoothness for guaranteed
-/// resync. The host now prepends fresh SPS/PPS on every IDR and `tryCreateFormatDescription`
-/// already recreates the session when parameter sets change, so this should be redundant.
-/// Set to `false` to A/B test smoothness vs. long-run sync on the AMD path.
-private let recreateSessionOnEveryIDR = true
-
 /// H.264 hardware decoder using VideoToolbox.
-/// Parses NAL units, extracts SPS/PPS, converts Annex B → AVCC, decodes to CVPixelBuffer.
+/// Parses NAL units, extracts SPS/PPS, converts Annex B → AVCC, decodes to CVPixelBuffer (NV12).
+///
+/// Session lifecycle: ONE `VTDecompressionSession` per format description. When new SPS/PPS
+/// arrive, an unchanged format is ignored, a compatible change is adopted in place
+/// (`VTDecompressionSessionCanAcceptFormatDescription`), and only a genuinely incompatible
+/// change tears the session down. The old per-IDR session recreation (the "AMD recovery
+/// hammer") is gone — the host prepends fresh SPS/PPS on every IDR, so the format-change
+/// path covers resync without rebuilding the hardware decoder twice a second.
 final class VideoDecoder {
     var onFrameDecoded: ((_ pixelBuffer: CVPixelBuffer, _ timestampUs: UInt64) -> Void)?
     var onEvent: ((String) -> Void)?
+    /// The decoder cannot make progress until the next keyframe (session died, decode error).
+    /// Protocol v2 turns this into a keyframe request to the host; today it is diagnostic.
+    var onNeedsKeyframe: (() -> Void)?
 
     private var formatDescription: CMVideoFormatDescription?
     private var decompressionSession: VTDecompressionSession?
     private var sps: Data?
     private var pps: Data?
-    private var callbackRecord: UnsafeMutablePointer<VTDecompressionOutputCallbackRecord>?
     private var loggedPacketizations = Set<String>()
     private var loggedNALTypes = Set<UInt8>()
     private var hasLoggedEmptyPayload = false
@@ -32,13 +35,18 @@ final class VideoDecoder {
     private var hasLoggedFirstNALPrefix = false
     private var hasLoggedFirstPacketHex = false
     private var waitingForSyncSample = true
-    // Per-packet logging counter for AMD recovery debugging (see verboseDecodeLogging).
+    private var isShutdown = false
     private var packetLogCounter: UInt64 = 0
 
     private let decodeQueue = DispatchQueue(label: "com.eternal.decode", qos: .userInteractive)
 
     deinit {
-        callbackRecord?.deallocate()
+        // `shutdown()` is the proper teardown; this is the safety net if an owner
+        // drops the decoder without calling it. No callbacks can be in flight at
+        // deinit (the session retains its output handlers' captures weakly).
+        if let session = decompressionSession {
+            VTDecompressionSessionInvalidate(session)
+        }
     }
 
     func decode(packet: FramePacket) {
@@ -47,20 +55,17 @@ final class VideoDecoder {
         }
     }
 
-    func invalidate() {
-        decodeQueue.async { [weak self] in
-            guard let self else { return }
-            if let session = self.decompressionSession {
-                VTDecompressionSessionWaitForAsynchronousFrames(session)
-                VTDecompressionSessionInvalidate(session)
-            }
-            self.decompressionSession = nil
+    /// Tear down on the decode queue, provably after any in-flight decode call.
+    /// Captures `self` strongly so the session cannot be freed under a live callback;
+    /// `isShutdown` makes any decode enqueued after this a no-op.
+    func shutdown(completion: (() -> Void)? = nil) {
+        decodeQueue.async {
+            self.isShutdown = true
+            self.teardownSession(waitForFrames: true)
             self.formatDescription = nil
             self.sps = nil
             self.pps = nil
             self.waitingForSyncSample = true
-            // Clear diagnostic state so a reconnection re-logs the first NAL types /
-            // packetisation it observes.
             self.loggedPacketizations.removeAll()
             self.loggedNALTypes.removeAll()
             self.hasLoggedEmptyPayload = false
@@ -68,12 +73,23 @@ final class VideoDecoder {
             self.hasLoggedFirstNALPrefix = false
             self.hasLoggedFirstPacketHex = false
             self.packetLogCounter = 0
+            completion?()
         }
     }
 
     // MARK: - Internal
 
+    private func teardownSession(waitForFrames: Bool) {
+        guard let session = decompressionSession else { return }
+        if waitForFrames {
+            VTDecompressionSessionWaitForAsynchronousFrames(session)
+        }
+        VTDecompressionSessionInvalidate(session)
+        decompressionSession = nil
+    }
+
     private func decodeOnQueue(packet: FramePacket) {
+        guard !isShutdown else { return }
         if verboseDecodeLogging && !hasLoggedFirstPacketHex {
             hasLoggedFirstPacketHex = true
             let hex = packet.data.prefix(16).map { String(format: "%02X", $0) }.joined(separator: " ")
@@ -136,22 +152,12 @@ final class VideoDecoder {
 
         if hasSliceNAL {
             let isSyncSample = isRandomAccessAccessUnit(accessUnitNALs)
-            // Per-packet log for the first 20 packets and then every 300th packet. Helps
-            // confirm AMD recovery is firing IDRs as expected (see verboseDecodeLogging).
             packetLogCounter += 1
             if verboseDecodeLogging && (packetLogCounter <= 20 || packetLogCounter % 300 == 0) {
                 let typesString = nalTypesInPacket.map { String($0) }.joined(separator: ",")
                 print(
                     "[VT] pkt seq=\(packet.seq) isKey=\(isSyncSample) nalCount=\(accessUnitNALs.count) nalTypes=\(typesString)"
                 )
-            }
-            // On every random-access access unit, recreate the VTDecompressionSession from the
-            // current format description. This clears any half-broken decoder state left over
-            // from a previous GOP — the AMD path on Windows would lose decoder sync after the
-            // first ~1s of P-frames; teardown forces VideoToolbox to honour the freshly-
-            // prepended SPS/PPS. Gated by recreateSessionOnEveryIDR so it can be A/B tested.
-            if isSyncSample && recreateSessionOnEveryIDR {
-                createDecompressionSession()
             }
             decodeAccessUnit(accessUnitNALs, timestampUs: packet.timestampUs, isSyncSample: isSyncSample)
         }
@@ -273,45 +279,44 @@ final class VideoDecoder {
 
         formatDescription = newFormat
         onEvent?("Updated format description SPS=\(sps.count)B PPS=\(pps.count)B")
-        createDecompressionSession()
+
+        // Adopt a compatible format change without rebuilding the hardware decoder;
+        // only an incompatible change (e.g. resolution switch) costs a session rebuild.
+        if let session = decompressionSession,
+           VTDecompressionSessionCanAcceptFormatDescription(session, formatDescription: newFormat) {
+            onEvent?("Format change accepted by the live session — no rebuild needed")
+        } else {
+            createDecompressionSession()
+        }
     }
 
     // MARK: - Decompression session
 
     private func createDecompressionSession() {
-        if let session = decompressionSession {
-            VTDecompressionSessionInvalidate(session)
-            decompressionSession = nil
-        }
-
-        // Clean up old callback record
-        callbackRecord?.deallocate()
-        callbackRecord = nil
+        teardownSession(waitForFrames: false)
 
         guard let formatDescription else { return }
 
         let outputAttributes: [String: Any] = [
-            kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA,
+            // NV12: what hardware H.264 decoders natively emit. BGRA forced a
+            // VideoToolbox-internal conversion pass and 2.7x the memory bandwidth.
+            kCVPixelBufferPixelFormatTypeKey as String:
+                kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange,
             kCVPixelBufferMetalCompatibilityKey as String: true,
+            kCVPixelBufferIOSurfacePropertiesKey as String: [:] as [String: Any],
         ]
-
-        // Allocate callback record on heap so it outlives this function
-        let record = UnsafeMutablePointer<VTDecompressionOutputCallbackRecord>.allocate(capacity: 1)
-        record.initialize(to: VTDecompressionOutputCallbackRecord(
-            decompressionOutputCallback: decompressionCallback,
-            decompressionOutputRefCon: Unmanaged.passUnretained(self).toOpaque()
-        ))
-        callbackRecord = record
 
         var session: VTDecompressionSession?
         let status = VTDecompressionSessionCreate(
             allocator: kCFAllocatorDefault,
             formatDescription: formatDescription,
             decoderSpecification: [
-                kVTVideoDecoderSpecification_RequireHardwareAcceleratedVideoDecoder: true
+                // Enable (not Require): hardware on device, silent software fallback in
+                // the simulator — which is what makes the automated E2E possible at all.
+                kVTVideoDecoderSpecification_EnableHardwareAcceleratedVideoDecoder: true
             ] as CFDictionary,
             imageBufferAttributes: outputAttributes as CFDictionary,
-            outputCallback: record,
+            outputCallback: nil,
             decompressionSessionOut: &session
         )
 
@@ -322,9 +327,21 @@ final class VideoDecoder {
         }
 
         VTSessionSetProperty(session, key: kVTDecompressionPropertyKey_RealTime, value: kCFBooleanTrue!)
+
+        var usingHardware: CFTypeRef?
+        VTSessionCopyProperty(
+            session,
+            key: kVTDecompressionPropertyKey_UsingHardwareAcceleratedVideoDecoder,
+            allocator: kCFAllocatorDefault,
+            valueOut: &usingHardware
+        )
+        let hardware = (usingHardware as? Bool) == true
         decompressionSession = session
         waitingForSyncSample = true
-        onEvent?("VideoToolbox session ready")
+        onEvent?("VideoToolbox session ready (\(hardware ? "hardware" : "software") decoder)")
+        if E2E.enabled {
+            E2E.logger.log("E2E_DECODER kind=\(hardware ? "hw" : "sw", privacy: .public)")
+        }
     }
 
     // MARK: - Decode an access unit
@@ -427,9 +444,6 @@ final class VideoDecoder {
             )
         }
 
-        // Pass timestampUs through frameReferenceContext so the callback can retrieve it
-        let frameRef = UnsafeMutableRawPointer(bitPattern: UInt(truncatingIfNeeded: timestampUs))
-
         if verboseDecodeLogging {
             let nalCount = nalUnits.count
             print("[VT] Submitting sample: size=\(totalLen) isKeyframe=\(isSyncSample) nalCount=\(nalCount)")
@@ -440,10 +454,27 @@ final class VideoDecoder {
             session,
             sampleBuffer: sampleBuffer,
             flags: [._EnableAsynchronousDecompression],
-            frameRefcon: frameRef,
             infoFlagsOut: &infoFlags
-        )
-        if status != noErr {
+        ) { [weak self] status, _, imageBuffer, _, _ in
+            guard let self else { return }
+            if verboseDecodeLogging {
+                print("[VT] Output callback fired: status=\(status)")
+            }
+            guard status == noErr, let pixelBuffer = imageBuffer else {
+                self.onEvent?("Decoder callback status=\(status) imageBufferMissing=\(imageBuffer == nil)")
+                return
+            }
+            self.onFrameDecoded?(pixelBuffer, timestampUs)
+        }
+
+        if status == kVTInvalidSessionErr {
+            // The session died underneath us (typical after app backgrounding).
+            // Rebuild it and hold for the next keyframe.
+            onEvent?("VideoToolbox session invalidated — recreating and waiting for a keyframe")
+            createDecompressionSession()
+            waitingForSyncSample = true
+            onNeedsKeyframe?()
+        } else if status != noErr {
             onEvent?("VTDecodeFrame failed status=\(status) nalCount=\(nalUnits.count) bytes=\(totalLen)")
         }
     }
@@ -577,36 +608,6 @@ final class VideoDecoder {
             .map { String(format: "%02X", $0) }
             .joined(separator: " ")
     }
-}
-
-// MARK: - VTDecompressionSession callback
-
-private func decompressionCallback(
-    decompressionOutputRefCon: UnsafeMutableRawPointer?,
-    sourceFrameRefCon: UnsafeMutableRawPointer?,
-    status: OSStatus,
-    infoFlags: VTDecodeInfoFlags,
-    imageBuffer: CVImageBuffer?,
-    presentationTimeStamp: CMTime,
-    presentationDuration: CMTime
-) {
-    guard let refCon = decompressionOutputRefCon else { return }
-
-    if verboseDecodeLogging {
-        print("[VT] Output callback fired: status=\(status) flags=\(infoFlags)")
-        if status != noErr {
-            print("[VT] Decode error: \(status)")
-        }
-    }
-
-    let decoder = Unmanaged<VideoDecoder>.fromOpaque(refCon).takeUnretainedValue()
-    guard status == noErr, let pixelBuffer = imageBuffer else {
-        decoder.onEvent?("Decoder callback status=\(status) imageBufferMissing=\(imageBuffer == nil)")
-        return
-    }
-
-    let timestampUs = UInt64(UInt(bitPattern: sourceFrameRefCon))
-    decoder.onFrameDecoded?(pixelBuffer, timestampUs)
 }
 
 private enum H264SliceKind {

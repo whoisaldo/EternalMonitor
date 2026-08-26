@@ -3,6 +3,7 @@ import Foundation
 import QuartzCore
 import Combine
 import os
+import UIKit
 
 enum ConnectionState: Equatable {
     case disconnected
@@ -119,8 +120,10 @@ final class ConnectionManager: ObservableObject {
             guard let self else { return }
             // Store frame in lock-protected slot (no Sendable boundary crossed)
             self.frameSlot.set(pixelBuffer)
-            // Capture only the scalar we need — avoids sending CVPixelBuffer across boundary
+            // Capture only the scalars we need — avoids sending CVPixelBuffer across boundary
             let ts = timestampUs
+            let frameWidth = CVPixelBufferGetWidth(pixelBuffer)
+            let frameHeight = CVPixelBufferGetHeight(pixelBuffer)
             Task { @MainActor in
                 self.quality.recordFrameDecoded()
                 self.debugState.decodedFrames += 1
@@ -130,6 +133,10 @@ final class ConnectionManager: ObservableObject {
                     self.timeoutTask?.cancel()
                     self.state = .connected
                     self.transportMode = "WiFi"
+                    // Streaming is a passive activity — never let the iPad dim
+                    // and lock mid-session because nobody touched the screen.
+                    UIApplication.shared.isIdleTimerDisabled = true
+                    E2E.firstFrame(width: frameWidth, height: frameHeight)
                     RecentConnectionStore.shared.add(host: normalizedHost, port: port, isUSB: false)
                     // remember the last successfully-connected target so we
                     // can pre-fill the IP field on next launch.
@@ -138,10 +145,26 @@ final class ConnectionManager: ObservableObject {
                 }
                 self.fpsCounter.tick()
                 self.fps = self.fpsCounter.currentFPS
+                if E2E.enabled && self.debugState.decodedFrames % 60 == 0 {
+                    E2E.stats(
+                        decoded: self.debugState.decodedFrames,
+                        width: frameWidth,
+                        height: frameHeight,
+                        fps: self.fps
+                    )
+                }
                 let nowUs = UInt64(ProcessInfo.processInfo.systemUptime * 1_000_000)
                 if ts > 0 {
                     self.lagMs = Double(nowUs &- ts) / 1000.0
                 }
+            }
+        }
+
+        decoder.onNeedsKeyframe = { [weak self] in
+            Task { @MainActor in
+                // Protocol v2 turns this into a keyframe request to the host;
+                // until then the stream recovers on the next natural IDR.
+                self?.record(.warning, "decode", "Decoder needs a keyframe to resume")
             }
         }
 
@@ -277,8 +300,10 @@ final class ConnectionManager: ObservableObject {
         timeoutTask = nil
         didExtendTimeout = false
 
+        // Teardown order matters: stop the socket first (no new input), then shut
+        // the decoder down on its own queue (provably after any in-flight decode).
         udpReceiver?.stop()
-        videoDecoder?.invalidate()
+        videoDecoder?.shutdown()
         frameAssembler?.reset()
 
         udpReceiver = nil
@@ -289,6 +314,7 @@ final class ConnectionManager: ObservableObject {
         fps = 0
         lagMs = 0
         quality.reset()
+        UIApplication.shared.isIdleTimerDisabled = false
     }
 
     private func record(_ level: DiagnosticLevel, _ category: String, _ message: String) {
@@ -329,10 +355,15 @@ final class PixelBufferBox: @unchecked Sendable {
 
 final class FrameSlot: @unchecked Sendable {
     private let lock = os.OSAllocatedUnfairLock<PixelBufferBox?>(initialState: nil)
+    /// Fired (on the storing thread — the VideoToolbox callback) every time a
+    /// frame lands, so the renderer can schedule an on-demand redraw. Assigned
+    /// once by the Metal view before streaming starts.
+    var onFrameStored: (() -> Void)?
 
     func set(_ buffer: CVPixelBuffer) {
         let box = PixelBufferBox(buffer)
         lock.withLock { $0 = box }
+        onFrameStored?()
     }
 
     func take() -> CVPixelBuffer? {

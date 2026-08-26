@@ -15,6 +15,13 @@ struct EternalMonitorApp: App {
                 .environmentObject(connectionManager)
                 .environmentObject(settings)
                 .preferredColorScheme(.dark)
+                .onAppear {
+                    // Automated end-to-end harness: EM_AUTOCONNECT=host:port
+                    // connects immediately, bypassing the connect screen.
+                    if let target = E2E.autoconnectTarget {
+                        connectionManager.connect(host: target.host, port: target.port)
+                    }
+                }
         }
     }
 }

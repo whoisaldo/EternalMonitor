@@ -129,6 +129,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let _mdns = discovery::advertise_service(listen_port);
 
+    // Headless mode for automation (the iOS E2E harness runs the host without a
+    // window): stream until the process is terminated externally.
+    if std::env::var("ETERNAL_HEADLESS").is_ok_and(|v| v.trim() == "1") {
+        info!("ETERNAL_HEADLESS=1 — running without GUI until terminated");
+        loop {
+            std::thread::sleep(std::time::Duration::from_secs(3600));
+        }
+    }
+
     if let Err(e) = gui::run_gui(gui_control.clone()) {
         error!(error = %e, "GUI exited with error");
     }
