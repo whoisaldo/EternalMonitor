@@ -48,6 +48,7 @@ pub struct Actions {
 pub struct ClientInfo {
     pub device_name: String,
     pub screen_px: (u16, u16),
+    pub refresh_hz: u8,
     pub decoder_caps: u16,
     pub feature_caps: u16,
     pub connected_at: Instant,
@@ -235,6 +236,7 @@ impl Session {
             info: ClientInfo {
                 device_name: hello.device_name.clone(),
                 screen_px: (hello.screen_px_w, hello.screen_px_h),
+                refresh_hz: hello.refresh_hz,
                 decoder_caps: hello.decoder_caps,
                 feature_caps: hello.feature_caps,
                 connected_at: now,
@@ -518,6 +520,13 @@ mod tests {
         assert_eq!(actions.new_target, Some(addr([10, 0, 0, 5], 50000)));
         assert!(actions.force_idr);
         assert!(session.is_active());
+
+        let info = session.client_info().unwrap();
+        assert_eq!(info.screen_px, (2420, 1668));
+        assert_eq!(
+            info.refresh_hz, 120,
+            "panel refresh feeds the VDD mode list"
+        );
     }
 
     #[test]

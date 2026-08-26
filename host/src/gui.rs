@@ -150,6 +150,7 @@ pub struct AnalyzerApp {
     settings_target_error: Option<String>,
     settings_start_on_boot: bool,
     settings_hevc_enabled: bool,
+    settings_vdd_match: bool,
     settings_encoder_choice: String, // display label, e.g. "Auto" or "NVENC"
     /// DXGI `DeviceName` of the chosen capture display; empty string means auto (primary).
     settings_capture_display: String,
@@ -272,6 +273,7 @@ impl AnalyzerApp {
             settings_target_error: None,
             settings_start_on_boot: start_on_boot,
             settings_hevc_enabled: persisted.hevc_enabled,
+            settings_vdd_match: persisted.vdd_match_resolution,
             settings_encoder_choice: encoder_choice,
             settings_capture_display,
             available_outputs,
@@ -324,6 +326,7 @@ impl AnalyzerApp {
                 Some(self.settings_capture_display.clone())
             },
             hevc_enabled: self.settings_hevc_enabled,
+            vdd_match_resolution: self.settings_vdd_match,
             start_on_boot: self.settings_start_on_boot,
         };
         file.save();
@@ -878,6 +881,21 @@ impl AnalyzerApp {
                 .color(MUTED)
                 .size(11.0),
             );
+
+            let prev_vdd_match = self.settings_vdd_match;
+            ui.checkbox(
+                &mut self.settings_vdd_match,
+                egui::RichText::new("Match extended display to the iPad's resolution")
+                    .color(TEXT)
+                    .size(13.0),
+            );
+            if self.settings_vdd_match != prev_vdd_match {
+                info!(
+                    enabled = self.settings_vdd_match,
+                    "VDD resolution match changed — applies next time the extended display starts"
+                );
+                self.persist_settings();
+            }
 
             ui.add_space(12.0);
 
