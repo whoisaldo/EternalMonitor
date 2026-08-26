@@ -31,9 +31,13 @@ license on its repository before public distribution.
 
 VERIFY BEFORE BUNDLING
 ----------------------
-After downloading, confirm the file is signed:
-   Get-AuthenticodeSignature .\Virtual.Display.Driver-v25.05.03-setup-x64.exe
-The Status should be "Valid".
+Upstream ships this setup wrapper UNSIGNED (Get-AuthenticodeSignature
+reports NotSigned) — the signed part is the driver package inside it, which
+Windows itself validates at install time. Verify the download by hash
+instead; the vetted 25.5.2 asset is:
+   SHA-256: ca10b85babecfb636c85b3f04d2306968d4f940dd3dd35767f866207bfba846e
+   (Get-FileHash .\Virtual.Display.Driver-v25.05.03-setup-x64.exe)
+The release workflow pins this same hash and fails the build on mismatch.
 
 NOTE: files in this folder (other than this README) are git-ignored so the binary
 is not committed to the repository.

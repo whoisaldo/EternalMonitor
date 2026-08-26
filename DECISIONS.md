@@ -143,10 +143,13 @@ multi-monitor and virtual-display layouts land clicks on the right screen.
 
 - One version, single-sourced from `host/Cargo.toml` (`env!` into the
   banner and the mDNS TXT), matched by the iOS `MARKETING_VERSION`.
-- CI builds releases from a `v*` tag: pinned FFmpeg, pinned driver version,
-  hard-fail Authenticode verification on the bundled driver, and the
-  installer's SHA-256 published in the release body, where the website
-  reads it.
+- CI builds releases from a `v*` tag: pinned FFmpeg, and the bundled driver
+  pinned by tag AND by the asset's SHA-256 with a hard fail on mismatch.
+  (Upstream ships the setup wrapper unsigned — the driver files inside are
+  the signed part — so exact-bytes pinning is the supply-chain gate, and
+  the workflow reports the Authenticode status informationally in case
+  upstream starts signing.) The installer's SHA-256 is published in the
+  release body, where the website reads it.
 
 ## Deferred
 
