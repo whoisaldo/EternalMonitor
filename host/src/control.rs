@@ -10,7 +10,12 @@ pub const DEFAULT_TARGET_FPS: u32 = 60;
 #[derive(Clone)]
 pub struct SharedControl {
     pub running: Arc<AtomicBool>,
+    /// The user's MAXIMUM bitrate (the GUI slider) — the ABR ceiling.
     pub bitrate_bps: Arc<AtomicU32>,
+    /// What the encoder should currently produce: the ABR controller's pick,
+    /// always <= `bitrate_bps`. The encoder reopens its session when this
+    /// changes (hardware encoders ignore bitrate pokes on an open context).
+    pub abr_current_bps: Arc<AtomicU32>,
     pub target_fps: Arc<AtomicU32>,
     pub target_addr: Arc<Mutex<SocketAddr>>,
     /// Set by transport on iPad re-handshake (same target). Encoder
@@ -61,6 +66,7 @@ impl SharedControl {
         Self {
             running: Arc::new(AtomicBool::new(false)),
             bitrate_bps: Arc::new(AtomicU32::new(initial_bitrate_bps)),
+            abr_current_bps: Arc::new(AtomicU32::new(initial_bitrate_bps)),
             target_fps: Arc::new(AtomicU32::new(DEFAULT_TARGET_FPS)),
             target_addr: Arc::new(Mutex::new(SocketAddr::from(([0, 0, 0, 0], listen_port)))),
             force_next_idr: Arc::new(AtomicBool::new(false)),

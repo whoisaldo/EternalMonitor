@@ -65,7 +65,11 @@ struct DisplayView: View {
         HStack(spacing: 14) {
             stat("\(Int(connectionManager.fps))", unit: "fps", color: Theme.amber)
             divider
-            stat(String(format: "%.0f", connectionManager.lagMs), unit: "ms", color: Theme.phosphor)
+            stat(
+                connectionManager.stats.e2eMs.map { String(format: "%.0f", $0) } ?? "—",
+                unit: "ms",
+                color: Theme.phosphor
+            )
             divider
             stat(connectionManager.transportMode, unit: "", color: Theme.text)
             divider
@@ -93,7 +97,7 @@ struct DisplayView: View {
     }
 
     private var qualityBars: some View {
-        let bars = connectionManager.quality.bars
+        let bars = connectionManager.stats.bars
         let color = Theme.quality(bars: bars)
         return HStack(alignment: .bottom, spacing: 2) {
             ForEach(0..<4, id: \.self) { idx in
@@ -107,13 +111,19 @@ struct DisplayView: View {
     }
 
     private var qualityPopover: some View {
-        let q = connectionManager.quality
+        let q = connectionManager.stats
         return VStack(alignment: .leading, spacing: 10) {
             SectionLabel(title: "Connection quality")
             HStack(spacing: 18) {
-                Readout(value: String(format: "%.1f", q.lossPercent), unit: "%", label: "loss", color: q.lossPercent < 3 ? Theme.phosphor : Theme.caution)
-                Readout(value: String(format: "%.0f", q.jitterMs), unit: "ms", label: "jitter", color: Theme.text)
-                Readout(value: "\(q.seqGap)", unit: "", label: "max gap", color: Theme.text)
+                Readout(
+                    value: String(format: "%.1f", q.lossPercent), unit: "%", label: "loss",
+                    color: q.lossPercent < 3 ? Theme.phosphor : Theme.caution
+                )
+                Readout(
+                    value: q.rttMs.map { String(format: "%.0f", $0) } ?? "—", unit: "ms",
+                    label: "rtt", color: Theme.text
+                )
+                Readout(value: "\(q.framesDropped)", unit: "", label: "dropped", color: Theme.text)
             }
         }
     }
@@ -142,11 +152,14 @@ struct DisplayView: View {
     private var bottomBar: some View {
         HStack {
             HStack(spacing: 8) {
-                SignalDot(color: Theme.phosphor, size: 8)
-                Text("ON AIR")
+                SignalDot(
+                    color: connectionManager.signalLost ? Theme.caution : Theme.phosphor,
+                    size: 8
+                )
+                Text(connectionManager.signalLost ? "SIGNAL LOST" : "ON AIR")
                     .font(.appMonoMedium(size: 12))
                     .tracking(1)
-                    .foregroundColor(Theme.phosphor)
+                    .foregroundColor(connectionManager.signalLost ? Theme.caution : Theme.phosphor)
                 Text("·")
                     .foregroundColor(Theme.text3)
                 Text(connectionManager.transportMode)

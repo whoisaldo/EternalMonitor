@@ -20,7 +20,6 @@ use crate::gpu::GpuInfo;
 use crate::stats::PIPELINE_STATS;
 
 const CHANNEL_CAPACITY: usize = 4;
-const DEFAULT_BITRATE: u32 = 15_000_000;
 const AMF_CAPTURE_PACKET_LIMIT: u64 = 120;
 const AMF_IDR_WARNING_PACKET: u64 = 60;
 const AMF_FORCED_INTRA_PERIOD: u64 = 30;
@@ -111,6 +110,8 @@ fn run_encode_loop(
     // a subsequent keyframe carrying inline parameter sets can recover, instead of leaving the
     // iPad unable to build a format description.
     let mut amf_startup_idr_retries: u8 = 0;
+    // Suppresses reopen retry storms after a failed bitrate change.
+    let mut failed_reopen_bitrate: Option<u32> = None;
 
     // Guarantee the very first frame of every pipeline is an IDR for all encoders, so the
     // iPad never sits in `waitingForSyncSample` after a connect or pipeline restart.
@@ -130,8 +131,17 @@ fn run_encode_loop(
             continue;
         }
 
+        let desired_bitrate = shared.abr_current_bps.load(Ordering::SeqCst).max(500_000);
+        let target_fps = shared.target_fps.load(Ordering::SeqCst);
+
         if encoder_state.is_none() {
-            match EncoderState::new(&encoder_name, raw_frame.width, raw_frame.height) {
+            match EncoderState::new(
+                &encoder_name,
+                raw_frame.width,
+                raw_frame.height,
+                desired_bitrate,
+                target_fps,
+            ) {
                 Ok(state) => encoder_state = Some(state),
                 Err(e) if encoder_name != "libx264" => {
                     // A hardware encoder (commonly AMF) can fail to *open* even though it is
@@ -154,18 +164,57 @@ fn run_encode_loop(
                         &encoder_name,
                         raw_frame.width,
                         raw_frame.height,
+                        desired_bitrate,
+                        target_fps,
                     )?);
                 }
                 Err(e) => return Err(e),
+            }
+        } else if encoder_state
+            .as_ref()
+            .is_some_and(|state| state.opened_bitrate != desired_bitrate)
+            && failed_reopen_bitrate != Some(desired_bitrate)
+        {
+            // Bitrate changed (ABR rung or the user's slider): hardware
+            // encoders ignore bitrate pokes on an open context, so a real
+            // change means a session reopen (~50-200ms hiccup, no transport
+            // teardown, same stream epoch) followed by a forced IDR.
+            let previous = encoder_state
+                .as_ref()
+                .map(|s| s.opened_bitrate)
+                .unwrap_or(0);
+            match EncoderState::new(
+                &encoder_name,
+                raw_frame.width,
+                raw_frame.height,
+                desired_bitrate,
+                target_fps,
+            ) {
+                Ok(state) => {
+                    info!(
+                        from = previous,
+                        to = desired_bitrate,
+                        "Reopened encoder session for new bitrate"
+                    );
+                    encoder_state = Some(state);
+                    failed_reopen_bitrate = None;
+                    shared.force_next_idr.store(true, Ordering::SeqCst);
+                }
+                Err(e) => {
+                    warn!(
+                        error = %e,
+                        bitrate = desired_bitrate,
+                        "Encoder reopen failed — keeping the current session"
+                    );
+                    failed_reopen_bitrate = Some(desired_bitrate);
+                }
             }
         }
 
         let encoder = encoder_state
             .as_mut()
             .expect("Encoder state must be initialized");
-
-        let current_bitrate = shared.bitrate_bps.load(Ordering::SeqCst);
-        apply_bitrate(&mut encoder.encoder, current_bitrate)?;
+        let current_bitrate = encoder.opened_bitrate;
 
         let stride = encoder.bgra_frame.stride(0);
         let src_row_bytes = (raw_frame.width * 4) as usize;
@@ -180,7 +229,20 @@ fn run_encode_loop(
         encoder
             .scaler
             .run(&encoder.bgra_frame, &mut encoder.frame)?;
-        encoder.frame.set_pts(Some(raw_frame.frame_number as i64));
+        let pts = if encoder.legacy_pts {
+            raw_frame.frame_number as i64
+        } else {
+            let epoch = *encoder.pts_epoch.get_or_insert(raw_frame.timestamp);
+            let real = raw_frame
+                .timestamp
+                .saturating_duration_since(epoch)
+                .as_micros() as i64;
+            // Strict monotonicity (keepalive resends and clock quirks).
+            let pts = real.max(encoder.last_pts + 1);
+            encoder.last_pts = pts;
+            pts
+        };
+        encoder.frame.set_pts(Some(pts));
         let force_idr = shared.force_next_idr.swap(false, Ordering::SeqCst);
         let _forced_intra = prepare_frame_for_encode(
             &mut encoder.frame,
@@ -284,6 +346,15 @@ struct EncoderState {
     packet: ffmpeg_next::Packet,
     h264: H264BitstreamState,
     amf_diagnostics: Option<AmfBitstreamDiagnostics>,
+    /// The bitrate this session was opened with; a change requests a reopen.
+    opened_bitrate: u32,
+    /// First frame's capture instant — the PTS epoch for this session.
+    pts_epoch: Option<std::time::Instant>,
+    last_pts: i64,
+    /// ETERNAL_LEGACY_PTS=1 restores the old dense frame-counter PTS at
+    /// time_base 1/60 (escape hatch until the real-PTS path is verified on
+    /// NVENC/AMF hardware).
+    legacy_pts: bool,
 }
 
 impl EncoderState {
@@ -291,7 +362,10 @@ impl EncoderState {
         encoder_name: &str,
         width: u32,
         height: u32,
+        bitrate_bps: u32,
+        target_fps: u32,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+        let legacy_pts = std::env::var("ETERNAL_LEGACY_PTS").is_ok_and(|v| v.trim() == "1");
         let codec = ffmpeg_next::encoder::find_by_name(encoder_name)
             .ok_or_else(|| format!("{} codec not found in FFmpeg", encoder_name))?;
         let context = ffmpeg_next::codec::Context::new_with_codec(codec);
@@ -300,9 +374,17 @@ impl EncoderState {
         encoder.set_width(width);
         encoder.set_height(height);
         encoder.set_format(ffmpeg_next::format::Pixel::YUV420P);
-        encoder.set_time_base(ffmpeg_next::Rational(1, 60));
+        if legacy_pts {
+            encoder.set_time_base(ffmpeg_next::Rational(1, 60));
+        } else {
+            // Microsecond PTS from real capture times: rate control finally
+            // sees the true cadence (idle keepalives, 30 fps modes) instead of
+            // being told every frame is 1/60s apart.
+            encoder.set_time_base(ffmpeg_next::Rational(1, 1_000_000));
+            encoder.set_frame_rate(Some(ffmpeg_next::Rational(target_fps.max(1) as i32, 1)));
+        }
         encoder.set_max_b_frames(0);
-        encoder.set_bit_rate(DEFAULT_BITRATE as usize);
+        encoder.set_bit_rate(bitrate_bps.max(500_000) as usize);
         encoder.set_gop(30);
         configure_encoder_flags(&mut encoder, encoder_name);
 
@@ -313,7 +395,8 @@ impl EncoderState {
         info!(
             width,
             height,
-            bitrate = DEFAULT_BITRATE,
+            bitrate = bitrate_bps,
+            fps = target_fps,
             encoder = encoder_name,
             "Encoder opened"
         );
@@ -347,6 +430,10 @@ impl EncoderState {
             packet: ffmpeg_next::Packet::empty(),
             h264,
             amf_diagnostics: AmfBitstreamDiagnostics::new(encoder_name),
+            opened_bitrate: bitrate_bps,
+            pts_epoch: None,
+            last_pts: -1,
+            legacy_pts,
         })
     }
 
@@ -413,17 +500,6 @@ fn encoder_options(encoder_name: &str) -> ffmpeg_next::Dictionary<'_> {
         }
     }
     opts
-}
-
-fn apply_bitrate(
-    encoder: &mut ffmpeg_next::codec::encoder::video::Encoder,
-    bitrate_bps: u32,
-) -> Result<(), ffmpeg_next::Error> {
-    let bitrate = bitrate_bps.max(1);
-    encoder.set_bit_rate(bitrate as usize);
-    encoder.set_max_bit_rate(bitrate as usize);
-    encoder.set_tolerance((bitrate / 2) as usize);
-    Ok(())
 }
 
 fn prepare_frame_for_encode(
@@ -501,6 +577,11 @@ struct AmfBitstreamDiagnostics {
 impl AmfBitstreamDiagnostics {
     fn new(encoder_name: &str) -> Option<Self> {
         if !is_amf_encoder(encoder_name) {
+            return None;
+        }
+        // Opt-in only: the capture writes every packet to disk and used to
+        // stall the encode thread for seconds on the ffmpeg.exe validation.
+        if !std::env::var("ETERNAL_AMF_DIAG").is_ok_and(|v| v.trim() == "1") {
             return None;
         }
 
@@ -616,20 +697,21 @@ impl AmfBitstreamDiagnostics {
                     }
                 }
                 self.capture_file = None;
-                self.validate_capture_with_ffmpeg();
+                // Never on the encode thread: the ffmpeg.exe round trip takes
+                // seconds and used to freeze the stream mid-session.
+                let capture_path = self.capture_path.clone();
+                std::thread::spawn(move || validate_capture_with_ffmpeg(&capture_path));
+                self.validation_complete = true;
             }
         }
     }
+}
 
-    fn validate_capture_with_ffmpeg(&mut self) {
-        if self.validation_complete {
-            return;
-        }
-        self.validation_complete = true;
-
+fn validate_capture_with_ffmpeg(capture_path: &std::path::Path) {
+    {
         let Some(ffmpeg_path) = find_ffmpeg_exe() else {
             warn!(
-                path = %self.capture_path.display(),
+                path = %capture_path.display(),
                 "AMF diagnostic capture completed but ffmpeg.exe was not found for software decode validation"
             );
             return;
@@ -641,7 +723,7 @@ impl AmfBitstreamDiagnostics {
                 "-v",
                 "error",
                 "-i",
-                self.capture_path.to_string_lossy().as_ref(),
+                capture_path.to_string_lossy().as_ref(),
                 "-f",
                 "null",
                 "-",
@@ -650,7 +732,7 @@ impl AmfBitstreamDiagnostics {
         {
             Ok(output) if output.status.success() => {
                 info!(
-                    capture = %self.capture_path.display(),
+                    capture = %capture_path.display(),
                     ffmpeg = %ffmpeg_path.display(),
                     "Local FFmpeg software decode of captured AMF bitstream succeeded"
                 );
@@ -658,7 +740,7 @@ impl AmfBitstreamDiagnostics {
             Ok(output) => {
                 let stderr = String::from_utf8_lossy(&output.stderr);
                 error!(
-                    capture = %self.capture_path.display(),
+                    capture = %capture_path.display(),
                     ffmpeg = %ffmpeg_path.display(),
                     status = ?output.status.code(),
                     stderr = %stderr.trim(),
@@ -667,7 +749,7 @@ impl AmfBitstreamDiagnostics {
             }
             Err(error) => {
                 warn!(
-                    capture = %self.capture_path.display(),
+                    capture = %capture_path.display(),
                     ffmpeg = %ffmpeg_path.display(),
                     error = %error,
                     "Failed to launch ffmpeg.exe for AMF software decode validation"

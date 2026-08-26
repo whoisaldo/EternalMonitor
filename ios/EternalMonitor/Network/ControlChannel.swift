@@ -39,9 +39,31 @@ final class ControlChannel {
     private var helloAttempts = 0
     private var helloTimer: DispatchSourceTimer?
     private var reportTimer: DispatchSourceTimer?
+    private var pingTimer: DispatchSourceTimer?
+    private var burstPingsRemaining = 0
+    private var estimator = ClockEstimator()
+
+    /// Client clock (µs) of the last host heartbeat; 0 = none yet. Read by the
+    /// ConnectionManager's watchdog.
+    let lastHeartbeatAtUs = OSAllocatedUnfairLock<UInt64>(initialState: 0)
+    /// Latest clock-sync results for latency math and the HUD.
+    let clockSnapshot = OSAllocatedUnfairLock<ClockSnapshot>(initialState: ClockSnapshot())
+
+    struct ClockSnapshot {
+        var offsetUs: Int64?
+        var rttUs: UInt64?
+    }
+
+    /// Monotonic client clock in microseconds (same domain as CACurrentMediaTime).
+    static func clientNowUs() -> UInt64 {
+        clock_gettime_nsec_np(CLOCK_UPTIME_RAW) / 1000
+    }
 
     private static let maxHelloAttempts = 8
     private static let helloRetryMs = 250
+    private static let pingIntervalMs = 2000
+    private static let pingBurstCount = 5
+    private static let pingBurstSpacingMs = 200
 
     init(queue: DispatchQueue, send: @escaping (Data) -> Void) {
         self.queue = queue
@@ -131,13 +153,18 @@ final class ControlChannel {
             handleAck(ack)
         case .heartbeat(let heartbeat):
             guard header.sessionId == sessionId, sessionId != 0 else { return }
+            lastHeartbeatAtUs.withLock { $0 = Self.clientNowUs() }
             onHeartbeat?(heartbeat)
         case .bye(let reason):
             guard header.sessionId == sessionId, sessionId != 0 else { return }
             onBye?(reason)
-        case .pong:
-            // Clock sync lands with the metrics phase.
-            break
+        case .pong(let pong):
+            guard header.sessionId == sessionId, sessionId != 0 else { return }
+            let t4 = Self.clientNowUs()
+            estimator.addExchange(t1: pong.t1Us, t2: pong.t2Us, t3: pong.t3Us, t4: t4)
+            clockSnapshot.withLock {
+                $0 = ClockSnapshot(offsetUs: estimator.offsetUs, rttUs: estimator.rttUs)
+            }
         case .streamConfig:
             break
         default:
@@ -161,7 +188,9 @@ final class ControlChannel {
 
         sessionId = ack.sessionId
         onDiagnostic?("Session \(ack.sessionId) established with \(ack.hostName)")
+        lastHeartbeatAtUs.withLock { $0 = Self.clientNowUs() }
         startReportTimer(intervalMs: max(ack.reportIntervalMs, 100))
+        startPinging()
         onSessionEstablished?(SessionInfo(
             sessionId: ack.sessionId,
             hostName: ack.hostName,
@@ -214,13 +243,43 @@ final class ControlChannel {
         }
     }
 
+    private func startPinging() {
+        burstPingsRemaining = Self.pingBurstCount
+        let timer = DispatchSource.makeTimerSource(queue: queue)
+        timer.schedule(deadline: .now(), repeating: .milliseconds(Self.pingBurstSpacingMs))
+        timer.setEventHandler { [weak self] in self?.pingTick() }
+        pingTimer?.cancel()
+        pingTimer = timer
+        timer.resume()
+    }
+
+    private func pingTick() {
+        guard sessionId != 0 else { return }
+        sendMessage(.ping(WirePing(t1Us: Self.clientNowUs())))
+        if burstPingsRemaining > 0 {
+            burstPingsRemaining -= 1
+            if burstPingsRemaining == 0 {
+                // Burst done: settle into the steady cadence.
+                pingTimer?.schedule(
+                    deadline: .now() + .milliseconds(Self.pingIntervalMs),
+                    repeating: .milliseconds(Self.pingIntervalMs)
+                )
+            }
+        }
+    }
+
     func stop() {
         queue.async { [self] in
             helloTimer?.cancel()
             helloTimer = nil
             reportTimer?.cancel()
             reportTimer = nil
+            pingTimer?.cancel()
+            pingTimer = nil
             sessionId = 0
+            estimator.reset()
+            lastHeartbeatAtUs.withLock { $0 = 0 }
+            clockSnapshot.withLock { $0 = ClockSnapshot() }
         }
     }
 

@@ -35,6 +35,8 @@ pub struct Actions {
     /// The client is gone (BYE or liveness expiry): stop sending media and, if
     /// the virtual display is in use, restart the pipeline so it tears down.
     pub client_lost: bool,
+    /// A fresh receiver report arrived (feeds the ABR controller).
+    pub report: Option<ReceiverReport>,
 }
 
 #[derive(Debug, Clone)]
@@ -264,11 +266,12 @@ impl Session {
         report: ReceiverReport,
         now: Instant,
     ) -> Actions {
-        let actions = Actions::default();
+        let mut actions = Actions::default();
         if let Some(session) = self.active.as_mut() {
             if session_peer_matches(session, source) {
                 session.liveness_deadline = now + LIVENESS_TIMEOUT;
                 session.last_report = Some(report);
+                actions.report = Some(report);
             }
         }
         actions
@@ -343,6 +346,25 @@ impl Session {
             ));
         }
         actions
+    }
+
+    /// One STREAM_CONFIG notify for the active client (bitrate/fps/resolution
+    /// changed). The heartbeat's embedded config self-heals if this is lost.
+    pub fn stream_config_notify(
+        &mut self,
+        config: &impl ConfigSource,
+    ) -> Vec<(SocketAddr, Vec<u8>)> {
+        let Some(session) = self.active.as_ref() else {
+            return Vec::new();
+        };
+        let peer = session.peer;
+        let session_id = session.session_id;
+        let msg_seq = self.next_msg_seq();
+        let message = ControlMessage::StreamConfig(config.stream_config());
+        vec![(
+            peer,
+            eternal_wire::v2::control::encode_control(session_id, msg_seq, &message),
+        )]
     }
 
     /// A legacy (v0.1.x) ETERNALHELLO arrived: no wire reply — the old app

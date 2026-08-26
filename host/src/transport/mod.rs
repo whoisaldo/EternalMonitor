@@ -1,3 +1,5 @@
+pub mod abr;
+pub mod pacer;
 pub mod session;
 
 use std::net::SocketAddr;
@@ -14,6 +16,8 @@ use tracing::{debug, info, warn};
 use crate::control::{CaptureTarget, SharedControl, SupervisorCommand, VddStatus};
 use crate::encoder::NALUnit;
 use crate::stats::PIPELINE_STATS;
+use abr::AbrController;
+use pacer::FramePacer;
 use session::{Actions, ConfigSource, Session, HEARTBEAT_INTERVAL};
 
 /// Monotonic per-process counter stamped into each media header's `stream_epoch`. Every
@@ -49,7 +53,7 @@ impl ConfigSource for SharedConfigSource<'_> {
             } else {
                 0
             },
-            bitrate_bps: self.shared.bitrate_bps.load(Ordering::SeqCst),
+            bitrate_bps: self.shared.abr_current_bps.load(Ordering::SeqCst),
         }
     }
 
@@ -71,7 +75,15 @@ pub async fn start_sender(
     supervisor_tx: std_mpsc::Sender<SupervisorCommand>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let bind_addr: SocketAddr = format!("0.0.0.0:{listen_port}").parse().unwrap();
-    let socket = UdpSocket::bind(bind_addr).await?;
+    let socket = {
+        let raw = socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::DGRAM, None)?;
+        // A 4 MiB send buffer lets the kernel absorb whatever the pacer's
+        // hard budget doesn't smooth (best effort — some platforms clamp it).
+        let _ = raw.set_send_buffer_size(4 * 1024 * 1024);
+        raw.set_nonblocking(true)?;
+        raw.bind(&bind_addr.into())?;
+        UdpSocket::from_std(raw.into())?
+    };
 
     // Never 0 — the receiver treats epoch 0 as invalid. (Wrap after 2^32 runs is
     // harmless: a fresh session id accompanies any host relaunch.)
@@ -99,6 +111,35 @@ pub async fn start_sender(
         stream_epoch,
     };
 
+    let abr_enabled = !std::env::var("ETERNAL_ABR").is_ok_and(|v| v.trim() == "0");
+    let mut abr = AbrController::new(shared.bitrate_bps.load(Ordering::SeqCst), abr_enabled);
+    shared
+        .abr_current_bps
+        .store(abr.current_bps(), Ordering::SeqCst);
+
+    // Test-harness fault injection: ETERNAL_DROP=0.05 silently drops ~5% of
+    // media datagrams (deterministic xorshift so runs are reproducible).
+    let drop_rate: f64 = std::env::var("ETERNAL_DROP")
+        .ok()
+        .and_then(|v| v.trim().parse().ok())
+        .filter(|r| (0.0..1.0).contains(r))
+        .unwrap_or(0.0);
+    let mut drop_rng: u64 = 0x9E37_79B9_7F4A_7C15;
+    let mut next_drop = move || {
+        drop_rng ^= drop_rng << 13;
+        drop_rng ^= drop_rng >> 7;
+        drop_rng ^= drop_rng << 17;
+        (drop_rng >> 11) as f64 / (1u64 << 53) as f64
+    };
+    if drop_rate > 0.0 {
+        warn!(drop_rate, "ETERNAL_DROP fault injection active");
+    }
+
+    // Frames already sitting in the encoder channel when a session starts are
+    // pre-IDR leftovers; a new session must begin with a keyframe.
+    let mut last_session_id: Option<u32> = None;
+    let mut awaiting_keyframe = true;
+
     let mut recv_buf = [0u8; 2048];
     let mut dgram_scratch = [0u8; MAX_DGRAM_SIZE];
     let mut heartbeat = tokio::time::interval(HEARTBEAT_INTERVAL);
@@ -116,9 +157,31 @@ pub async fn start_sender(
                             Classified::Control(_) => {
                                 match eternal_wire::v2::control::parse_control(datagram) {
                                     Ok((_, message)) => {
-                                        let actions = session.handle_control(
+                                        let mut actions = session.handle_control(
                                             src, message, &config, Instant::now(),
                                         );
+                                        if let Some(report) = actions.report.take() {
+                                            let ceiling =
+                                                shared.bitrate_bps.load(Ordering::SeqCst);
+                                            let _ = abr.set_ceiling(ceiling);
+                                            let decision = abr.on_report(&report, Instant::now());
+                                            if decision.changed {
+                                                shared
+                                                    .abr_current_bps
+                                                    .store(decision.target_bps, Ordering::SeqCst);
+                                                PIPELINE_STATS
+                                                    .lock()
+                                                    .set_bitrate(decision.target_bps);
+                                                // One immediate notify; the 1s heartbeat's
+                                                // embedded config self-heals any loss.
+                                                let notify = session.stream_config_notify(&config);
+                                                for (destination, datagram) in notify {
+                                                    let _ = socket
+                                                        .send_to(&datagram, destination)
+                                                        .await;
+                                                }
+                                            }
+                                        }
                                         execute_actions(
                                             actions, &socket, &shared, &supervisor_tx,
                                         ).await;
@@ -144,6 +207,16 @@ pub async fn start_sender(
                 if target_addr.ip().is_unspecified() || target_addr.port() == 0 {
                     continue;
                 }
+                if last_session_id != Some(session_id) {
+                    last_session_id = Some(session_id);
+                    awaiting_keyframe = true;
+                }
+                if awaiting_keyframe {
+                    if !nal.is_keyframe {
+                        continue; // stale pre-session frame — the forced IDR is coming
+                    }
+                    awaiting_keyframe = false;
+                }
 
                 let send_start = Instant::now();
                 let payload = &nal.data;
@@ -160,6 +233,7 @@ pub async fn start_sender(
                 let capture_ts_us = crate::clock::instant_to_us(nal.timestamp);
 
                 let mut send_failed = false;
+                let mut frame_pacer = FramePacer::new(frag_count_usize, Instant::now());
                 for (index, chunk) in payload.chunks(MAX_MEDIA_PAYLOAD).enumerate() {
                     let header = MediaHeader {
                         session_id,
@@ -176,11 +250,19 @@ pub async fn start_sender(
                         .copy_from_slice(chunk);
                     let datagram = &dgram_scratch[..MEDIA_HEADER_SIZE + chunk.len()];
 
-                    if let Err(e) = socket.send_to(datagram, target_addr).await {
-                        if !send_failed {
-                            warn!(seq = nal.sequence, fragment = index, error = %e, "UDP send failed");
-                            send_failed = true;
+                    let inject_drop = drop_rate > 0.0 && next_drop() < drop_rate;
+                    if !inject_drop {
+                        if let Err(e) = socket.send_to(datagram, target_addr).await {
+                            if !send_failed {
+                                warn!(seq = nal.sequence, fragment = index, error = %e, "UDP send failed");
+                                send_failed = true;
+                            }
                         }
+                    }
+
+                    let pause = frame_pacer.after_send(Instant::now());
+                    if pause > Duration::ZERO {
+                        tokio::time::sleep(pause).await;
                     }
                 }
 
