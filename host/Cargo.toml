@@ -28,6 +28,9 @@ mdns-sd = "0.12"
 parking_lot = "0.12"
 once_cell = "1"
 
+# Socket options (send-buffer sizing) before handing the socket to tokio
+socket2 = "0.5"
+
 [build-dependencies]
 winresource = "0.1"
 

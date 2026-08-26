@@ -69,8 +69,12 @@ final class ConnectionManager: ObservableObject {
     @Published var transportMode: String = "WiFi"
     @Published var connectionError: String?
     @Published private(set) var diagnostics: [DiagnosticEntry] = []
-    // connection quality tracker exposed to the HUD.
-    let quality = ConnectionQualityTracker()
+    /// Live stream health for the HUD, recomputed at the 4 Hz flush.
+    @Published private(set) var stats = StreamStats()
+    /// Host heartbeats/frames stopped arriving; the frozen frame is stale.
+    @Published private(set) var signalLost = false
+    /// Nonzero while an automatic reconnect cycle is running.
+    @Published private(set) var reconnectAttempt = 0
 
     private var udpReceiver: UDPReceiver?
     private var frameAssembler: FrameAssembler?
@@ -92,6 +96,11 @@ final class ConnectionManager: ObservableObject {
     /// retaining self (rebuilt each connect).
     private let controlChannelBox = ControlChannelBox()
     private var fpsCounter = FPSCounter()
+    private var lastTarget: (host: String, port: UInt16)?
+    private var livenessTimeoutUs: UInt64 = 3_000_000
+    private var degradedSinceUs: UInt64?
+    private var reconnectTask: Task<Void, Never>?
+    private var prevCounters = FrameAssembler.Counters()
 
     static let connectionTimeoutSeconds: UInt64 = 10
 
@@ -110,6 +119,10 @@ final class ConnectionManager: ObservableObject {
 
         state = .connecting
         connectionError = nil
+        lastTarget = (normalizedHost, port)
+        signalLost = false
+        degradedSinceUs = nil
+        prevCounters = FrameAssembler.Counters()
         diagnostics.removeAll()
         didExtendTimeout = false
         debugState = ConnectionDebugState(host: normalizedHost, port: port)
@@ -134,7 +147,6 @@ final class ConnectionManager: ObservableObject {
             let frameWidth = CVPixelBufferGetWidth(pixelBuffer)
             let frameHeight = CVPixelBufferGetHeight(pixelBuffer)
             Task { @MainActor in
-                self.quality.recordFrameDecoded()
                 self.debugState.decodedFrames += 1
                 self.debugState.lastDecodedTimestampUs = ts
                 if self.debugState.decodedFrames == 1 {
@@ -162,9 +174,14 @@ final class ConnectionManager: ObservableObject {
                         fps: self.fps
                     )
                 }
-                let nowUs = UInt64(ProcessInfo.processInfo.systemUptime * 1_000_000)
-                if ts > 0 {
-                    self.lagMs = Double(nowUs &- ts) / 1000.0
+                self.signalLost = false
+                self.degradedSinceUs = nil
+                if ts > 0,
+                   let offset = self.controlChannelBox.value?.clockSnapshot.withLock({ $0.offsetUs }) {
+                    let nowUs = ControlChannel.clientNowUs()
+                    let captureClient = Int64(bitPattern: ts) - offset
+                    let latencyUs = Int64(bitPattern: nowUs) - captureClient
+                    self.lagMs = latencyUs > 0 ? Double(latencyUs) / 1000.0 : 0
                 }
             }
         }
@@ -201,7 +218,21 @@ final class ConnectionManager: ObservableObject {
             receiver?.send(data)
         })
         controlChannelBox.value = channel
-        channel.reportProvider = { ReceiverReport() }
+        channel.reportProvider = { [weak assembler, weak channel] in
+            var report = ReceiverReport()
+            if let counters = assembler?.counters.withLock({ $0 }) {
+                report.framesComplete = UInt32(clamping: counters.framesComplete)
+                report.framesDropped = UInt32(clamping: counters.framesDropped)
+                report.fragsReceived = UInt32(clamping: counters.fragsReceived)
+                report.fragsLost = UInt32(clamping: counters.fragsLost)
+            }
+            if let snapshot = channel?.clockSnapshot.withLock({ $0 }) {
+                if let rtt = snapshot.rttUs {
+                    report.rttMsX10 = UInt16(clamping: rtt / 100)
+                }
+            }
+            return report
+        }
         channel.onHelloAttempt = { [weak self] attempt, total in
             Task { @MainActor in
                 self?.debugState.helloAttempts = attempt
@@ -217,6 +248,8 @@ final class ConnectionManager: ObservableObject {
             receiver?.setAcceptedSessionId(info.sessionId)
             Task { @MainActor in
                 guard let self else { return }
+                self.livenessTimeoutUs = UInt64(info.livenessTimeoutMs) * 1000
+                self.reconnectAttempt = 0
                 self.record(
                     .info, "ctrl",
                     "Connected to \(info.hostName): \(info.streamConfig.width)x\(info.streamConfig.height) @ \(info.streamConfig.fps)fps"
@@ -360,7 +393,91 @@ final class ConnectionManager: ObservableObject {
                 if firstAssembled {
                     self.record(.info, "assembly", "First frame payload assembled (\(snapshot.assembledBytes) bytes)")
                 }
+                self.refreshStatsAndWatchdog()
             }
+        }
+    }
+
+    /// Recomputes the HUD stats from the hot-path counters and runs the
+    /// heartbeat liveness watchdog. MainActor, 4 Hz.
+    private func refreshStatsAndWatchdog() {
+        guard let channel = controlChannel else { return }
+
+        // --- Stats snapshot ---
+        var next = StreamStats()
+        next.decodeFps = fps
+        let clock = channel.clockSnapshot.withLock { $0 }
+        if let rtt = clock.rttUs { next.rttMs = Double(rtt) / 1000.0 }
+        if clock.offsetUs != nil { next.e2eMs = lagMs }
+        if let counters = frameAssembler?.counters.withLock({ $0 }) {
+            let deltaReceived = counters.fragsReceived &- prevCounters.fragsReceived
+            let deltaLost = counters.fragsLost &- prevCounters.fragsLost
+            prevCounters = counters
+            let total = deltaReceived + deltaLost
+            next.lossPercent = total == 0 ? 0 : Double(deltaLost) * 100.0 / Double(total)
+            next.framesDropped = counters.framesDropped
+        }
+        next.bars = StreamStats.bars(lossPercent: next.lossPercent, rttMs: next.rttMs)
+        stats = next
+
+        // --- Liveness watchdog (host heartbeats stopped => stale picture) ---
+        guard state == .connected else { return }
+        let lastHeartbeat = channel.lastHeartbeatAtUs.withLock { $0 }
+        guard lastHeartbeat > 0 else { return }
+        let sinceUs = ControlChannel.clientNowUs() &- lastHeartbeat
+        if sinceUs > livenessTimeoutUs {
+            if !signalLost {
+                signalLost = true
+                degradedSinceUs = ControlChannel.clientNowUs()
+                record(.warning, "ctrl", "Host heartbeats stopped — signal lost")
+            } else if let since = degradedSinceUs,
+                      ControlChannel.clientNowUs() &- since > 5_000_000 {
+                // 5s of degraded: give up on this session and (optionally)
+                // start the reconnect cycle.
+                beginReconnect(reason: "host stopped responding")
+            }
+        } else if signalLost {
+            signalLost = false
+            degradedSinceUs = nil
+            record(.info, "ctrl", "Signal recovered")
+        }
+    }
+
+    private func beginReconnect(reason: String) {
+        let target = lastTarget
+        let auto = UserDefaults.standard.object(forKey: "autoReconnect") as? Bool ?? true
+        record(.warning, "ctrl", "Connection lost (\(reason))")
+        disconnect()
+        guard auto, let target else {
+            connectionError = "Connection lost — \(reason)."
+            return
+        }
+        startReconnectCycle(to: target)
+    }
+
+    private func startReconnectCycle(to target: (host: String, port: UInt16)) {
+        reconnectTask?.cancel()
+        reconnectTask = Task { @MainActor [weak self] in
+            for attempt in 1...6 {
+                guard let self, !Task.isCancelled else { return }
+                self.reconnectAttempt = attempt
+                self.connectionError = "Connection lost — reconnecting (attempt \(attempt)/6)…"
+                let backoff = min(1 << (attempt - 1), 15)
+                try? await Task.sleep(for: .seconds(Double(backoff)))
+                guard !Task.isCancelled, self.state == .disconnected else { return }
+                self.connect(host: target.host, port: target.port)
+                // Give the attempt its connect-timeout window to succeed.
+                try? await Task.sleep(for: .seconds(Double(Self.connectionTimeoutSeconds) + 2))
+                guard !Task.isCancelled else { return }
+                if self.state == .connected {
+                    self.reconnectAttempt = 0
+                    self.connectionError = nil
+                    return
+                }
+            }
+            guard let self, !Task.isCancelled else { return }
+            self.reconnectAttempt = 0
+            self.connectionError = "Could not reach the host after 6 attempts."
         }
     }
 
@@ -381,6 +498,8 @@ final class ConnectionManager: ObservableObject {
 
     func cancel() {
         timeoutTask?.cancel()
+        reconnectTask?.cancel()
+        reconnectAttempt = 0
         disconnect()
     }
 
@@ -418,7 +537,10 @@ final class ConnectionManager: ObservableObject {
         state = .disconnected
         fps = 0
         lagMs = 0
-        quality.reset()
+        stats = StreamStats()
+        signalLost = false
+        degradedSinceUs = nil
+        prevCounters = FrameAssembler.Counters()
         UIApplication.shared.isIdleTimerDisabled = false
     }
 

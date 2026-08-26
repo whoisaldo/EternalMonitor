@@ -1,4 +1,5 @@
 import Foundation
+import os
 
 /// Reassembles fragmented UDP datagrams into complete FlatBuffer payloads.
 /// Called exclusively from the UDP receiver's serial queue — no locking needed.
@@ -21,6 +22,17 @@ final class FrameAssembler {
     static let maxPendingFrames = 8
     /// Hard ceiling on buffered fragment bytes across all partial frames.
     static let maxPendingBytes = 8 * 1024 * 1024
+
+    /// Cumulative per-connection loss accounting, safe to read from any
+    /// thread (feeds receiver reports and the HUD).
+    struct Counters {
+        var framesComplete: UInt64 = 0
+        var framesDropped: UInt64 = 0
+        var fragsReceived: UInt64 = 0
+        var fragsLost: UInt64 = 0
+    }
+
+    let counters = OSAllocatedUnfairLock<Counters>(initialState: Counters())
 
     private var pending: [UInt32: PendingFrame] = [:]
     private var pendingBytes = 0
@@ -135,6 +147,7 @@ final class FrameAssembler {
             pending[seq]?.fragments[index] = payload
             pending[seq]?.byteCount += payload.count
             pendingBytes += payload.count
+            counters.withLock { $0.fragsReceived += 1 }
         }
 
         // Check if frame is complete
@@ -153,11 +166,12 @@ final class FrameAssembler {
 
             latestCompletedSeq = seq
             removePending(seq)
+            counters.withLock { $0.framesComplete += 1 }
 
             // Evict any frames older than the completed one — delivering them
             // after a newer frame would corrupt decode order.
             for staleSeq in pending.keys where staleSeq <= seq {
-                removePending(staleSeq)
+                dropPending(staleSeq)
             }
 
             onFrameAssembled?(assembled, seq, frame.captureTimestampUs, frame.isKeyframe)
@@ -178,11 +192,23 @@ final class FrameAssembler {
         latestCompletedSeq = 0
         cleanupCounter = 0
         currentEpoch = nil
+        counters.withLock { $0 = Counters() }
     }
 
     private func removePending(_ seq: UInt32) {
         if let removed = pending.removeValue(forKey: seq) {
             pendingBytes -= removed.byteCount
+        }
+    }
+
+    /// Remove a partial frame that will never complete, counting its loss.
+    private func dropPending(_ seq: UInt32) {
+        if let removed = pending.removeValue(forKey: seq) {
+            pendingBytes -= removed.byteCount
+            counters.withLock {
+                $0.framesDropped += 1
+                $0.fragsLost += UInt64(max(Int(removed.fragmentCount) - removed.fragments.count, 0))
+            }
         }
     }
 
@@ -193,7 +219,7 @@ final class FrameAssembler {
         while pending.count >= Self.maxPendingFrames || pendingBytes >= Self.maxPendingBytes {
             guard let oldest = pending.keys.min() else { break }
             onDiagnostic?("Dropped partial frame seq=\(oldest) to admit seq=\(incoming) (capacity)")
-            removePending(oldest)
+            dropPending(oldest)
         }
     }
 
@@ -207,7 +233,7 @@ final class FrameAssembler {
         for (seq, frame) in pending {
             let elapsedNs = ((now - frame.createdAt) * numer) / denom
             if elapsedNs >= 100_000_000 {  // 100ms timeout
-                removePending(seq)
+                dropPending(seq)
             }
         }
     }

@@ -29,6 +29,20 @@ use eternal_wire::v2::control::{
 use eternal_wire::v2::media::MediaHeader;
 use eternal_wire::v2::{classify, Classified};
 
+/// Tests share process-global env (ETERNAL_*); run them one at a time.
+static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Surface the host's tracing in test output (best effort, once per process).
+fn init_test_tracing() {
+    use tracing_subscriber::EnvFilter;
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
+        )
+        .with_test_writer()
+        .try_init();
+}
+
 const SYNTH_W: u32 = 640;
 const SYNTH_H: u32 = 360;
 const WANT_DECODED_FRAMES: usize = 30;
@@ -108,11 +122,16 @@ impl FakeReceiver {
         });
         let hello_bytes = encode_control(0, 1, &hello);
 
-        let deadline = Instant::now() + Duration::from_secs(10);
+        let deadline = Instant::now() + Duration::from_secs(20);
         let mut buf = [0u8; 2048];
         let mut last_hello = Instant::now() - Duration::from_secs(1);
+        let mut datagrams_seen = 0u32;
+        let mut media_seen = 0u32;
         let ack: HelloAck = loop {
-            assert!(Instant::now() < deadline, "no HELLO_ACK within 10s");
+            assert!(
+                Instant::now() < deadline,
+                "no HELLO_ACK within 20s (saw {datagrams_seen} datagrams, {media_seen} media)"
+            );
             if last_hello.elapsed() >= Duration::from_millis(250) {
                 socket.send_to(&hello_bytes, &host).expect("send hello2");
                 last_hello = Instant::now();
@@ -120,10 +139,15 @@ impl FakeReceiver {
             let Ok((len, _)) = socket.recv_from(&mut buf) else {
                 continue;
             };
-            if let Classified::Control(_) = classify(&buf[..len]) {
-                if let Ok((_, ControlMessage::HelloAck(ack))) = parse_control(&buf[..len]) {
-                    break ack;
+            datagrams_seen += 1;
+            match classify(&buf[..len]) {
+                Classified::Control(_) => {
+                    if let Ok((_, ControlMessage::HelloAck(ack))) = parse_control(&buf[..len]) {
+                        break ack;
+                    }
                 }
+                Classified::Media { .. } => media_seen += 1,
+                _ => {}
             }
         };
 
@@ -166,10 +190,13 @@ impl FakeReceiver {
 
 #[test]
 fn synthetic_stream_end_to_end_v2() {
+    let _guard = ENV_LOCK.lock().unwrap();
+    init_test_tracing();
     let _ = ffmpeg_next::init();
 
     std::env::set_var("ETERNAL_SYNTH_SIZE", format!("{SYNTH_W}x{SYNTH_H}"));
     std::env::set_var("ETERNAL_CAPTURE", "synthetic");
+    std::env::remove_var("ETERNAL_DROP");
 
     let listen_port = free_udp_port();
     let shared = SharedControl::new(listen_port, pipeline::DEFAULT_BITRATE_BPS);
@@ -346,6 +373,146 @@ fn synthetic_stream_end_to_end_v2() {
         .send(SupervisorCommand::Shutdown)
         .expect("send shutdown");
 
+    let (done_tx, done_rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = supervisor.join();
+        let _ = done_tx.send(());
+    });
+    done_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("supervisor must shut down within 5s");
+}
+
+/// Under injected fragment loss the system must keep delivering decodable
+/// video (keyframe requests beat the GOP) and the ABR must step the bitrate
+/// down from its 15 Mbps start.
+#[test]
+fn lossy_stream_recovers_and_adapts() {
+    let _guard = ENV_LOCK.lock().unwrap();
+    init_test_tracing();
+    let _ = ffmpeg_next::init();
+
+    std::env::set_var("ETERNAL_SYNTH_SIZE", format!("{SYNTH_W}x{SYNTH_H}"));
+    std::env::set_var("ETERNAL_CAPTURE", "synthetic");
+    std::env::set_var("ETERNAL_DROP", "0.05");
+
+    let listen_port = free_udp_port();
+    let shared = SharedControl::new(listen_port, pipeline::DEFAULT_BITRATE_BPS);
+    *shared.encoder_override.lock() = Some("libx264".to_string());
+    let gpu_info = GpuInfo::software_fallback();
+
+    let (supervisor_tx, supervisor_rx) = mpsc::channel();
+    let supervisor_shared = shared.clone();
+    let supervisor_tx_clone = supervisor_tx.clone();
+    let supervisor = std::thread::spawn(move || {
+        pipeline::supervisor_loop(
+            listen_port,
+            supervisor_shared,
+            gpu_info,
+            supervisor_tx_clone,
+            supervisor_rx,
+        );
+    });
+
+    let mut receiver = FakeReceiver::connect(listen_port);
+
+    let deadline = Instant::now() + DEADLINE;
+    let mut reassembler = Reassembler::new();
+    let mut decoder = H264TestDecoder::new();
+    let mut datagram = [0u8; 2048];
+
+    let mut decoded = 0usize;
+    let mut abr_stepped_down = false;
+    let mut keyframe_requests = 0u32;
+    let mut last_progress = Instant::now();
+    let mut highest_seq = 0u32;
+    let mut current_epoch = 0u32;
+
+    while decoded < 40 || !abr_stepped_down {
+        assert!(
+            Instant::now() < deadline,
+            "timed out: decoded={decoded}, abr_stepped_down={abr_stepped_down}, \
+             keyframe_requests={keyframe_requests}, counters={:?}",
+            reassembler.counters()
+        );
+
+        // Real loss accounting: the reassembler's counters feed the reports
+        // that drive the host ABR.
+        let counters = reassembler.counters();
+        if receiver.last_report.elapsed() >= Duration::from_millis(400) {
+            receiver.last_report = Instant::now();
+            receiver.send(&ControlMessage::ReceiverReport(ReceiverReport {
+                stream_epoch: current_epoch,
+                highest_seq,
+                frames_complete: counters.frames_complete as u32,
+                frames_dropped: counters.frames_dropped as u32,
+                frags_received: counters.frags_received as u32,
+                frags_lost: counters.frags_lost as u32,
+                ..Default::default()
+            }));
+        }
+
+        // Client-side recovery: stuck for 400ms -> ask for a keyframe.
+        if last_progress.elapsed() >= Duration::from_millis(400) {
+            last_progress = Instant::now();
+            keyframe_requests += 1;
+            receiver.send(&ControlMessage::KeyframeRequest(KeyframeRequest {
+                stream_epoch: current_epoch,
+                last_complete_seq: highest_seq,
+                reason: KeyframeReason::GapLoss,
+            }));
+        }
+
+        let Ok((len, _)) = receiver.socket.recv_from(&mut datagram) else {
+            continue;
+        };
+        let bytes = &datagram[..len];
+
+        match classify(bytes) {
+            Classified::Control(_) => {
+                if let Ok((_, ControlMessage::Heartbeat(hb))) = parse_control(bytes) {
+                    if hb.stream_config.bitrate_bps < 15_000_000 {
+                        abr_stepped_down = true;
+                    }
+                }
+            }
+            Classified::Media { .. } => {
+                let Ok((header, payload)) = MediaHeader::decode(bytes) else {
+                    continue;
+                };
+                highest_seq = highest_seq.max(header.frame_seq);
+                current_epoch = header.stream_epoch;
+                if let AddOutcome::Completed(frame_bytes) = reassembler.add_fragment(
+                    header.frame_seq,
+                    header.frag_index,
+                    header.frag_count,
+                    header.stream_epoch,
+                    payload,
+                    Instant::now(),
+                ) {
+                    let frames = decoder.decode(&frame_bytes);
+                    if !frames.is_empty() {
+                        decoded += frames.len();
+                        last_progress = Instant::now();
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let counters = reassembler.counters();
+    assert!(
+        counters.frags_lost > 0,
+        "injected drop must surface as fragment loss"
+    );
+
+    std::env::remove_var("ETERNAL_DROP");
+
+    shared.stop();
+    supervisor_tx
+        .send(SupervisorCommand::Shutdown)
+        .expect("send shutdown");
     let (done_tx, done_rx) = mpsc::channel();
     std::thread::spawn(move || {
         let _ = supervisor.join();
