@@ -280,13 +280,18 @@ pub fn run_capture_loop(
 
         let frame_start = Instant::now();
         let frame_budget = frame_budget_for(shared.target_fps.load(Ordering::SeqCst));
+        // Half the frame budget, clamped: at 60 fps this is the classic 8 ms;
+        // high-rate modes (ETERNAL_FPS=120) must not block a whole 16 ms in
+        // AcquireNextFrame, and below 4 ms the wakeups outrun the compositor.
+        let acquire_timeout_ms =
+            ((frame_budget.as_millis() as u32) / 2).clamp(4, ACQUIRE_TIMEOUT_MS);
 
         let mut frame_info = DXGI_OUTDUPL_FRAME_INFO::default();
         let mut desktop_resource: Option<IDXGIResource> = None;
 
         let acquire_start = Instant::now();
         let hr = unsafe {
-            duplication.AcquireNextFrame(ACQUIRE_TIMEOUT_MS, &mut frame_info, &mut desktop_resource)
+            duplication.AcquireNextFrame(acquire_timeout_ms, &mut frame_info, &mut desktop_resource)
         };
         let acquire_us = acquire_start.elapsed().as_micros();
 
@@ -463,6 +468,16 @@ pub fn run_capture_loop(
                         height: tex_height,
                     });
                     last_send = now;
+                } else if !client_connected(&shared)
+                    && last_send.elapsed() >= Duration::from_secs(2)
+                {
+                    // Idle throttle: nobody is watching and the desktop is
+                    // static — stop spinning at capture rate. 4 Hz polling
+                    // still notices a client promptly (registration also
+                    // restarts the pipeline for virtual-display targets).
+                    // The 250 ms naps stay far under the supervisor's 3 s
+                    // loop-heartbeat wedge threshold.
+                    std::thread::sleep(Duration::from_millis(250));
                 }
                 continue;
             }

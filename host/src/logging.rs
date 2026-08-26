@@ -43,6 +43,12 @@ pub struct MemoryLogWriter {
     current_line: Vec<u8>,
 }
 
+impl Default for MemoryLogWriter {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl MemoryLogWriter {
     pub fn new() -> Self {
         Self {

@@ -38,6 +38,11 @@ final class RelayTouchUIView: UIView {
         super.init(frame: frame)
         isMultipleTouchEnabled = true
         backgroundColor = .clear
+        // VoiceOver: this surface IS the remote pointer — pass touches
+        // straight through instead of narrating them.
+        isAccessibilityElement = true
+        accessibilityLabel = "Remote control surface. Touches control the PC."
+        accessibilityTraits = .allowsDirectInteraction
     }
 
     required init?(coder: NSCoder) {

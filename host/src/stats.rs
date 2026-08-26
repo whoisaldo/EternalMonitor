@@ -59,11 +59,12 @@ pub struct PipelineStats {
 
     // mDNS
     pub mdns_active: bool,
+}
 
-    /// GPU temperature in °C. None when no probe is available on this platform/vendor.
-    /// NVML / DXGI 1.6 hooks for this are not implemented yet; the field exists so the
-    /// Performance tab can render a stable row instead of being shaped differently per build.
-    pub gpu_temp_c: Option<f64>,
+impl Default for PipelineStats {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl PipelineStats {
@@ -105,7 +106,6 @@ impl PipelineStats {
             start_time: None,
 
             mdns_active: false,
-            gpu_temp_c: None,
         }
     }
 
@@ -118,7 +118,6 @@ impl PipelineStats {
         let codec_name = self.codec_name.clone();
         let using_software_fallback = self.using_software_fallback;
         let mdns_active = self.mdns_active;
-        let gpu_temp_c = self.gpu_temp_c;
 
         *self = Self::new();
         self.gpu_name = gpu_name;
@@ -129,7 +128,6 @@ impl PipelineStats {
         self.codec_name = codec_name;
         self.using_software_fallback = using_software_fallback;
         self.mdns_active = mdns_active;
-        self.gpu_temp_c = gpu_temp_c;
     }
 
     /// Clear transport counters and the bandwidth window without touching uptime,

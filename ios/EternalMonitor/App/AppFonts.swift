@@ -21,7 +21,8 @@ enum AppFontStyle {
 
     func font(size: CGFloat) -> Font {
         if FontRegistry.shared.availablePostScriptNames.contains(postScriptName) {
-            Font.custom(postScriptName, size: size)
+            // relativeTo makes the custom faces track Dynamic Type.
+            Font.custom(postScriptName, size: size, relativeTo: .body)
         } else {
             switch self {
             case .monoRegular:
@@ -82,8 +83,11 @@ final class FontRegistry: @unchecked Sendable {
     }
 
     private func bundledFontURLs() -> [URL] {
+        // Static faces only: the variable font's PostScript name never matched
+        // the "Syne-Bold" the display style asks for, so titles silently fell
+        // back to the system font.
         let rootNames = [
-            "Syne-Variable.ttf",
+            "Syne-Bold.ttf",
             "JetBrainsMono-Regular.ttf",
             "JetBrainsMono-Medium.ttf",
         ]

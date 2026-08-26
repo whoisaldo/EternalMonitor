@@ -79,7 +79,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     info!("══════════════════════════════════");
-    info!("  EternalMonitor v0.1.2");
+    info!("  EternalMonitor v{}", env!("CARGO_PKG_VERSION"));
     info!("  GPU:     {} ({})", gpu_info.name, gpu_info.vendor);
     info!("  VRAM:    {} MB", gpu_info.dedicated_vram_mb);
     info!("  Encoder: {}", gpu_info.codec_display_name);
@@ -87,10 +87,36 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     info!("  Listen:  0.0.0.0:{}", listen_port);
     info!("══════════════════════════════════");
 
-    let shared = SharedControl::new(listen_port, DEFAULT_BITRATE_BPS);
+    // Load persisted settings BEFORE the first pipeline spawns, so generation
+    // 0 already streams with the user's bitrate/fps/encoder/display/codec.
+    // (Previously only the GUI applied them, seconds later — and headless
+    // runs never did.) The GUI re-applies the same values at startup, which
+    // is idempotent.
+    let persisted = eternal_host::settings::SettingsFile::load();
+    let initial_bitrate = if persisted.bitrate_mbps > 0.0 {
+        (persisted.bitrate_mbps * 1_000_000.0).round() as u32
+    } else {
+        DEFAULT_BITRATE_BPS
+    };
+
+    let shared = SharedControl::new(listen_port, initial_bitrate);
+    if persisted.target_fps == 30 || persisted.target_fps == 60 {
+        shared
+            .target_fps
+            .store(persisted.target_fps, std::sync::atomic::Ordering::SeqCst);
+    }
+    if let Some(name) = persisted.encoder_override.clone() {
+        *shared.encoder_override.lock() = Some(name);
+    }
+    *shared.capture_target.lock() =
+        eternal_host::control::CaptureTarget::from_setting(persisted.capture_display.as_deref());
+    shared
+        .hevc_enabled
+        .store(persisted.hevc_enabled, std::sync::atomic::Ordering::SeqCst);
+
     {
         let mut stats = stats::PIPELINE_STATS.lock();
-        stats.set_bitrate(DEFAULT_BITRATE_BPS);
+        stats.set_bitrate(initial_bitrate);
         stats.set_listen_addr(gui::detect_local_ip(listen_port));
         stats.set_target_addr(shared.target_addr.lock().to_string());
         stats.set_gpu_name(gpu_info.name.clone());
@@ -108,12 +134,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
     // Optional HEVC preference override for automation (the E2E harness runs headless without
-    // the GUI toggle). Takes effect for the next client whose HELLO2 advertises HEVC decode.
-    if std::env::var("ETERNAL_HEVC").is_ok_and(|v| v.trim() == "1") {
-        info!("HEVC preference forced from ETERNAL_HEVC");
+    // the GUI toggle). When present it is authoritative in BOTH directions, so
+    // ETERNAL_HEVC=0 pins H.264 regardless of the persisted setting.
+    if let Ok(value) = std::env::var("ETERNAL_HEVC") {
+        let enabled = value.trim() == "1";
+        info!(enabled, "HEVC preference forced from ETERNAL_HEVC");
         shared
             .hevc_enabled
-            .store(true, std::sync::atomic::Ordering::SeqCst);
+            .store(enabled, std::sync::atomic::Ordering::SeqCst);
     }
     // Optional target FPS override (e.g. ETERNAL_FPS=30) to lighten encode load — useful when
     // testing a hardware encoder on a weak/integrated GPU.
@@ -134,22 +162,40 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         supervisor_tx: supervisor_tx.clone(),
     };
 
+    /// Set by the termination-signal handler; the headless loop polls it.
+    /// (On Windows no handler is registered — headless there still exits only
+    /// on a hard kill, same as before.)
+    static SHUTDOWN_REQUESTED: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(false);
+    #[cfg(unix)]
+    extern "C" fn on_terminate_signal(_signal: libc::c_int) {
+        // Async-signal-safe: only a flag store — the polling loop does the work.
+        SHUTDOWN_REQUESTED.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
     let supervisor_thread = std::thread::spawn(move || {
         eternal_host::supervisor::run(listen_port, shared, gpu_info, supervisor_tx, supervisor_rx);
     });
 
-    let _mdns = discovery::advertise_service(listen_port);
+    let mdns = discovery::advertise_service(listen_port);
 
-    // Headless mode for automation (the iOS E2E harness runs the host without a
-    // window): stream until the process is terminated externally.
+    // Headless mode for automation (the iOS E2E harness runs the host without
+    // a window): stream until SIGTERM/SIGINT, then fall through to the same
+    // clean teardown as a GUI quit — mDNS goodbye, VDD disable, bounded
+    // supervisor join. (Previously a kill skipped all of that.)
     if std::env::var("ETERNAL_HEADLESS").is_ok_and(|v| v.trim() == "1") {
         info!("ETERNAL_HEADLESS=1 — running without GUI until terminated");
-        loop {
-            std::thread::sleep(std::time::Duration::from_secs(3600));
+        #[cfg(unix)]
+        unsafe {
+            let handler = on_terminate_signal as extern "C" fn(libc::c_int);
+            libc::signal(libc::SIGTERM, handler as libc::sighandler_t);
+            libc::signal(libc::SIGINT, handler as libc::sighandler_t);
         }
-    }
-
-    if let Err(e) = gui::run_gui(gui_control.clone()) {
+        while !SHUTDOWN_REQUESTED.load(std::sync::atomic::Ordering::SeqCst) {
+            std::thread::sleep(std::time::Duration::from_millis(250));
+        }
+        info!("Termination signal received — shutting down cleanly");
+    } else if let Err(e) = gui::run_gui(gui_control.clone()) {
         error!(error = %e, "GUI exited with error");
     }
 
@@ -160,18 +206,30 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // EternalMonitor is actively using it.
     vdd::disable();
 
-    // Give the supervisor a bounded amount of time to shut down cleanly.
-    // If it doesn't finish (blocked on DXGI acquire, mDNS threads, etc.),
+    // Give the supervisor a bounded amount of time to shut down cleanly,
+    // exiting the moment it finishes instead of always burning the full
+    // window. If it doesn't finish (blocked on DXGI acquire, etc.),
     // force-exit so the process never lingers as an invisible zombie.
-    let shutdown_deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+    let (supervisor_done_tx, supervisor_done_rx) = mpsc::channel();
     std::thread::spawn(move || {
         if let Err(error) = supervisor_thread.join() {
             error!(error = ?error, "Supervisor thread panicked");
         }
+        let _ = supervisor_done_tx.send(());
     });
 
-    while std::time::Instant::now() < shutdown_deadline {
-        std::thread::sleep(std::time::Duration::from_millis(50));
+    // Say goodbye on mDNS while the supervisor winds down, so iPads drop the
+    // host from their scan list promptly (process::exit skips destructors —
+    // without this no goodbye is ever sent).
+    if let Some(mdns) = mdns {
+        discovery::say_goodbye(mdns);
+    }
+
+    if supervisor_done_rx
+        .recv_timeout(std::time::Duration::from_secs(3))
+        .is_err()
+    {
+        tracing::warn!("Supervisor did not shut down within 3s — forcing exit");
     }
 
     info!("EternalMonitor shutting down");

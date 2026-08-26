@@ -81,7 +81,6 @@ struct StatsSnapshot {
     pipeline_running: bool,
     uptime_secs: f64,
     mdns_active: bool,
-    gpu_temp_c: Option<f64>,
 }
 
 impl StatsSnapshot {
@@ -112,15 +111,15 @@ impl StatsSnapshot {
             pipeline_running: s.pipeline_running,
             uptime_secs: s.uptime_secs(),
             mdns_active: s.mdns_active,
-            gpu_temp_c: s.gpu_temp_c,
         }
     }
 }
 
 const CAPTURE_AUTO_LABEL: &str = "Auto (primary)";
 const CAPTURE_VIRTUAL_LABEL: &str = "Extended display (iPad)";
-/// Sentinel stored in settings/`settings_capture_display` for the managed virtual display.
-const CAPTURE_VIRTUAL_SENTINEL: &str = "virtual";
+// The settings sentinel for the managed virtual display lives in control.rs
+// (shared with the startup preload).
+use crate::control::CAPTURE_VIRTUAL_SENTINEL;
 
 /// Combo label for an enumerated output, e.g. `DISPLAY3 · 2732×2048 · +2560,0 · primary`.
 fn format_output_label(o: &OutputInfo) -> String {
@@ -151,6 +150,9 @@ pub struct AnalyzerApp {
     settings_start_on_boot: bool,
     settings_hevc_enabled: bool,
     settings_vdd_match: bool,
+    /// Set when a high-frequency control (the bitrate slider) changed; the
+    /// settings file is written once the value has been stable for 800 ms.
+    settings_dirty_at: Option<std::time::Instant>,
     settings_encoder_choice: String, // display label, e.g. "Auto" or "NVENC"
     /// DXGI `DeviceName` of the chosen capture display; empty string means auto (primary).
     settings_capture_display: String,
@@ -274,6 +276,7 @@ impl AnalyzerApp {
             settings_start_on_boot: start_on_boot,
             settings_hevc_enabled: persisted.hevc_enabled,
             settings_vdd_match: persisted.vdd_match_resolution,
+            settings_dirty_at: None,
             settings_encoder_choice: encoder_choice,
             settings_capture_display,
             available_outputs,
@@ -334,27 +337,40 @@ impl AnalyzerApp {
 }
 
 impl eframe::App for AnalyzerApp {
+    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        if self.settings_dirty_at.take().is_some() {
+            self.persist_settings();
+        }
+    }
+
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        if let Some(dirty_at) = self.settings_dirty_at {
+            if dirty_at.elapsed() >= std::time::Duration::from_millis(800) {
+                self.settings_dirty_at = None;
+                self.persist_settings();
+            }
+        }
+        // (A debounced write still pending at window close is flushed by on_exit.)
         ctx.request_repaint_after(std::time::Duration::from_millis(50));
 
         let mut visuals = egui::Visuals::dark();
         visuals.panel_fill = BG;
         visuals.window_fill = SURFACE;
         visuals.widgets.noninteractive.bg_fill = SURFACE;
-        visuals.widgets.noninteractive.fg_stroke = egui::Stroke::new(1.0, TEXT);
+        visuals.widgets.noninteractive.fg_stroke = egui::Stroke::new(1.0_f32, TEXT);
         visuals.widgets.inactive.bg_fill = SURFACE2;
         visuals.widgets.inactive.weak_bg_fill = CLEAR;
-        visuals.widgets.inactive.bg_stroke = egui::Stroke::new(1.0, MUTED);
-        visuals.widgets.inactive.fg_stroke = egui::Stroke::new(1.0, MUTED);
+        visuals.widgets.inactive.bg_stroke = egui::Stroke::new(1.0_f32, MUTED);
+        visuals.widgets.inactive.fg_stroke = egui::Stroke::new(1.0_f32, MUTED);
         visuals.widgets.hovered.bg_fill = SURFACE2;
         visuals.widgets.hovered.weak_bg_fill = CLEAR;
-        visuals.widgets.hovered.bg_stroke = egui::Stroke::new(1.0, MUTED2);
-        visuals.widgets.hovered.fg_stroke = egui::Stroke::new(1.0, TEXT);
+        visuals.widgets.hovered.bg_stroke = egui::Stroke::new(1.0_f32, MUTED2);
+        visuals.widgets.hovered.fg_stroke = egui::Stroke::new(1.0_f32, TEXT);
         visuals.widgets.active.bg_fill = SURFACE2;
         visuals.widgets.active.weak_bg_fill = CLEAR;
-        visuals.widgets.active.bg_stroke = egui::Stroke::new(1.0, TEXT);
+        visuals.widgets.active.bg_stroke = egui::Stroke::new(1.0_f32, TEXT);
         visuals.selection.bg_fill = SELECTION_BG;
-        visuals.selection.stroke = egui::Stroke::new(1.0, ACCENT);
+        visuals.selection.stroke = egui::Stroke::new(1.0_f32, ACCENT);
         // Instrument-grade: tight corners, hairline focus ring in amber.
         let r = egui::CornerRadius::same(4);
         visuals.widgets.noninteractive.corner_radius = r;
@@ -402,7 +418,7 @@ impl AnalyzerApp {
             .frame(
                 egui::Frame::new()
                     .fill(SURFACE)
-                    .stroke(egui::Stroke::new(1.0, BORDER))
+                    .stroke(egui::Stroke::new(1.0_f32, BORDER))
                     .inner_margin(egui::Margin::same(12)),
             )
             .show(ctx, |ui| {
@@ -483,6 +499,17 @@ impl AnalyzerApp {
                 );
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if amber_button(ui, "QR code").clicked() {
+                        // Re-resolve the LAN address on open — DHCP renews and
+                        // interface changes would otherwise leave the QR
+                        // encoding a stale IP from process start.
+                        if let Some(port) = snap
+                            .listen_addr
+                            .rsplit(':')
+                            .next()
+                            .and_then(|p| p.parse::<u16>().ok())
+                        {
+                            PIPELINE_STATS.lock().set_listen_addr(detect_local_ip(port));
+                        }
                         self.show_qr_modal = true;
                     }
                     if ghost_button(ui, "Copy IP", true).clicked() && !snap.listen_addr.is_empty() {
@@ -670,11 +697,6 @@ impl AnalyzerApp {
                     "Inactive"
                 },
             );
-            let gpu_temp = snap
-                .gpu_temp_c
-                .map(|t| format!("{:.1} °C", t))
-                .unwrap_or_else(|| "unavailable".to_string());
-            stat_row(ui, "GPU temp", &gpu_temp);
         });
     }
 
@@ -686,7 +708,7 @@ impl AnalyzerApp {
             // --- Bitrate slider ---------------------------------------------------
             ui.horizontal(|ui| {
                 ui.label(egui::RichText::new(format!(
-                    "Bitrate: {:.0} Mbps",
+                    "Max bitrate: {:.0} Mbps",
                     self.settings_bitrate_mbps
                 ))
                 .color(TEXT)
@@ -701,7 +723,9 @@ impl AnalyzerApp {
                     .bitrate_bps
                     .store(bitrate_bps, std::sync::atomic::Ordering::SeqCst);
                 PIPELINE_STATS.lock().set_bitrate(bitrate_bps);
-                self.persist_settings();
+                // Live value applies immediately; the file write is debounced
+                // (a slider drag emits dozens of change events per second).
+                self.settings_dirty_at = Some(std::time::Instant::now());
             }
 
             ui.add_space(12.0);
@@ -1092,7 +1116,7 @@ impl AnalyzerApp {
 fn software_fallback_banner(ui: &mut egui::Ui) {
     egui::Frame::new()
         .fill(WARN_FILL)
-        .stroke(egui::Stroke::new(1.0, WARN_BORDER))
+        .stroke(egui::Stroke::new(1.0_f32, WARN_BORDER))
         .corner_radius(4.0)
         .inner_margin(egui::Margin::same(12))
         .show(ui, |ui| {
@@ -1120,7 +1144,7 @@ fn software_fallback_banner(ui: &mut egui::Ui) {
 fn vdd_failed_banner(ui: &mut egui::Ui) {
     egui::Frame::new()
         .fill(WARN_FILL)
-        .stroke(egui::Stroke::new(1.0, WARN_BORDER))
+        .stroke(egui::Stroke::new(1.0_f32, WARN_BORDER))
         .corner_radius(4.0)
         .inner_margin(egui::Margin::same(12))
         .show(ui, |ui| {
@@ -1146,7 +1170,7 @@ fn vdd_failed_banner(ui: &mut egui::Ui) {
 fn card_frame() -> egui::Frame {
     egui::Frame::new()
         .fill(SURFACE)
-        .stroke(egui::Stroke::new(1.0, BORDER))
+        .stroke(egui::Stroke::new(1.0_f32, BORDER))
         .corner_radius(6.0)
         .inner_margin(egui::Margin::same(12))
 }
@@ -1154,7 +1178,7 @@ fn card_frame() -> egui::Frame {
 /// Draw viewfinder / registration corner ticks just inside `rect` — the recurring
 /// "this is a monitor" motif. `len` is the arm length of each L-shaped tick.
 fn viewfinder_marks(painter: &egui::Painter, rect: egui::Rect, color: egui::Color32, len: f32) {
-    let stroke = egui::Stroke::new(1.0, color);
+    let stroke = egui::Stroke::new(1.0_f32, color);
     let inset = 3.0;
     let l = rect.left() + inset;
     let r = rect.right() - inset;
@@ -1189,7 +1213,7 @@ fn module_with_ticks(
 fn hero_module(ui: &mut egui::Ui, content: impl FnOnce(&mut egui::Ui)) {
     let resp = egui::Frame::new()
         .fill(ACCENT_FILL)
-        .stroke(egui::Stroke::new(1.0, ACCENT_BORDER))
+        .stroke(egui::Stroke::new(1.0_f32, ACCENT_BORDER))
         .corner_radius(6.0)
         .inner_margin(egui::Margin::same(14))
         .show(ui, content)
@@ -1224,7 +1248,7 @@ fn ghost_button(ui: &mut egui::Ui, text: &str, enabled: bool) -> egui::Response 
                 .monospace(),
         )
         .fill(SURFACE2)
-        .stroke(egui::Stroke::new(1.0, BORDER))
+        .stroke(egui::Stroke::new(1.0_f32, BORDER))
         .corner_radius(4.0)
         .min_size(egui::vec2(0.0, 30.0)),
     )
@@ -1235,11 +1259,11 @@ fn danger_button(ui: &mut egui::Ui, text: &str) -> egui::Response {
     ui.scope(|ui| {
         let v = ui.visuals_mut();
         v.widgets.inactive.weak_bg_fill = CLEAR;
-        v.widgets.inactive.bg_stroke = egui::Stroke::new(1.0, DANGER_BORDER);
-        v.widgets.inactive.fg_stroke = egui::Stroke::new(1.0, RED);
+        v.widgets.inactive.bg_stroke = egui::Stroke::new(1.0_f32, DANGER_BORDER);
+        v.widgets.inactive.fg_stroke = egui::Stroke::new(1.0_f32, RED);
         v.widgets.hovered.weak_bg_fill = DANGER_HOVER_FILL;
-        v.widgets.hovered.bg_stroke = egui::Stroke::new(1.0, RED);
-        v.widgets.hovered.fg_stroke = egui::Stroke::new(1.0, RED);
+        v.widgets.hovered.bg_stroke = egui::Stroke::new(1.0_f32, RED);
+        v.widgets.hovered.fg_stroke = egui::Stroke::new(1.0_f32, RED);
         ui.add(
             egui::Button::new(
                 egui::RichText::new(text.to_uppercase())
@@ -1300,7 +1324,7 @@ fn status_pill(ui: &mut egui::Ui, ctx: &egui::Context, running: bool, target_add
 
     egui::Frame::new()
         .fill(fill)
-        .stroke(egui::Stroke::new(1.0, border))
+        .stroke(egui::Stroke::new(1.0_f32, border))
         .corner_radius(4.0)
         .inner_margin(egui::Margin::same(10))
         .show(ui, |ui| {
@@ -1454,13 +1478,13 @@ fn draw_sparkline(ui: &mut egui::Ui, data: &[f64], height: f32, color: egui::Col
     painter.rect_stroke(
         rect,
         4.0,
-        egui::Stroke::new(1.0, BORDER),
+        egui::Stroke::new(1.0_f32, BORDER),
         egui::StrokeKind::Inside,
     );
 
     // Grid graticule
     let grid = egui::Stroke::new(
-        1.0,
+        1.0_f32,
         egui::Color32::from_rgba_unmultiplied(255, 255, 255, 10),
     );
     let cols = 8;
@@ -1527,11 +1551,11 @@ fn draw_sparkline(ui: &mut egui::Ui, data: &[f64], height: f32, color: egui::Col
     let glow = egui::Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), 60);
     painter.add(egui::Shape::line(
         points.clone(),
-        egui::Stroke::new(4.0, glow),
+        egui::Stroke::new(4.0_f32, glow),
     ));
     painter.add(egui::Shape::line(
         points.clone(),
-        egui::Stroke::new(1.5, color),
+        egui::Stroke::new(1.5_f32, color),
     ));
 
     // Bright dot at the latest sample
