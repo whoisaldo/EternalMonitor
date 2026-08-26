@@ -329,6 +329,9 @@ final class ConnectionManager: ObservableObject {
                     screenPtW: UInt16(clamping: Int(UIScreen.main.bounds.width)),
                     screenPtH: UInt16(clamping: Int(UIScreen.main.bounds.height)),
                     refreshHz: UInt8(clamping: UIScreen.main.maximumFramesPerSecond),
+                    // VideoToolbox decodes HEVC on every supported iPad
+                    // (hardware on device, software in the simulator).
+                    decoderCaps: Hello2.capDecodeH264 | Hello2.capDecodeHEVC,
                     featureCaps: wantsInput ? Hello2.featureWantsInput : 0
                 )
             )

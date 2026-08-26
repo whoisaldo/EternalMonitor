@@ -1,5 +1,5 @@
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, Ordering};
 use std::sync::{mpsc, Arc};
 
 use parking_lot::Mutex;
@@ -42,6 +42,13 @@ pub struct SharedControl {
     /// normalized touch coordinates onto this rect. `None` until the first
     /// capture stage comes up.
     pub capture_geometry: Arc<Mutex<Option<crate::input::CaptureGeometry>>>,
+    /// The user's "prefer HEVC" setting. The encoder switches to an H.265
+    /// session only when this is on AND the connected client advertised HEVC
+    /// decode in its HELLO2.
+    pub hevc_enabled: Arc<AtomicBool>,
+    /// What the encoder is actually emitting right now (wire `CODEC_*` value),
+    /// written on every encoder open and reported in HELLO_ACK/heartbeats.
+    pub active_codec: Arc<AtomicU8>,
     /// The client session. Lives here (not in the transport task) so a
     /// pipeline restart — crash recovery, virtual-display toggle, settings
     /// change — does NOT force the iPad through a fresh handshake: the new
@@ -94,6 +101,8 @@ impl SharedControl {
             hb_capture_frame_ms: Arc::new(AtomicU64::new(0)),
             hb_encode_frame_ms: Arc::new(AtomicU64::new(0)),
             capture_geometry: Arc::new(Mutex::new(None)),
+            hevc_enabled: Arc::new(AtomicBool::new(false)),
+            active_codec: Arc::new(AtomicU8::new(eternal_wire::v2::control::CODEC_H264)),
             session: Arc::new(Mutex::new(crate::transport::session::Session::new({
                 use std::hash::{BuildHasher, Hasher};
                 std::collections::hash_map::RandomState::new()

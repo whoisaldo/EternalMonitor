@@ -62,9 +62,13 @@ struct H264TestDecoder {
 
 impl H264TestDecoder {
     fn new() -> Self {
-        let codec = ffmpeg_next::decoder::find(ffmpeg_next::codec::Id::H264).expect("h264 decoder");
+        Self::with_codec(ffmpeg_next::codec::Id::H264)
+    }
+
+    fn with_codec(id: ffmpeg_next::codec::Id) -> Self {
+        let codec = ffmpeg_next::decoder::find(id).expect("test decoder");
         let context = ffmpeg_next::codec::Context::new_with_codec(codec);
-        let decoder = context.decoder().video().expect("open h264 decoder");
+        let decoder = context.decoder().video().expect("open test decoder");
         Self {
             decoder,
             frame: ffmpeg_next::frame::Video::empty(),
@@ -99,10 +103,14 @@ struct FakeReceiver {
 
 impl FakeReceiver {
     fn connect(host_port: u16) -> Self {
-        Self::connect_with_caps(host_port, 0)
+        Self::connect_full(host_port, CAP_DECODE_H264, 0)
     }
 
     fn connect_with_caps(host_port: u16, feature_caps: u16) -> Self {
+        Self::connect_full(host_port, CAP_DECODE_H264, feature_caps)
+    }
+
+    fn connect_full(host_port: u16, decoder_caps: u16, feature_caps: u16) -> Self {
         let socket = UdpSocket::bind("127.0.0.1:0").expect("receiver socket");
         socket
             .set_read_timeout(Some(Duration::from_millis(150)))
@@ -115,7 +123,7 @@ impl FakeReceiver {
             proto_max: 2,
             client_nonce: 0xE2E0_0001,
             listen_port,
-            decoder_caps: CAP_DECODE_H264,
+            decoder_caps,
             feature_caps,
             screen_px_w: 2420,
             screen_px_h: 1668,
@@ -512,6 +520,153 @@ fn lossy_stream_recovers_and_adapts() {
     );
 
     std::env::remove_var("ETERNAL_DROP");
+
+    shared.stop();
+    supervisor_tx
+        .send(SupervisorCommand::Shutdown)
+        .expect("send shutdown");
+    let (done_tx, done_rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = supervisor.join();
+        let _ = done_tx.send(());
+    });
+    done_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("supervisor must shut down within 5s");
+}
+
+/// HEVC negotiation end to end: with the host preference on and a client
+/// advertising HEVC decode, the encoder switches to H.265 mid-session —
+/// keyframes carry VPS/SPS/PPS, pictures decode with advancing counters, and
+/// heartbeats advertise codec=HEVC. The switch is a live reopen, so a stray
+/// H.264 access unit from before the handoff is tolerated (the iPad's decoder
+/// sniffs the codec per keyframe for exactly this reason).
+#[test]
+fn hevc_stream_negotiates_and_decodes() {
+    use eternal_wire::v2::control::{CAP_DECODE_HEVC, CODEC_HEVC};
+
+    let _guard = ENV_LOCK.lock().unwrap();
+    init_test_tracing();
+    let _ = ffmpeg_next::init();
+
+    if ffmpeg_next::encoder::find_by_name("libx265").is_none() {
+        eprintln!("libx265 not present in this FFmpeg build — skipping HEVC E2E");
+        return;
+    }
+
+    std::env::set_var("ETERNAL_SYNTH_SIZE", format!("{SYNTH_W}x{SYNTH_H}"));
+    std::env::set_var("ETERNAL_CAPTURE", "synthetic");
+    std::env::remove_var("ETERNAL_DROP");
+
+    let listen_port = free_udp_port();
+    let shared = SharedControl::new(listen_port, pipeline::DEFAULT_BITRATE_BPS);
+    *shared.encoder_override.lock() = Some("libx264".to_string());
+    shared
+        .hevc_enabled
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let gpu_info = GpuInfo::software_fallback();
+
+    let (supervisor_tx, supervisor_rx) = mpsc::channel();
+    let supervisor_shared = shared.clone();
+    let supervisor_tx_clone = supervisor_tx.clone();
+    let supervisor = std::thread::spawn(move || {
+        eternal_host::supervisor::run(
+            listen_port,
+            supervisor_shared,
+            gpu_info,
+            supervisor_tx_clone,
+            supervisor_rx,
+        );
+    });
+
+    let mut receiver =
+        FakeReceiver::connect_full(listen_port, CAP_DECODE_H264 | CAP_DECODE_HEVC, 0);
+
+    let deadline = Instant::now() + DEADLINE;
+    let mut reassembler = Reassembler::new();
+    let mut decoder = H264TestDecoder::with_codec(ffmpeg_next::codec::Id::HEVC);
+    let mut datagram = [0u8; 2048];
+
+    let mut decoded_hevc: Vec<u64> = Vec::new();
+    let mut hevc_parameter_sets_seen = false;
+    let mut hevc_codec_advertised = false;
+    let mut highest_seq = 0u32;
+
+    while decoded_hevc.len() < WANT_DECODED_FRAMES
+        || !hevc_parameter_sets_seen
+        || !hevc_codec_advertised
+    {
+        assert!(
+            Instant::now() < deadline,
+            "timed out: decoded={}, vps_seen={hevc_parameter_sets_seen}, \
+             advertised={hevc_codec_advertised} (reassembly: {:?})",
+            decoded_hevc.len(),
+            reassembler.counters()
+        );
+
+        receiver.maybe_report(highest_seq, decoded_hevc.len() as u32);
+
+        let Ok((len, _)) = receiver.socket.recv_from(&mut datagram) else {
+            continue;
+        };
+        let bytes = &datagram[..len];
+
+        match classify(bytes) {
+            Classified::Control(_) => {
+                if let Ok((_, ControlMessage::Heartbeat(hb))) = parse_control(bytes) {
+                    if hb.stream_config.codec == CODEC_HEVC {
+                        hevc_codec_advertised = true;
+                    }
+                }
+            }
+            Classified::Media { .. } => {
+                let (header, payload) = MediaHeader::decode(bytes).expect("valid media datagram");
+                highest_seq = highest_seq.max(header.frame_seq);
+                let AddOutcome::Completed(frame_bytes) = reassembler.add_fragment(
+                    header.frame_seq,
+                    header.frag_index,
+                    header.frag_count,
+                    header.stream_epoch,
+                    payload,
+                    Instant::now(),
+                ) else {
+                    continue;
+                };
+
+                // Ignore anything before the HEVC handoff (a leftover H.264
+                // access unit from the pre-switch encoder session).
+                if !hevc_parameter_sets_seen {
+                    if eternal_wire::hevc::contains_parameter_sets(&frame_bytes) {
+                        hevc_parameter_sets_seen = true;
+                        assert!(
+                            eternal_wire::hevc::contains_keyframe(&frame_bytes),
+                            "the first HEVC frame must be an IRAP keyframe"
+                        );
+                        assert!(
+                            header.is_keyframe,
+                            "the wire keyframe flag must be set on the HEVC IRAP"
+                        );
+                    } else {
+                        continue;
+                    }
+                }
+
+                for counter in decoder.decode(&frame_bytes) {
+                    assert_eq!(
+                        counter,
+                        header.frame_seq as u64 & 0xFF_FFFF,
+                        "decoded HEVC frame counter must match the wire sequence"
+                    );
+                    decoded_hevc.push(counter);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    for pair in decoded_hevc.windows(2) {
+        assert!(pair[1] > pair[0], "HEVC counters must advance: {pair:?}");
+    }
 
     shared.stop();
     supervisor_tx

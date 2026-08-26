@@ -112,6 +112,11 @@ fn run_encode_loop(
     let mut amf_startup_idr_retries: u8 = 0;
     // Suppresses reopen retry storms after a failed bitrate change.
     let mut failed_reopen_bitrate: Option<u32> = None;
+    // HEVC gating memory: warn only once when no HEVC sibling exists, and
+    // don't retry an HEVC open that failed until the preference or the
+    // session changes (hevc_wanted going false resets it).
+    let mut hevc_unavailable_warned = false;
+    let mut hevc_open_failed = false;
 
     // Guarantee the very first frame of every pipeline is an IDR for all encoders, so the
     // iPad never sits in `waitingForSyncSample` after a connect or pipeline restart.
@@ -148,15 +153,55 @@ fn run_encode_loop(
         let desired_bitrate = shared.abr_current_bps.load(Ordering::SeqCst).max(500_000);
         let target_fps = shared.target_fps.load(Ordering::SeqCst);
 
+        // HEVC negotiation, re-checked every frame so a settings toggle or a
+        // new session takes effect at the next frame boundary: the user's
+        // preference AND the connected client's advertised decode capability.
+        let hevc_wanted = shared.hevc_enabled.load(Ordering::SeqCst)
+            && shared.session.lock().client_supports_hevc();
+        if !hevc_wanted {
+            hevc_open_failed = false;
+        }
+        let desired_encoder: String = if hevc_wanted && !hevc_open_failed {
+            match hevc_variant_of(&encoder_name) {
+                Some(hevc) if ffmpeg_next::encoder::find_by_name(hevc).is_some() => {
+                    hevc.to_string()
+                }
+                _ => {
+                    if !hevc_unavailable_warned {
+                        hevc_unavailable_warned = true;
+                        warn!(
+                            encoder = %encoder_name,
+                            "HEVC requested but no H.265 encoder is available — staying on H.264"
+                        );
+                    }
+                    encoder_name.clone()
+                }
+            }
+        } else {
+            encoder_name.clone()
+        };
+
         if encoder_state.is_none() {
             match EncoderState::new(
-                &encoder_name,
+                &desired_encoder,
                 raw_frame.width,
                 raw_frame.height,
                 desired_bitrate,
                 target_fps,
             ) {
-                Ok(state) => encoder_state = Some(state),
+                Ok(state) => {
+                    encoder_state = Some(state);
+                    note_encoder_opened(&shared, &desired_encoder);
+                }
+                Err(e) if is_hevc_encoder(&desired_encoder) => {
+                    warn!(
+                        encoder = %desired_encoder,
+                        error = %e,
+                        "HEVC encoder failed to open — staying on H.264"
+                    );
+                    hevc_open_failed = true;
+                    continue;
+                }
                 Err(e) if encoder_name != "libx264" => {
                     // A hardware encoder (commonly AMF) can fail to *open* even though it is
                     // compiled into FFmpeg — driver hiccup, AMF runtime busy/missing, transient
@@ -181,24 +226,26 @@ fn run_encode_loop(
                         desired_bitrate,
                         target_fps,
                     )?);
+                    note_encoder_opened(&shared, &encoder_name);
                 }
                 Err(e) => return Err(e),
             }
-        } else if encoder_state
-            .as_ref()
-            .is_some_and(|state| state.opened_bitrate != desired_bitrate)
-            && failed_reopen_bitrate != Some(desired_bitrate)
-        {
-            // Bitrate changed (ABR rung or the user's slider): hardware
-            // encoders ignore bitrate pokes on an open context, so a real
-            // change means a session reopen (~50-200ms hiccup, no transport
+        } else if encoder_state.as_ref().is_some_and(|state| {
+            state.opened_encoder != desired_encoder
+                || (state.opened_bitrate != desired_bitrate
+                    && failed_reopen_bitrate != Some(desired_bitrate))
+        }) {
+            // Bitrate changed (ABR rung or the user's slider) or the
+            // negotiated codec changed (HEVC toggle / client capability):
+            // hardware encoders ignore parameter pokes on an open context, so
+            // either means a session reopen (~50-200ms hiccup, no transport
             // teardown, same stream epoch) followed by a forced IDR.
             let previous = encoder_state
                 .as_ref()
                 .map(|s| s.opened_bitrate)
                 .unwrap_or(0);
             match EncoderState::new(
-                &encoder_name,
+                &desired_encoder,
                 raw_frame.width,
                 raw_frame.height,
                 desired_bitrate,
@@ -208,11 +255,21 @@ fn run_encode_loop(
                     info!(
                         from = previous,
                         to = desired_bitrate,
-                        "Reopened encoder session for new bitrate"
+                        encoder = %desired_encoder,
+                        "Reopened encoder session"
                     );
                     encoder_state = Some(state);
                     failed_reopen_bitrate = None;
                     shared.force_next_idr.store(true, Ordering::SeqCst);
+                    note_encoder_opened(&shared, &desired_encoder);
+                }
+                Err(e) if is_hevc_encoder(&desired_encoder) => {
+                    warn!(
+                        error = %e,
+                        encoder = %desired_encoder,
+                        "HEVC reopen failed — keeping the current session"
+                    );
+                    hevc_open_failed = true;
                 }
                 Err(e) => {
                     warn!(
@@ -229,6 +286,7 @@ fn run_encode_loop(
             .as_mut()
             .expect("Encoder state must be initialized");
         let current_bitrate = encoder.opened_bitrate;
+        let opened_is_hevc = is_hevc_encoder(&encoder.opened_encoder);
 
         let stride = encoder.bgra_frame.stride(0);
         let src_row_bytes = (raw_frame.width * 4) as usize;
@@ -261,7 +319,7 @@ fn run_encode_loop(
         let _forced_intra = prepare_frame_for_encode(
             &mut encoder.frame,
             raw_frame.frame_number,
-            &encoder_name,
+            &encoder.opened_encoder,
             &mut frames_since_last_idr,
             force_idr,
         );
@@ -273,38 +331,63 @@ fn run_encode_loop(
             match encoder.encoder.receive_packet(&mut encoder.packet) {
                 Ok(()) => {
                     let encode_us = encode_start.elapsed().as_micros();
-                    if encoder.h264.needs_parameter_sets() {
-                        encoder
-                            .h264
-                            .refresh_parameter_sets_from_extradata(encoder_extradata(
-                                &encoder.encoder,
-                            ));
-                    }
-
                     let packet_bytes = encoder.packet.data().unwrap_or_default();
                     let packet_is_key = encoder.packet.is_key();
-                    let (nal_data, au_info) = normalize_h264_payload_with_info(
-                        packet_bytes,
-                        packet_is_key,
-                        &mut encoder.h264,
-                        &encoder_name,
-                    );
-                    let is_keyframe = packet_is_key
-                        || au_info.contains_idr
-                        || (is_amf_encoder(&encoder_name) && au_info.intra_only);
-                    encoder.observe_amf_diagnostics(
-                        &nal_data,
-                        raw_frame.frame_number,
-                        packet_is_key,
-                        is_keyframe,
-                    );
+                    let (nal_data, is_keyframe) = if opened_is_hevc {
+                        // HEVC path: no parameter-set surgery — the encoders
+                        // are configured to repeat VPS/SPS/PPS in-band. If a
+                        // keyframe still lacks them and the extradata is
+                        // Annex B, prepend it as a safety net.
+                        let mut data = packet_bytes.to_vec();
+                        let key = packet_is_key || eternal_wire::hevc::contains_keyframe(&data);
+                        if key && !eternal_wire::hevc::contains_parameter_sets(&data) {
+                            if let Some(extra) = encoder_extradata(&encoder.encoder) {
+                                if extra.starts_with(&[0, 0, 0, 1]) || extra.starts_with(&[0, 0, 1])
+                                {
+                                    let mut with_headers =
+                                        Vec::with_capacity(extra.len() + data.len());
+                                    with_headers.extend_from_slice(&extra);
+                                    with_headers.extend_from_slice(&data);
+                                    data = with_headers;
+                                }
+                            }
+                        }
+                        (data, key)
+                    } else {
+                        if encoder.h264.needs_parameter_sets() {
+                            encoder
+                                .h264
+                                .refresh_parameter_sets_from_extradata(encoder_extradata(
+                                    &encoder.encoder,
+                                ));
+                        }
+                        let (nal_data, au_info) = normalize_h264_payload_with_info(
+                            packet_bytes,
+                            packet_is_key,
+                            &mut encoder.h264,
+                            &encoder.opened_encoder,
+                        );
+                        let is_keyframe = packet_is_key
+                            || au_info.contains_idr
+                            || (is_amf_encoder(&encoder.opened_encoder) && au_info.intra_only);
+                        (nal_data, is_keyframe)
+                    };
+                    if !opened_is_hevc {
+                        encoder.observe_amf_diagnostics(
+                            &nal_data,
+                            raw_frame.frame_number,
+                            packet_is_key,
+                            is_keyframe,
+                        );
+                    }
 
                     // AMF startup safety net: a keyframe went out but we still have no cached
                     // SPS/PPS (empty extradata and none inline), so the iPad can't build a format
                     // description. Nudge another IDR a few times — a later keyframe may carry the
                     // parameter sets inline and recover the stream.
                     if is_keyframe
-                        && is_amf_encoder(&encoder_name)
+                        && !opened_is_hevc
+                        && is_amf_encoder(&encoder.opened_encoder)
                         && encoder.h264.needs_parameter_sets()
                         && amf_startup_idr_retries < 3
                     {
@@ -360,6 +443,9 @@ struct EncoderState {
     packet: ffmpeg_next::Packet,
     h264: H264BitstreamState,
     amf_diagnostics: Option<AmfBitstreamDiagnostics>,
+    /// The FFmpeg encoder this session was opened with; a negotiated codec
+    /// change (H.264 ↔ HEVC) requests a reopen.
+    opened_encoder: String,
     /// The bitrate this session was opened with; a change requests a reopen.
     opened_bitrate: u32,
     /// First frame's capture instant — the PTS epoch for this session.
@@ -445,6 +531,7 @@ impl EncoderState {
             packet: ffmpeg_next::Packet::empty(),
             h264,
             amf_diagnostics: AmfBitstreamDiagnostics::new(encoder_name),
+            opened_encoder: encoder_name.to_string(),
             opened_bitrate: bitrate_bps,
             pts_epoch: None,
             last_pts: -1,
@@ -463,6 +550,52 @@ impl EncoderState {
             diagnostics.observe_packet(normalized_packet, sequence, packet_is_key, is_keyframe);
         }
     }
+}
+
+/// The H.265 sibling of an H.264 encoder name, if one exists.
+pub fn hevc_variant_of(h264_name: &str) -> Option<&'static str> {
+    match h264_name {
+        "h264_nvenc" => Some("hevc_nvenc"),
+        "h264_amf" => Some("hevc_amf"),
+        "h264_qsv" => Some("hevc_qsv"),
+        "h264_videotoolbox" => Some("hevc_videotoolbox"),
+        "libx264" => Some("libx265"),
+        _ => None,
+    }
+}
+
+pub fn is_hevc_encoder(encoder_name: &str) -> bool {
+    encoder_name.starts_with("hevc_") || encoder_name == "libx265"
+}
+
+fn codec_display_name_for(encoder_name: &str) -> &str {
+    match encoder_name {
+        "h264_nvenc" => "H.264 (NVENC)",
+        "h264_amf" => "H.264 (AMF)",
+        "h264_qsv" => "H.264 (QSV)",
+        "h264_videotoolbox" => "H.264 (VideoToolbox)",
+        "libx264" => "H.264 (x264)",
+        "hevc_nvenc" => "HEVC (NVENC)",
+        "hevc_amf" => "HEVC (AMF)",
+        "hevc_qsv" => "HEVC (QSV)",
+        "hevc_videotoolbox" => "HEVC (VideoToolbox)",
+        "libx265" => "HEVC (x265)",
+        other => other,
+    }
+}
+
+/// After every successful encoder open: report the live codec on the wire
+/// (HELLO_ACK/heartbeat `StreamConfig.codec`) and in the GUI.
+fn note_encoder_opened(shared: &SharedControl, encoder_name: &str) {
+    let codec = if is_hevc_encoder(encoder_name) {
+        eternal_wire::v2::control::CODEC_HEVC
+    } else {
+        eternal_wire::v2::control::CODEC_H264
+    };
+    shared.active_codec.store(codec, Ordering::SeqCst);
+    PIPELINE_STATS
+        .lock()
+        .set_codec_name(codec_display_name_for(encoder_name));
 }
 
 fn encoder_options(encoder_name: &str) -> ffmpeg_next::Dictionary<'_> {
@@ -509,6 +642,35 @@ fn encoder_options(encoder_name: &str) -> ffmpeg_next::Dictionary<'_> {
             opts.set("preset", "ultrafast");
             opts.set("tune", "zerolatency");
             opts.set("profile", "baseline");
+        }
+        // HEVC siblings. Every keyframe must be decodable by a mid-stream
+        // joiner, so ask each encoder to repeat VPS/SPS/PPS in-band; the
+        // encode loop also prepends Annex B extradata as a safety net.
+        "hevc_nvenc" => {
+            opts.set("preset", "p1");
+            opts.set("tune", "ll");
+            opts.set("zerolatency", "1");
+            opts.set("rc", "cbr");
+        }
+        "hevc_amf" => {
+            opts.set("usage", "lowlatency");
+            opts.set("latency", "1");
+            opts.set("quality", "speed");
+            opts.set("rc", "cbr");
+            opts.set("aud", "0");
+            // AMF HEVC's equivalent of h264_amf's header_spacing.
+            opts.set("header_insertion_mode", "idr");
+        }
+        "hevc_qsv" => {
+            opts.set("preset", "veryfast");
+        }
+        "hevc_videotoolbox" => {
+            opts.set("realtime", "1");
+        }
+        "libx265" => {
+            opts.set("preset", "ultrafast");
+            opts.set("tune", "zerolatency");
+            opts.set("x265-params", "repeat-headers=1:log-level=error");
         }
         _ => {
             opts.set("profile", "baseline");
@@ -879,4 +1041,31 @@ fn find_ffmpeg_exe() -> Option<PathBuf> {
         .map(PathBuf::from)
         .map(|dir| dir.join("bin").join("ffmpeg.exe"))
         .filter(|path| path.is_file())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hevc_variants_cover_every_supported_encoder() {
+        assert_eq!(hevc_variant_of("h264_nvenc"), Some("hevc_nvenc"));
+        assert_eq!(hevc_variant_of("h264_amf"), Some("hevc_amf"));
+        assert_eq!(hevc_variant_of("h264_qsv"), Some("hevc_qsv"));
+        assert_eq!(
+            hevc_variant_of("h264_videotoolbox"),
+            Some("hevc_videotoolbox")
+        );
+        assert_eq!(hevc_variant_of("libx264"), Some("libx265"));
+        assert_eq!(hevc_variant_of("mystery_codec"), None);
+    }
+
+    #[test]
+    fn hevc_detection_matches_the_variant_table() {
+        for h264 in ["h264_nvenc", "h264_amf", "h264_qsv", "libx264"] {
+            assert!(!is_hevc_encoder(h264));
+            let hevc = hevc_variant_of(h264).unwrap();
+            assert!(is_hevc_encoder(hevc), "{hevc} must register as HEVC");
+        }
+    }
 }

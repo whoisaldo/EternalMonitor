@@ -47,7 +47,7 @@ impl ConfigSource for SharedConfigSource<'_> {
                 .target_fps
                 .load(Ordering::SeqCst)
                 .min(u32::from(u16::MAX)) as u16,
-            codec: eternal_wire::v2::control::CODEC_H264,
+            codec: self.shared.active_codec.load(Ordering::SeqCst),
             flags: if software {
                 eternal_wire::v2::control::STREAM_FLAG_SOFTWARE_ENCODER
             } else {

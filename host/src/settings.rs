@@ -19,6 +19,10 @@ pub struct SettingsFile {
     /// `None` means auto (primary monitor).
     #[serde(default)]
     pub capture_display: Option<String>,
+    /// Prefer H.265/HEVC when the connected client can decode it.
+    /// Off by default until verified on real encoder hardware.
+    #[serde(default)]
+    pub hevc_enabled: bool,
     pub start_on_boot: bool,
 }
 
@@ -30,6 +34,7 @@ impl Default for SettingsFile {
             target_ip: None,
             encoder_override: None,
             capture_display: None,
+            hevc_enabled: false,
             start_on_boot: false,
         }
     }

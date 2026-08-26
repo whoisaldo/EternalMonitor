@@ -107,6 +107,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             *shared.encoder_override.lock() = Some(name);
         }
     }
+    // Optional HEVC preference override for automation (the E2E harness runs headless without
+    // the GUI toggle). Takes effect for the next client whose HELLO2 advertises HEVC decode.
+    if std::env::var("ETERNAL_HEVC").is_ok_and(|v| v.trim() == "1") {
+        info!("HEVC preference forced from ETERNAL_HEVC");
+        shared
+            .hevc_enabled
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
     // Optional target FPS override (e.g. ETERNAL_FPS=30) to lighten encode load — useful when
     // testing a hardware encoder on a weak/integrated GPU.
     if let Ok(fps) = std::env::var("ETERNAL_FPS") {
