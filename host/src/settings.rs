@@ -91,7 +91,12 @@ impl SettingsFile {
         }
         match serde_json::to_string_pretty(self) {
             Ok(text) => {
-                if let Err(error) = fs::write(&path, text) {
+                // Atomic tmp+rename: a crash mid-write must never leave a
+                // truncated settings.json (load() would silently reset every
+                // preference to defaults).
+                let tmp = path.with_extension("json.tmp");
+                let result = fs::write(&tmp, text).and_then(|()| fs::rename(&tmp, &path));
+                if let Err(error) = result {
                     warn!(
                         path = %path.display(),
                         error = %error,

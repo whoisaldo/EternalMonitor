@@ -81,6 +81,11 @@ final class ConnectionManager: ObservableObject {
     /// Whether this session asked the host to relay input (the Settings
     /// toggle, latched at HELLO2 time — mid-session flips need a reconnect).
     @Published private(set) var sessionWantsInput = false
+    /// The host's HELLO_ACK identity (name, negotiated timing) for Settings.
+    @Published private(set) var hostInfo: ControlChannel.SessionInfo?
+    /// The host's live stream parameters — from the ACK, then refreshed by
+    /// every heartbeat (so ABR bitrate changes and codec switches show up).
+    @Published private(set) var hostStreamConfig: StreamConfig?
 
     private var udpReceiver: UDPReceiver?
     private var frameAssembler: FrameAssembler?
@@ -107,6 +112,8 @@ final class ConnectionManager: ObservableObject {
     private var degradedSinceUs: UInt64?
     private var reconnectTask: Task<Void, Never>?
     private var prevCounters = FrameAssembler.Counters()
+    /// True when backgrounding ended a live session — foregrounding may resume it.
+    private var resumeOnForeground = false
 
     static let connectionTimeoutSeconds: UInt64 = 10
 
@@ -171,9 +178,10 @@ final class ConnectionManager: ObservableObject {
                     self.timeoutTask?.cancel()
                     self.state = .connected
                     self.transportMode = "WiFi"
-                    // Streaming is a passive activity — never let the iPad dim
-                    // and lock mid-session because nobody touched the screen.
-                    UIApplication.shared.isIdleTimerDisabled = true
+                    // Streaming is a passive activity — keep the iPad from
+                    // dimming mid-session unless the user opted out.
+                    UIApplication.shared.isIdleTimerDisabled =
+                        UserDefaults.standard.object(forKey: "keepScreenAwake") as? Bool ?? true
                     E2E.firstFrame(width: frameWidth, height: frameHeight)
                     RecentConnectionStore.shared.add(host: normalizedHost, port: port, isUSB: false)
                     // remember the last successfully-connected target so we
@@ -270,6 +278,8 @@ final class ConnectionManager: ObservableObject {
                 guard let self else { return }
                 self.livenessTimeoutUs = UInt64(info.livenessTimeoutMs) * 1000
                 self.reconnectAttempt = 0
+                self.hostInfo = info
+                self.hostStreamConfig = info.streamConfig
                 self.record(
                     .info, "ctrl",
                     "Connected to \(info.hostName): \(info.streamConfig.width)x\(info.streamConfig.height) @ \(info.streamConfig.fps)fps"
@@ -312,8 +322,10 @@ final class ConnectionManager: ObservableObject {
                 self.disconnect()
             }
         }
-        channel.onHeartbeat = { _ in
-            // Liveness watchdog lands with the reliability phase.
+        channel.onHeartbeat = { [weak self] heartbeat in
+            Task { @MainActor in
+                self?.hostStreamConfig = heartbeat.streamConfig
+            }
         }
 
         receiver.onControlDatagram = { [weak channel] data in
@@ -531,9 +543,22 @@ final class ConnectionManager: ObservableObject {
     /// streaming promptly instead of waiting out its liveness window.
     func handleAppBackgrounded() {
         guard state != .disconnected else { return }
+        resumeOnForeground = true
         controlChannel?.sendBye(.appBackground)
         record(.info, "ctrl", "App backgrounded — sent BYE and disconnected")
         disconnect()
+    }
+
+    /// Resume the session that backgrounding interrupted (opt-out toggle).
+    func handleAppForegrounded() {
+        guard resumeOnForeground else { return }
+        resumeOnForeground = false
+        guard UserDefaults.standard.object(forKey: "autoResumeOnForeground") as? Bool ?? true,
+              state == .disconnected,
+              let target = lastTarget
+        else { return }
+        record(.info, "ctrl", "App foregrounded — resuming the interrupted session")
+        connect(host: target.host, port: target.port)
     }
 
     func disconnect() {
@@ -565,6 +590,8 @@ final class ConnectionManager: ObservableObject {
         signalLost = false
         degradedSinceUs = nil
         prevCounters = FrameAssembler.Counters()
+        hostInfo = nil
+        hostStreamConfig = nil
         UIApplication.shared.isIdleTimerDisabled = false
     }
 
@@ -697,11 +724,16 @@ struct FPSCounter {
 // MARK: - Settings
 
 final class AppSettings: ObservableObject {
-    @Published var preferUSB: Bool {
-        didSet { UserDefaults.standard.set(preferUSB, forKey: "preferUSB") }
-    }
     @Published var showHUD: Bool {
         didSet { UserDefaults.standard.set(showHUD, forKey: "showHUD") }
+    }
+    /// Keep the display from dimming/locking while streaming (default on).
+    @Published var keepScreenAwake: Bool {
+        didSet { UserDefaults.standard.set(keepScreenAwake, forKey: "keepScreenAwake") }
+    }
+    /// Reconnect automatically when returning from the app switcher.
+    @Published var autoResumeOnForeground: Bool {
+        didSet { UserDefaults.standard.set(autoResumeOnForeground, forKey: "autoResumeOnForeground") }
     }
     /// Relay touches/pencil to the PC as mouse input (negotiated at connect).
     @Published var controlPC: Bool {
@@ -726,8 +758,10 @@ final class AppSettings: ObservableObject {
 
     init() {
         let defaults = UserDefaults.standard
-        self.preferUSB = defaults.object(forKey: "preferUSB") as? Bool ?? true
         self.showHUD = defaults.object(forKey: "showHUD") as? Bool ?? true
+        self.keepScreenAwake = defaults.object(forKey: "keepScreenAwake") as? Bool ?? true
+        self.autoResumeOnForeground =
+            defaults.object(forKey: "autoResumeOnForeground") as? Bool ?? true
         self.controlPC = defaults.object(forKey: "controlPC") as? Bool ?? true
         self.autoReconnect = defaults.object(forKey: "autoReconnect") as? Bool ?? true
         self.targetFPS = defaults.object(forKey: "targetFPS") as? Int ?? 60

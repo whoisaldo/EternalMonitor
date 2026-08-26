@@ -2,6 +2,7 @@ import SwiftUI
 
 struct SettingsView: View {
     @EnvironmentObject var settings: AppSettings
+    @EnvironmentObject var connectionManager: ConnectionManager
     @Environment(\.dismiss) private var dismiss
 
     private var appVersion: String {
@@ -34,10 +35,21 @@ struct SettingsView: View {
                     Toggle(isOn: $settings.autoReconnect) {
                         Label("Auto-reconnect", systemImage: "arrow.triangle.2.circlepath")
                     }
+
+                    Toggle(isOn: $settings.keepScreenAwake) {
+                        Label("Keep screen awake", systemImage: "sun.max")
+                    }
+
+                    Toggle(isOn: $settings.autoResumeOnForeground) {
+                        Label("Resume after switching apps", systemImage: "arrow.uturn.forward")
+                    }
                 } header: {
                     sectionHeader("Playback")
                 } footer: {
-                    footnote("Triple-tap the video to toggle the HUD while streaming.")
+                    footnote(
+                        "Tap the video to toggle the HUD while streaming — "
+                            + "three fingers while Control PC is on."
+                    )
                 }
 
                 // Control (input relay)
@@ -55,24 +67,36 @@ struct SettingsView: View {
                     )
                 }
 
-                // Connection
+                // Host — live values from HELLO_ACK, refreshed by heartbeats.
                 Section {
-                    Toggle(isOn: $settings.preferUSB) {
-                        Label("Prefer USB when available", systemImage: "cable.connector")
+                    if let host = connectionManager.hostInfo,
+                       let config = connectionManager.hostStreamConfig {
+                        infoRow("Host", host.hostName, "desktopcomputer")
+                        infoRow(
+                            "Resolution",
+                            "\(config.width)×\(config.height) @ \(config.fps) fps",
+                            "rectangle.on.rectangle"
+                        )
+                        infoRow(
+                            "Codec",
+                            config.codec == StreamConfig.codecHEVC ? "HEVC (H.265)" : "H.264",
+                            "cpu"
+                        )
+                        infoRow(
+                            "Bitrate",
+                            String(format: "%.1f Mbps", Double(config.bitrateBps) / 1_000_000.0),
+                            "slider.horizontal.3"
+                        )
+                    } else {
+                        infoRow("Host", "Not connected", "desktopcomputer")
                     }
-                } header: {
-                    sectionHeader("Connection")
-                }
-
-                // Host stream — honest about what the iPad controls vs the PC
-                Section {
-                    infoRow("Resolution", "Matches your PC display", "rectangle.on.rectangle")
-                    infoRow("Codec", "H.264", "cpu")
-                    infoRow("Bitrate", "Set on the host", "slider.horizontal.3")
                 } header: {
                     sectionHeader("Host stream")
                 } footer: {
-                    footnote("Resolution, codec and bitrate are configured in the EternalMonitor app on your Windows PC.")
+                    footnote(
+                        "Live values from the connected host. Resolution, codec and bitrate "
+                            + "are configured in the EternalMonitor app on your Windows PC."
+                    )
                 }
 
                 // About

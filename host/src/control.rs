@@ -85,6 +85,22 @@ pub enum CaptureTarget {
     VirtualExtended,
 }
 
+/// The `capture_display` settings value that means [`CaptureTarget::VirtualExtended`].
+pub const CAPTURE_VIRTUAL_SENTINEL: &str = "virtual";
+
+impl CaptureTarget {
+    /// Map the persisted `capture_display` setting to a target (shared by the
+    /// GUI and the startup preload so generation 0 already captures the right
+    /// display).
+    pub fn from_setting(setting: Option<&str>) -> Self {
+        match setting {
+            Some(s) if s == CAPTURE_VIRTUAL_SENTINEL => CaptureTarget::VirtualExtended,
+            Some(name) if !name.is_empty() => CaptureTarget::Output(name.to_string()),
+            _ => CaptureTarget::PrimaryAuto,
+        }
+    }
+}
+
 impl SharedControl {
     pub fn new(listen_port: u16, initial_bitrate_bps: u32) -> Self {
         Self {
