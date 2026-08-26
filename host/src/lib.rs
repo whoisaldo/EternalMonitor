@@ -16,6 +16,7 @@ pub mod stats;
 pub mod supervisor;
 pub mod transport;
 pub mod vdd;
+pub mod vdd_settings;
 
 #[cfg(windows)]
 pub mod gpu;

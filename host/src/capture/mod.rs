@@ -234,6 +234,31 @@ pub(crate) fn reconcile_virtual_display(
                 return CaptureTarget::PrimaryAuto;
             }
 
+            // Best effort: match the virtual display's mode list to the
+            // connected iPad's panel BEFORE enabling the driver (it reads
+            // vdd_settings.xml at enable time). Failure is non-fatal — the
+            // driver's built-in modes apply. NEEDS_WINDOWS_VERIFY (M10).
+            if crate::settings::SettingsFile::load().vdd_match_resolution {
+                if let Some(info) = shared.session.lock().client_info() {
+                    let modes = crate::vdd_settings::modes_for_client(
+                        info.screen_px.0,
+                        info.screen_px.1,
+                        info.refresh_hz,
+                    );
+                    let path = std::path::Path::new(r"C:\VirtualDisplayDriver\vdd_settings.xml");
+                    match crate::vdd_settings::write_to(path, &modes) {
+                        Ok(()) => info!(
+                            ?modes,
+                            "Wrote virtual display mode list for the connected client"
+                        ),
+                        Err(error) => warn!(
+                            %error,
+                            "Could not write vdd_settings.xml — driver default modes apply"
+                        ),
+                    }
+                }
+            }
+
             let before: Vec<String> = enumerate_outputs()
                 .into_iter()
                 .map(|o| o.device_name)

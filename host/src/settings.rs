@@ -23,7 +23,15 @@ pub struct SettingsFile {
     /// Off by default until verified on real encoder hardware.
     #[serde(default)]
     pub hevc_enabled: bool,
+    /// Ask the virtual display driver to offer the connected iPad's native
+    /// resolution/refresh (writes vdd_settings.xml before enabling it).
+    #[serde(default = "default_true")]
+    pub vdd_match_resolution: bool,
     pub start_on_boot: bool,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 impl Default for SettingsFile {
@@ -35,6 +43,7 @@ impl Default for SettingsFile {
             encoder_override: None,
             capture_display: None,
             hevc_enabled: false,
+            vdd_match_resolution: true,
             start_on_boot: false,
         }
     }
