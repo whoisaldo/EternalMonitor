@@ -37,15 +37,16 @@ final class ClockEstimatorTests: XCTestCase {
         let trueOffset: Int64 = -2_000_000
 
         // Two congested exchanges with asymmetric delay (corrupted offsets)...
+        // Client times start well above |offset| so host time stays positive.
         for (i, legs) in [(40_000 as UInt64, 5_000 as UInt64), (3_000, 60_000)].enumerated() {
-            let t1 = UInt64(1_000_000 * (i + 1))
+            let t1 = UInt64(10_000_000 * (i + 1))
             let t2 = UInt64(Int64(t1 + legs.0) + trueOffset)
             let t3 = t2 + 100
             let t4 = t1 + legs.0 + 100 + legs.1
             estimator.addExchange(t1: t1, t2: t2, t3: t3, t4: t4)
         }
         // ...and one clean symmetric exchange.
-        let clean = symmetricExchange(at: 3_000_000, offset: trueOffset, legUs: 2_000)
+        let clean = symmetricExchange(at: 30_000_000, offset: trueOffset, legUs: 2_000)
         estimator.addExchange(t1: clean.t1, t2: clean.t2, t3: clean.t3, t4: clean.t4)
 
         let measured = try! XCTUnwrap(estimator.offsetUs)
