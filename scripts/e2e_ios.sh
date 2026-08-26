@@ -18,6 +18,10 @@ SIM_NAME="${EM_SIM_NAME:-iPad Pro 11-inch (M4)}"
 PORT="${EM_PORT:-9876}"
 WANT_DECODED="${EM_WANT_DECODED:-120}"
 TIMEOUT_SECS="${EM_TIMEOUT:-120}"
+# EM_CODEC=hevc runs the same system test over H.265: the host prefers HEVC
+# (ETERNAL_HEVC=1 → libx265 via the variant table) and the app's VideoToolbox
+# session software-decodes it in the simulator.
+CODEC="${EM_CODEC:-h264}"
 SYNTH_W=640
 SYNTH_H=360
 # BSD mktemp only substitutes TRAILING Xs — no suffix after them.
@@ -50,11 +54,14 @@ APP="$ROOT/ios/build/e2e/Build/Products/Debug-iphonesimulator/EternalMonitor.app
 echo "==> Building host"
 cargo build -q --release -p eternal-host
 
-echo "==> Starting host on 127.0.0.1:$PORT (synthetic ${SYNTH_W}x${SYNTH_H}, libx264, headless)"
+HEVC_FLAG=0
+[ "$CODEC" = "hevc" ] && HEVC_FLAG=1
+echo "==> Starting host on 127.0.0.1:$PORT (synthetic ${SYNTH_W}x${SYNTH_H}, codec=$CODEC, headless)"
 ETERNAL_HEADLESS=1 \
 ETERNAL_CAPTURE=synthetic \
 ETERNAL_SYNTH_SIZE="${SYNTH_W}x${SYNTH_H}" \
 ETERNAL_ENCODER=libx264 \
+ETERNAL_HEVC="$HEVC_FLAG" \
     "$ROOT/target/release/eternal-host" "$PORT" >"$HOST_LOG" 2>&1 &
 HOST_PID=$!
 
@@ -108,6 +115,12 @@ last_stats=$(grep 'E2E_STATS' "$APP_LOG" | tail -1)
 
 if ! grep -q "w=$SYNTH_W h=$SYNTH_H" <<<"$last_stats"; then
     echo "FAIL: decoded resolution mismatch: $last_stats (expected ${SYNTH_W}x${SYNTH_H})"
+    exit 1
+fi
+
+if [ "$CODEC" = "hevc" ] && ! grep -q "libx265" "$HOST_LOG"; then
+    echo "FAIL: hevc requested but the host never opened an HEVC encoder session"
+    echo "----- host log -----"; tail -30 "$HOST_LOG"
     exit 1
 fi
 

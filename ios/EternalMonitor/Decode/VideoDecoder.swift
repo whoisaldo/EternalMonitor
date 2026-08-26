@@ -24,8 +24,16 @@ final class VideoDecoder {
     /// Protocol v2 turns this into a keyframe request to the host; today it is diagnostic.
     var onNeedsKeyframe: (() -> Void)?
 
+    /// Which bitstream the host is sending. Sniffed from the NAL units
+    /// themselves (an HEVC VPS or an H.264 SPS in a keyframe) because the
+    /// host switches codecs via a live encoder reopen — the bitstream is the
+    /// authority, not the last STREAM_CONFIG to arrive.
+    enum StreamCodec { case h264, hevc }
+
     private var formatDescription: CMVideoFormatDescription?
     private var decompressionSession: VTDecompressionSession?
+    private var codec: StreamCodec = .h264
+    private var vps: Data?
     private var sps: Data?
     private var pps: Data?
     private var loggedPacketizations = Set<String>()
@@ -63,6 +71,8 @@ final class VideoDecoder {
             self.isShutdown = true
             self.teardownSession(waitForFrames: true)
             self.formatDescription = nil
+            self.codec = .h264
+            self.vps = nil
             self.sps = nil
             self.pps = nil
             self.waitingForSyncSample = true
@@ -122,6 +132,19 @@ final class VideoDecoder {
 
         logFirstNALPrefixIfNeeded(nalUnits[0])
 
+        if let detected = Self.sniffCodec(nalUnits), detected != codec {
+            onEvent?("Bitstream codec switched to \(detected == .hevc ? "HEVC" : "H.264")")
+            codec = detected
+            vps = nil
+            sps = nil
+            pps = nil
+            waitingForSyncSample = true
+        }
+        if codec == .hevc {
+            decodeHEVCNALs(nalUnits, timestampUs: packet.timestampUs)
+            return
+        }
+
         var accessUnitNALs: [Data] = []
         var hasSliceNAL = false
         var nalTypesInPacket: [UInt8] = []
@@ -161,6 +184,83 @@ final class VideoDecoder {
             }
             decodeAccessUnit(accessUnitNALs, timestampUs: packet.timestampUs, isSyncSample: isSyncSample)
         }
+    }
+
+    // MARK: - HEVC
+
+    /// The codec whose parameter sets appear in this access unit, if any.
+    /// Exactly `0x40` (HEVC VPS, layer 0) marks HEVC — the byte reads as NAL
+    /// type 0 in H.264, which no encoder emits. NOT `0x41`: that is a common
+    /// H.264 P-slice (type 1, ref_idc 2) that merely shares the VPS type bits.
+    /// `x & 0x9F == 0x07` is a classic H.264 SPS. The host guarantees a VPS on
+    /// every HEVC switch keyframe, so VPS-only detection is sufficient.
+    static func sniffCodec(_ nalUnits: [Data]) -> StreamCodec? {
+        for nal in nalUnits {
+            guard let first = nal.first else { continue }
+            if first == 0x40 { return .hevc }
+            if first & 0x9F == 0x07 { return .h264 }
+        }
+        return nil
+    }
+
+    private func decodeHEVCNALs(_ nalUnits: [Data], timestampUs: UInt64) {
+        var accessUnitNALs: [Data] = []
+        var hasSliceNAL = false
+        var isSyncSample = false
+        for nal in nalUnits {
+            guard let first = nal.first else { continue }
+            let nalType = (first >> 1) & 0x3F
+            switch nalType {
+            case 32:
+                vps = nal
+                tryCreateHEVCFormatDescription()
+            case 33:
+                sps = nal
+                tryCreateHEVCFormatDescription()
+            case 34:
+                pps = nal
+                tryCreateHEVCFormatDescription()
+            case 35, 39, 40:
+                // AUD and SEI — same VideoToolbox hygiene as the H.264 path.
+                continue
+            default:
+                if nalType <= 31 {
+                    hasSliceNAL = true
+                    if (16...21).contains(nalType) {
+                        isSyncSample = true // IRAP: BLA/IDR/CRA
+                    }
+                }
+                accessUnitNALs.append(nal)
+            }
+        }
+        if hasSliceNAL {
+            decodeAccessUnit(accessUnitNALs, timestampUs: timestampUs, isSyncSample: isSyncSample)
+        }
+    }
+
+    private func tryCreateHEVCFormatDescription() {
+        guard let vps, let sps, let pps else { return }
+        let parameterSets: [Data] = [vps, sps, pps]
+        var newFormat: CMFormatDescription?
+        let status = parameterSets.withUnsafeBufferPointers { pointers, sizes in
+            CMVideoFormatDescriptionCreateFromHEVCParameterSets(
+                allocator: kCFAllocatorDefault,
+                parameterSetCount: 3,
+                parameterSetPointers: pointers,
+                parameterSetSizes: sizes,
+                nalUnitHeaderLength: 4,
+                extensions: nil,
+                formatDescriptionOut: &newFormat
+            )
+        }
+        guard status == noErr, let newFormat else {
+            onEvent?("Failed to create HEVC format description status=\(status)")
+            return
+        }
+        adoptFormatDescription(
+            newFormat,
+            describing: "VPS=\(vps.count)B SPS=\(sps.count)B PPS=\(pps.count)B"
+        )
     }
 
     // MARK: - NAL unit parsing (Annex B → individual NAL units)
@@ -272,13 +372,17 @@ final class VideoDecoder {
             return
         }
 
+        adoptFormatDescription(newFormat, describing: "SPS=\(sps.count)B PPS=\(pps.count)B")
+    }
+
+    private func adoptFormatDescription(_ newFormat: CMFormatDescription, describing detail: String) {
         if let existing = formatDescription,
            CMFormatDescriptionEqual(existing, otherFormatDescription: newFormat) {
             return
         }
 
         formatDescription = newFormat
-        onEvent?("Updated format description SPS=\(sps.count)B PPS=\(pps.count)B")
+        onEvent?("Updated format description \(detail)")
 
         // Adopt a compatible format change without rebuilding the hardware decoder;
         // only an incompatible change (e.g. resolution switch) costs a session rebuild.
@@ -695,30 +799,34 @@ private func readBigEndianLength(from data: Data, offset: Int, width: Int) -> In
 // MARK: - Helper for parameter set creation
 
 private extension Array where Element == Data {
+    /// Runs `body` with a C array of pointers to EVERY element's bytes, all
+    /// simultaneously live — what `CMVideoFormatDescriptionCreateFrom*ParameterSets`
+    /// needs. Recursion nests one `withUnsafeBytes` scope per element, so this
+    /// works for H.264's [SPS, PPS] and HEVC's [VPS, SPS, PPS] alike (an older
+    /// version hardcoded two elements and handed VideoToolbox a nil third
+    /// pointer, which it rejects as -12712).
     func withUnsafeBufferPointers<R>(
         _ body: (UnsafePointer<UnsafePointer<UInt8>>, UnsafePointer<Int>) -> R
     ) -> R {
-        var pointers = [UnsafePointer<UInt8>?](repeating: nil, count: count)
-        var sizes = [Int](repeating: 0, count: count)
+        var collected: [UnsafePointer<UInt8>] = []
+        collected.reserveCapacity(count)
 
-        for (i, data) in self.enumerated() {
-            sizes[i] = data.count
-        }
-
-        return self[0].withUnsafeBytes { spsPtr in
-            self[1].withUnsafeBytes { ppsPtr in
-                pointers[0] = spsPtr.bindMemory(to: UInt8.self).baseAddress
-                pointers[1] = ppsPtr.bindMemory(to: UInt8.self).baseAddress
-                return pointers.withUnsafeBufferPointer { ptrBuf in
+        func recurse(_ index: Int) -> R {
+            if index == count {
+                let sizes = map(\.count)
+                return collected.withUnsafeBufferPointer { ptrBuf in
                     sizes.withUnsafeBufferPointer { sizeBuf in
-                        body(
-                            UnsafeRawPointer(ptrBuf.baseAddress!).assumingMemoryBound(to: UnsafePointer<UInt8>.self),
-                            sizeBuf.baseAddress!
-                        )
+                        body(ptrBuf.baseAddress!, sizeBuf.baseAddress!)
                     }
                 }
             }
+            return self[index].withUnsafeBytes { raw in
+                collected.append(raw.bindMemory(to: UInt8.self).baseAddress!)
+                return recurse(index + 1)
+            }
         }
+
+        return recurse(0)
     }
 }
 

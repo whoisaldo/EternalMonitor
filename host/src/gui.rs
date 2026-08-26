@@ -149,6 +149,7 @@ pub struct AnalyzerApp {
     settings_target_ip: String,
     settings_target_error: Option<String>,
     settings_start_on_boot: bool,
+    settings_hevc_enabled: bool,
     settings_encoder_choice: String, // display label, e.g. "Auto" or "NVENC"
     /// DXGI `DeviceName` of the chosen capture display; empty string means auto (primary).
     settings_capture_display: String,
@@ -240,6 +241,13 @@ impl AnalyzerApp {
         };
         let available_outputs = enumerate_outputs();
 
+        // Same model as encoder_override: push the persisted preference into
+        // SharedControl so the encoder honours it without a restart.
+        control
+            .shared
+            .hevc_enabled
+            .store(persisted.hevc_enabled, std::sync::atomic::Ordering::SeqCst);
+
         let start_on_boot = if persisted.start_on_boot != read_startup_registry() {
             // Persisted state disagrees with the registry — trust the registry as ground truth.
             read_startup_registry()
@@ -263,6 +271,7 @@ impl AnalyzerApp {
             settings_target_ip,
             settings_target_error: None,
             settings_start_on_boot: start_on_boot,
+            settings_hevc_enabled: persisted.hevc_enabled,
             settings_encoder_choice: encoder_choice,
             settings_capture_display,
             available_outputs,
@@ -314,6 +323,7 @@ impl AnalyzerApp {
             } else {
                 Some(self.settings_capture_display.clone())
             },
+            hevc_enabled: self.settings_hevc_enabled,
             start_on_boot: self.settings_start_on_boot,
         };
         file.save();
@@ -868,6 +878,35 @@ impl AnalyzerApp {
                 .color(MUTED)
                 .size(11.0),
             );
+
+            ui.add_space(12.0);
+
+            // --- HEVC preference --------------------------------------------------
+            let prev_hevc = self.settings_hevc_enabled;
+            ui.checkbox(
+                &mut self.settings_hevc_enabled,
+                egui::RichText::new("Prefer HEVC (H.265) when the iPad supports it")
+                    .color(TEXT)
+                    .size(13.0),
+            );
+            ui.label(
+                egui::RichText::new(
+                    "Experimental. Falls back to H.264 automatically if the GPU has no HEVC encoder.",
+                )
+                .color(MUTED)
+                .size(11.0),
+            );
+            if self.settings_hevc_enabled != prev_hevc {
+                self.control
+                    .shared
+                    .hevc_enabled
+                    .store(self.settings_hevc_enabled, std::sync::atomic::Ordering::SeqCst);
+                info!(
+                    enabled = self.settings_hevc_enabled,
+                    "HEVC preference changed — applies at the next frame"
+                );
+                self.persist_settings();
+            }
 
             ui.add_space(12.0);
 

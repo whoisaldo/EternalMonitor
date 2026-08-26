@@ -103,6 +103,14 @@ impl Session {
         self.active.as_ref().map(|s| s.info.clone())
     }
 
+    /// Whether the connected client advertised HEVC decode in its HELLO2.
+    /// False with no active session — no client, no reason to encode HEVC.
+    pub fn client_supports_hevc(&self) -> bool {
+        self.active
+            .as_ref()
+            .is_some_and(|s| s.info.decoder_caps & eternal_wire::v2::control::CAP_DECODE_HEVC != 0)
+    }
+
     pub fn last_report(&self) -> Option<ReceiverReport> {
         self.active.as_ref().and_then(|s| s.last_report)
     }
