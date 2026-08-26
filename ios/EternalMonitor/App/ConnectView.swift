@@ -30,7 +30,10 @@ struct ConnectView: View {
     }
 
     private var parsedPort: UInt16? {
-        UInt16(port.trimmingCharacters(in: .whitespacesAndNewlines))
+        guard let value = UInt16(port.trimmingCharacters(in: .whitespacesAndNewlines)),
+              value > 0
+        else { return nil }
+        return value
     }
 
     private var canConnect: Bool {
@@ -268,7 +271,9 @@ struct ConnectView: View {
 
     private var inputSection: some View {
         VStack(spacing: 14) {
-            field(label: "HOST IP", placeholder: "e.g. 10.0.0.45", text: $hostIP, field: .host, keyboard: .decimalPad)
+            // .URL keyboard: hostnames and IPv6 need letters and colons, which
+            // the old .decimalPad made impossible to type.
+            field(label: "HOST IP", placeholder: "e.g. 10.0.0.45", text: $hostIP, field: .host, keyboard: .URL)
 
             if !settings.lastHost.isEmpty && settings.lastHost != normalizedHostIP {
                 Button {
@@ -461,22 +466,18 @@ struct ConnectView: View {
         .opacity(isConnecting ? 0.5 : 1)
     }
 
-    // parse "eternaldisplay://IP:port" and immediately connect.
+    // parse "eternaldisplay://host:port" and immediately connect.
     private func handleScannedQR(_ value: String) {
-        let prefix = "eternaldisplay://"
-        guard value.hasPrefix(prefix) else {
+        switch PairingCode.parse(value) {
+        case .success(let target):
+            hostIP = target.host
+            port = String(target.port)
+            connectionManager.connect(host: target.host, port: target.port)
+        case .failure(.wrongScheme):
             connectionManager.connectionError = "Scanned QR is not an EternalMonitor link."
-            return
-        }
-        let body = String(value.dropFirst(prefix.count))
-        let parts = body.split(separator: ":")
-        guard parts.count == 2, let scannedPort = UInt16(parts[1]) else {
+        case .failure:
             connectionManager.connectionError = "Scanned QR is malformed."
-            return
         }
-        hostIP = String(parts[0])
-        port = String(scannedPort)
-        connectionManager.connect(host: hostIP, port: scannedPort)
     }
 
     // MARK: - Scan empty state

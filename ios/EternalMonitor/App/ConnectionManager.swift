@@ -76,6 +76,11 @@ final class ConnectionManager: ObservableObject {
     private var frameAssembler: FrameAssembler?
     private var videoDecoder: VideoDecoder?
     private var timeoutTask: Task<Void, Never>?
+    private var statsFlushTask: Task<Void, Never>?
+    /// Hot-path counters written on the UDP queue and drained at 4 Hz — the
+    /// old per-datagram MainActor Task (~2 per datagram, ~2,800 hops/s at
+    /// 1080p60) throttled the whole receive path.
+    private let streamCounters = StreamCounters()
     private var debugState = ConnectionDebugState()
     // Whether we've already granted the one-time timeout extension that fires when datagrams
     // start arriving (so a slow/jittery network gets a fresh window to finish reassembly+decode).
@@ -176,13 +181,7 @@ final class ConnectionManager: ObservableObject {
 
         assembler.onFrameAssembled = { [weak self, weak decoder] data in
             guard let self else { return }
-            Task { @MainActor in
-                self.debugState.assembledFrames += 1
-                self.debugState.assembledFrameBytes += data.count
-                if self.debugState.assembledFrames == 1 || self.debugState.assembledFrames % 30 == 0 {
-                    self.record(.info, "assembly", "Assembled frame payload #\(self.debugState.assembledFrames) (\(data.count) bytes)")
-                }
-            }
+            self.streamCounters.recordAssembled(bytes: data.count)
 
             guard let decoder else { return }
             guard let packet = FramePacket.deserialize(from: data) else {
@@ -191,12 +190,7 @@ final class ConnectionManager: ObservableObject {
                 }
                 return
             }
-            Task { @MainActor in
-                self.debugState.decodePackets += 1
-                if self.debugState.decodePackets == 1 || self.debugState.decodePackets % 30 == 0 {
-                    self.record(.info, "proto", "Parsed FramePacket seq=\(packet.seq) bytes=\(packet.data.count) keyframe=\(packet.isKeyframe)")
-                }
-            }
+            self.streamCounters.recordParsed()
             decoder.decode(packet: packet)
         }
 
@@ -218,28 +212,10 @@ final class ConnectionManager: ObservableObject {
                 self?.record(.warning, "udp", "HELLO send failed: \(message)")
             }
         }
-        receiver.onDatagramReceived = { [weak self] byteCount in
-            Task { @MainActor in
-                guard let self else { return }
-                self.debugState.datagramsReceived += 1
-                self.debugState.datagramBytesReceived += byteCount
-                if self.debugState.datagramsReceived == 1 {
-                    self.record(.info, "udp", "First UDP datagram received (\(byteCount) bytes)")
-                    // Data is flowing — grant a fresh full window (once) so a slow/jittery network
-                    // gets time to finish reassembly + decode instead of being cut off mid-handshake.
-                    if self.state == .connecting && !self.didExtendTimeout {
-                        self.didExtendTimeout = true
-                        self.armConnectTimeout(seconds: Self.connectionTimeoutSeconds)
-                    }
-                } else if self.debugState.datagramsReceived % 50 == 0 {
-                    self.record(.info, "udp", "Received \(self.debugState.datagramsReceived) UDP datagrams so far")
-                }
-            }
-        }
-        receiver.onFragmentSeq = { [weak self] seq in
-            Task { @MainActor in
-                self?.quality.recordFragmentSeq(seq)
-            }
+        receiver.onDatagramReceived = { [streamCounters] byteCount in
+            // UDP-queue side: just count. The 4 Hz flush loop below moves the
+            // totals onto the MainActor.
+            streamCounters.recordDatagram(bytes: byteCount)
         }
         receiver.onDatagramIgnored = { [weak self] message in
             Task { @MainActor in
@@ -271,8 +247,49 @@ final class ConnectionManager: ObservableObject {
             return
         }
 
+        startStatsFlushLoop()
+
         // Timeout after N seconds (re-armed once when datagrams start arriving).
         armConnectTimeout(seconds: Self.connectionTimeoutSeconds)
+    }
+
+    /// Drains the hot-path counters onto the MainActor at 4 Hz — cheap enough
+    /// to be invisible, fresh enough for diagnostics and the connect flow.
+    private func startStatsFlushLoop() {
+        statsFlushTask?.cancel()
+        statsFlushTask = Task { @MainActor [weak self] in
+            while !Task.isCancelled {
+                try? await Task.sleep(nanoseconds: 250_000_000)
+                guard let self, !Task.isCancelled else { return }
+                let snapshot = self.streamCounters.drain()
+                guard snapshot.datagrams > 0 || snapshot.assembled > 0 else { continue }
+
+                let firstDatagrams = self.debugState.datagramsReceived == 0 && snapshot.datagrams > 0
+                let firstAssembled = self.debugState.assembledFrames == 0 && snapshot.assembled > 0
+                self.debugState.datagramsReceived += snapshot.datagrams
+                self.debugState.datagramBytesReceived += snapshot.datagramBytes
+                self.debugState.assembledFrames += snapshot.assembled
+                self.debugState.assembledFrameBytes += snapshot.assembledBytes
+                self.debugState.decodePackets += snapshot.parsed
+
+                if firstDatagrams {
+                    self.record(
+                        .info, "udp",
+                        "UDP data flowing (\(snapshot.datagrams) datagrams, \(snapshot.datagramBytes) bytes in first batch)"
+                    )
+                    // Data is flowing — grant a fresh full window (once) so a slow/jittery
+                    // network gets time to finish reassembly + decode instead of being cut
+                    // off mid-handshake.
+                    if self.state == .connecting && !self.didExtendTimeout {
+                        self.didExtendTimeout = true
+                        self.armConnectTimeout(seconds: Self.connectionTimeoutSeconds)
+                    }
+                }
+                if firstAssembled {
+                    self.record(.info, "assembly", "First frame payload assembled (\(snapshot.assembledBytes) bytes)")
+                }
+            }
+        }
     }
 
     /// (Re)arm the connect-timeout watchdog. Cancels any existing timer and starts a fresh one;
@@ -298,6 +315,9 @@ final class ConnectionManager: ObservableObject {
     func disconnect() {
         timeoutTask?.cancel()
         timeoutTask = nil
+        statsFlushTask?.cancel()
+        statsFlushTask = nil
+        _ = streamCounters.drain()
         didExtendTimeout = false
 
         // Teardown order matters: stop the socket first (no new input), then shut
@@ -336,6 +356,49 @@ private extension DiagnosticLevel {
             return .default
         case .error:
             return .error
+        }
+    }
+}
+
+// MARK: - Hot-path stream counters
+
+/// Written from the UDP queue on every datagram/frame; drained by the
+/// MainActor flush loop. The unfair lock costs nanoseconds where a per-event
+/// `Task { @MainActor }` cost a scheduler hop.
+final class StreamCounters: @unchecked Sendable {
+    struct Snapshot {
+        var datagrams = 0
+        var datagramBytes = 0
+        var assembled = 0
+        var assembledBytes = 0
+        var parsed = 0
+    }
+
+    private let lock = OSAllocatedUnfairLock(initialState: Snapshot())
+
+    func recordDatagram(bytes: Int) {
+        lock.withLock {
+            $0.datagrams += 1
+            $0.datagramBytes += bytes
+        }
+    }
+
+    func recordAssembled(bytes: Int) {
+        lock.withLock {
+            $0.assembled += 1
+            $0.assembledBytes += bytes
+        }
+    }
+
+    func recordParsed() {
+        lock.withLock { $0.parsed += 1 }
+    }
+
+    func drain() -> Snapshot {
+        lock.withLock { current in
+            let snapshot = current
+            current = Snapshot()
+            return snapshot
         }
     }
 }

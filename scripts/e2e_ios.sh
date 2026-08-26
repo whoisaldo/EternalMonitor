@@ -20,8 +20,9 @@ WANT_DECODED="${EM_WANT_DECODED:-120}"
 TIMEOUT_SECS="${EM_TIMEOUT:-120}"
 SYNTH_W=640
 SYNTH_H=360
-APP_LOG="$(mktemp /tmp/em_e2e_app.XXXXXX.log)"
-HOST_LOG="$(mktemp /tmp/em_e2e_host.XXXXXX.log)"
+# BSD mktemp only substitutes TRAILING Xs — no suffix after them.
+APP_LOG="$(mktemp /tmp/em_e2e_app.XXXXXX)"
+HOST_LOG="$(mktemp /tmp/em_e2e_host.XXXXXX)"
 
 HOST_PID=""
 LOG_PID=""
@@ -47,14 +48,14 @@ APP="$ROOT/ios/build/e2e/Build/Products/Debug-iphonesimulator/EternalMonitor.app
 [ -d "$APP" ] || { echo "FAIL: app bundle not found at $APP"; exit 1; }
 
 echo "==> Building host"
-cargo build -q -p eternal-host
+cargo build -q --release -p eternal-host
 
 echo "==> Starting host on 127.0.0.1:$PORT (synthetic ${SYNTH_W}x${SYNTH_H}, libx264, headless)"
 ETERNAL_HEADLESS=1 \
 ETERNAL_CAPTURE=synthetic \
 ETERNAL_SYNTH_SIZE="${SYNTH_W}x${SYNTH_H}" \
 ETERNAL_ENCODER=libx264 \
-    "$ROOT/target/debug/eternal-host" "$PORT" >"$HOST_LOG" 2>&1 &
+    "$ROOT/target/release/eternal-host" "$PORT" >"$HOST_LOG" 2>&1 &
 HOST_PID=$!
 
 echo "==> Booting simulator: $SIM_NAME"
