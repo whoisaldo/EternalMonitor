@@ -24,14 +24,18 @@ struct DisplayView: View {
                 })
                 .ignoresSafeArea()
             } else {
+                // One gesture, one meaning: tap toggles the HUD. (The old
+                // single-tap-hide + triple-tap-toggle pair made every triple
+                // tap race its own first tap.)
                 MetalView()
                     .ignoresSafeArea()
-                    .onTapGesture(count: 3) {
-                        showHUD.toggle()
-                        scheduleHUDDismiss()
-                    }
-                    .onTapGesture(count: 1) {
-                        if showHUD { withAnimation(.easeOut(duration: 0.25)) { showHUD = false } }
+                    .onTapGesture {
+                        if showHUD {
+                            hudDismissTask?.cancel()
+                            withAnimation(.easeOut(duration: 0.25)) { showHUD = false }
+                        } else {
+                            scheduleHUDDismiss()
+                        }
                     }
             }
 
@@ -69,6 +73,11 @@ struct DisplayView: View {
         .persistentSystemOverlays(.hidden)
         .onAppear { scheduleHUDDismiss() }
         .onDisappear { hudDismissTask?.cancel() }
+        .onChange(of: settings.keepScreenAwake) { _, keepAwake in
+            // Apply mid-session — the whole point of flipping it is the
+            // screen dimming (or not) right now.
+            UIApplication.shared.isIdleTimerDisabled = keepAwake
+        }
     }
 
     // MARK: - HUD overlay
@@ -106,6 +115,15 @@ struct DisplayView: View {
                         .strokeBorder(Theme.hairline, lineWidth: 1)
                 )
         )
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel(hudAccessibilitySummary)
+    }
+
+    private var hudAccessibilitySummary: String {
+        let latency = connectionManager.stats.e2eMs.map { String(format: "%.0f milliseconds", $0) }
+            ?? "unknown latency"
+        return "Stream statistics: \(Int(connectionManager.fps)) frames per second, "
+            + "\(latency), \(connectionManager.stats.bars) of 4 signal bars"
     }
 
     private var qualityBars: some View {
@@ -178,6 +196,10 @@ struct DisplayView: View {
                     .font(.appMonoRegular(size: 12))
                     .foregroundColor(Theme.text2)
             }
+            .accessibilityElement(children: .ignore)
+            .accessibilityLabel(
+                connectionManager.signalLost ? "Signal lost, reconnecting" : "On air"
+            )
             .padding(.horizontal, 14)
             .padding(.vertical, 9)
             .background(

@@ -283,10 +283,10 @@ impl Session {
         }
         session.liveness_deadline = now + LIVENESS_TIMEOUT;
 
-        let granted = match session.last_keyframe_grant {
-            Some(last) if now.duration_since(last) < KEYFRAME_REQUEST_MIN_INTERVAL => false,
-            _ => true,
-        };
+        let granted = !matches!(
+            session.last_keyframe_grant,
+            Some(last) if now.duration_since(last) < KEYFRAME_REQUEST_MIN_INTERVAL
+        );
         if granted {
             session.last_keyframe_grant = Some(now);
             info!(reason = ?request.reason, "Keyframe requested by client — forcing IDR");

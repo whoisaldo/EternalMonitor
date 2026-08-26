@@ -27,9 +27,12 @@ struct EternalMonitorApp: App {
         .onChange(of: scenePhase) { _, phase in
             // A backgrounded app cannot keep receiving UDP; tell the host
             // goodbye so it stops streaming (and can tear the virtual display
-            // down) instead of timing out on liveness.
+            // down) instead of timing out on liveness. Coming back to the
+            // foreground resumes the interrupted session (opt-out toggle).
             if phase == .background {
                 connectionManager.handleAppBackgrounded()
+            } else if phase == .active {
+                connectionManager.handleAppForegrounded()
             }
         }
     }

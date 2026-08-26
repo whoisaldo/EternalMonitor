@@ -14,10 +14,11 @@ const RE_ADVERT_INTERVAL: Duration = Duration::from_secs(60);
 /// so the iOS app's NetworkScanner (NWBrowser) can discover it.
 ///
 /// Also spawns a background thread that re-registers the service every 60s.
-/// Some routers and clients suppress mDNS TTL refreshes; an explicit
-/// unregister/register cycle restores discoverability.
+/// Some routers and clients suppress mDNS TTL refreshes; `register` is a
+/// documented upsert in mdns-sd, so the refresh never takes the service off
+/// the air (the old unregister-first cycle opened a ~1s discovery hole).
 ///
-/// Returns the `ServiceDaemon` handle — dropping it unregisters the service.
+/// Returns the `ServiceDaemon` handle — call [`say_goodbye`] on it at exit.
 pub fn advertise_service(port: u16) -> Option<ServiceDaemon> {
     let mdns = match ServiceDaemon::new() {
         Ok(d) => d,
@@ -53,18 +54,17 @@ pub fn advertise_service(port: u16) -> Option<ServiceDaemon> {
     let mdns_clone = mdns.clone();
     let host_fqdn_for_thread = host_fqdn.clone();
     let instance_for_thread = instance_name.clone();
-    let full_name_for_thread = full_name;
+    let _ = full_name; // fullname only mattered for the old unregister cycle
     thread::spawn(move || loop {
         thread::sleep(RE_ADVERT_INTERVAL);
-        if let Err(error) = mdns_clone.unregister(&full_name_for_thread) {
-            warn!(error = %error, "mDNS unregister before re-advertisement failed");
-        }
         let Some(info) = build_service_info(port, &host_fqdn_for_thread, &instance_for_thread)
         else {
             warn!("mDNS re-advertisement: failed to rebuild ServiceInfo");
             continue;
         };
         let addrs: Vec<_> = info.get_addresses().iter().copied().collect();
+        // Plain upsert: the service stays continuously advertised (addresses
+        // may have changed, e.g. DHCP renew or interface flap).
         match mdns_clone.register(info) {
             Ok(_) => info!(addrs = ?addrs, "mDNS re-advertisement"),
             Err(error) => warn!(error = %error, "mDNS re-advertisement register failed"),
@@ -74,8 +74,24 @@ pub fn advertise_service(port: u16) -> Option<ServiceDaemon> {
     Some(mdns)
 }
 
+/// Send mDNS goodbye packets and stop the daemon. Called on the way out so
+/// iPads drop the host from their scan list promptly instead of waiting for
+/// the TTL to lapse. The short grace period lets the goodbyes hit the wire —
+/// `std::process::exit` would otherwise cut them off.
+pub fn say_goodbye(mdns: ServiceDaemon) {
+    if mdns.shutdown().is_ok() {
+        thread::sleep(Duration::from_millis(300));
+        info!("mDNS goodbye sent");
+    }
+}
+
 fn build_service_info(port: u16, host_fqdn: &str, instance_name: &str) -> Option<ServiceInfo> {
-    let properties = [("version", "0.1.2"), ("platform", "windows")];
+    let platform = if cfg!(windows) { "windows" } else { "other" };
+    let properties = [
+        ("version", env!("CARGO_PKG_VERSION")),
+        ("proto", "2"),
+        ("platform", platform),
+    ];
     match ServiceInfo::new(
         SERVICE_TYPE,
         instance_name,
