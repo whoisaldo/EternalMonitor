@@ -61,10 +61,23 @@ choose "Auto (primary)" and Restart stream again.
 The extra screen only exists while the iPad is connected and using it - when
 you quit EternalMonitor it disappears, so there's no leftover monitor.
 
+Step 6 - Control the PC from the iPad
+-------------------------------------
+Your touches control the PC while streaming (on by default):
+
+- Tap            = left click          - Drag        = move the mouse
+- Two fingers    = scroll              - Hold ~0.5s  = right click
+- Apple Pencil   = draws immediately   - 3-finger tap = show/hide the stats
+
+To make the iPad view-only, turn off "Control PC with touch" in the iPad
+app's Settings and reconnect.
+
 If the video is choppy or laggy
 -------------------------------
 - This is almost always Wi-Fi, not the app. Get close to the router, use
-  5 GHz instead of 2.4 GHz, or plug the PC into Ethernet.
+  5 GHz instead of 2.4 GHz, or plug the PC into Ethernet. The app now
+  lowers its quality automatically on a bad connection and sharpens back
+  up when it improves - brief softness is it coping, not breaking.
 - Open the "Performance" tab and check the Codec. If it reads "H.264 (x264)"
   you are encoding on the CPU (slow) because the hardware encoder didn't
   start - update your GPU drivers and click "Restart stream".

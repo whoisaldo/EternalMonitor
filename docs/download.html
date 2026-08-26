@@ -45,7 +45,7 @@
   <section class="download-hero">
     <div class="container">
       <h1>Download EternalMonitor</h1>
-      <p>Windows host + iPad app &middot; v0.1.2-mirror</p>
+      <p>Windows host + iPad app &middot; matching versions required</p>
     </div>
   </section>
 
@@ -58,7 +58,7 @@
         <div class="download-card-header">
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="3" width="20" height="14" rx="2"/><path d="M8 21h8"/><path d="M12 17v4"/></svg>
           <h2>Windows Host</h2>
-          <span class="badge badge-green" id="release-version">v0.1.2</span>
+          <span class="badge badge-green" id="release-version">latest</span>
         </div>
         <p>Runs on your PC. Captures and streams your display.</p>
         <div class="download-requirements">
@@ -100,12 +100,13 @@
           <h3>Requirements</h3>
           <ul class="build-reqs">
             <li>Rust stable MSVC</li>
-            <li>FFmpeg 7.1</li>
+            <li>FFmpeg 7.1 shared SDK (set <code>FFMPEG_DIR</code>)</li>
             <li>GPU with hardware encoder (NVIDIA/AMD/Intel) or software fallback</li>
           </ul>
           <h3>Windows Host</h3>
           <pre><code>git clone https://github.com/whoisaldo/EternalMonitor
 cd EternalMonitor
+$env:FFMPEG_DIR = "C:\ffmpeg"   # your FFmpeg 7.1 shared SDK
 cargo build --release -p eternal-host</code></pre>
           <h3>iPad App</h3>
           <pre><code>cd ios

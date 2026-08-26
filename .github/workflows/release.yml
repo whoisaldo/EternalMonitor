@@ -1,0 +1,116 @@
+name: Release
+
+# Tagging vX.Y.Z builds the Windows installer and publishes a GitHub release
+# with its SHA-256 in the body (docs/download.html reads both from the
+# releases API). workflow_dispatch runs the same build WITHOUT publishing —
+# the dry-run mode for validating this pipeline.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  # The bundled Virtual Display Driver (VirtualDrivers/Virtual-Display-Driver,
+  # MIT). Pinned: the installer's scheduled tasks and lifecycle handling are
+  # verified against this exact version.
+  VDD_RELEASE_TAG: "25.5.2"
+  VDD_ASSET: "Virtual.Display.Driver-v25.05.03-setup-x64.exe"
+
+jobs:
+  windows-installer:
+    name: Windows installer
+    runs-on: windows-2022
+    timeout-minutes: 60
+    env:
+      LIBCLANG_PATH: C:\Program Files\LLVM\bin
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Cache FFmpeg 7.1.1 shared SDK
+        id: ffmpeg-cache
+        uses: actions/cache@v4
+        with:
+          path: C:\ffmpeg
+          key: ffmpeg-7.1.1-full_build-shared
+
+      - name: Download FFmpeg 7.1.1 shared SDK
+        if: steps.ffmpeg-cache.outputs.cache-hit != 'true'
+        shell: pwsh
+        run: |
+          $url = "https://github.com/GyanD/codexffmpeg/releases/download/7.1.1/ffmpeg-7.1.1-full_build-shared.7z"
+          Invoke-WebRequest -Uri $url -OutFile ffmpeg.7z
+          7z x ffmpeg.7z -oC:\ffmpeg-extract | Out-Null
+          Move-Item C:\ffmpeg-extract\ffmpeg-7.1.1-full_build-shared C:\ffmpeg
+
+      - name: Configure FFmpeg environment
+        shell: pwsh
+        run: |
+          "FFMPEG_DIR=C:\ffmpeg" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "C:\ffmpeg\bin" | Out-File -FilePath $env:GITHUB_PATH -Append
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Download the bundled virtual display driver
+        shell: pwsh
+        run: |
+          $dest = "installer\vendor\vdd"
+          $url = "https://github.com/VirtualDrivers/Virtual-Display-Driver/releases/download/$env:VDD_RELEASE_TAG/$env:VDD_ASSET"
+          Invoke-WebRequest -Uri $url -OutFile (Join-Path $dest $env:VDD_ASSET)
+          # Its MIT license text, redistributed alongside the binary.
+          Invoke-WebRequest -Uri "https://raw.githubusercontent.com/VirtualDrivers/Virtual-Display-Driver/$env:VDD_RELEASE_TAG/LICENSE" `
+              -OutFile (Join-Path $dest "LICENSE-VirtualDisplayDriver.txt")
+
+      - name: Verify the driver's Authenticode signature
+        shell: pwsh
+        run: |
+          $sig = Get-AuthenticodeSignature "installer\vendor\vdd\$env:VDD_ASSET"
+          Write-Host "Signature status: $($sig.Status)  Signer: $($sig.SignerCertificate.Subject)"
+          if ($sig.Status -ne "Valid") {
+              throw "Driver signature is '$($sig.Status)' — refusing to release an unverified driver."
+          }
+
+      - name: Install Inno Setup
+        shell: pwsh
+        run: choco install innosetup -y --no-progress
+
+      - name: Build the installer (strict driver signature)
+        shell: pwsh
+        run: .\scripts\build-installer.ps1 -StrictSignature
+
+      - name: Compute SHA-256
+        id: hash
+        shell: pwsh
+        run: |
+          $hash = (Get-FileHash "build\out\EternalMonitor-Setup.exe" -Algorithm SHA256).Hash
+          "sha256=$hash" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          Write-Host "SHA256: $hash"
+
+      - name: Upload installer artifact (dry runs and debugging)
+        uses: actions/upload-artifact@v4
+        with:
+          name: EternalMonitor-Setup
+          path: build\out\EternalMonitor-Setup.exe
+
+      - name: Publish GitHub release
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $tag = $env:GITHUB_REF_NAME
+          $sha = "${{ steps.hash.outputs.sha256 }}"
+          $lines = @(
+              "EternalMonitor $tag — see [RELEASE_NOTES.md](https://github.com/whoisaldo/EternalMonitor/blob/main/RELEASE_NOTES.md) for what's new.",
+              "",
+              "**EternalMonitor-Setup.exe SHA-256:**",
+              '```',
+              $sha,
+              '```'
+          )
+          gh release create $tag "build\out\EternalMonitor-Setup.exe" `
+              --title "EternalMonitor $tag" `
+              --notes ($lines -join "`n")

@@ -8,11 +8,19 @@
 #   installer\vendor\vdd\   (see that folder's README.txt for the exact file).
 # Without it, the build still succeeds and produces an app-only installer.
 
+param(
+    # Release builds (CI) pass this: an unsigned or invalidly-signed bundled
+    # driver then FAILS the build instead of warning. Local developer builds
+    # keep the warning so an unsigned test driver doesn't block iteration.
+    [switch]$StrictSignature
+)
+
 $ErrorActionPreference = "Stop"
 $repo = Split-Path -Parent $PSScriptRoot
 Set-Location $repo
 
-$version = "0.1.2"
+$version = [regex]::Match((Get-Content -Raw "host\Cargo.toml"), 'version\s*=\s*"([^"]+)"').Groups[1].Value
+if (-not $version) { throw "Could not read the package version from host\Cargo.toml" }
 $staging = Join-Path $repo "build\installer-staging"
 $outDir  = Join-Path $repo "build\out"
 
@@ -33,7 +41,7 @@ Write-Host "[setup] ISCC: $iscc"
 
 # --- Build the release binary ----------------------------------------------------
 Write-Host "[1/5] Building release binary..."
-cargo build --release -p eternal-host
+cargo build --release --locked -p eternal-host
 if ($LASTEXITCODE -ne 0) { throw "cargo build failed" }
 
 # --- Stage the payload -----------------------------------------------------------
@@ -44,14 +52,17 @@ New-Item -ItemType Directory -Path $outDir -Force | Out-Null
 
 Copy-Item "target\release\eternal-host.exe" (Join-Path $staging "EternalMonitor-host.exe")
 
-# FFmpeg runtime DLLs + utility, resolved from .cargo/config.toml (same as package.ps1).
-$cargoConfig = Get-Content -Raw ".cargo\config.toml"
-$ffmpegMatch = [regex]::Match($cargoConfig, 'FFMPEG_DIR\s*=\s*\{\s*value\s*=\s*"([^"]+)"')
-if (-not $ffmpegMatch.Success) {
-    $ffmpegMatch = [regex]::Match($cargoConfig, 'FFMPEG_DIR\s*=\s*"([^"]+)"')
+# FFmpeg runtime DLLs + utility. FFMPEG_DIR (the same env var the build uses)
+# wins; .cargo\config.toml is the fallback for developer machines that pin it there.
+$ffmpegDir = $env:FFMPEG_DIR
+if (-not $ffmpegDir -and (Test-Path ".cargo\config.toml")) {
+    $cargoConfig = Get-Content -Raw ".cargo\config.toml"
+    $m = [regex]::Match($cargoConfig, 'FFMPEG_DIR\s*=\s*\{\s*value\s*=\s*"([^"]+)"')
+    if (-not $m.Success) { $m = [regex]::Match($cargoConfig, 'FFMPEG_DIR\s*=\s*"([^"]+)"') }
+    if ($m.Success) { $ffmpegDir = $m.Groups[1].Value }
 }
-if (-not $ffmpegMatch.Success) { throw "Could not resolve FFMPEG_DIR from .cargo/config.toml" }
-$ffmpegBin = Join-Path $ffmpegMatch.Groups[1].Value "bin"
+if (-not $ffmpegDir) { throw "FFMPEG_DIR is not set. Point it at your FFmpeg 7.1 shared SDK (the folder containing bin\avcodec-*.dll)." }
+$ffmpegBin = Join-Path $ffmpegDir "bin"
 Copy-Item "$ffmpegBin\*.dll" $staging
 if (Test-Path "$ffmpegBin\ffmpeg.exe") { Copy-Item "$ffmpegBin\ffmpeg.exe" $staging }
 
@@ -68,11 +79,18 @@ $includeDriver = $false
 if ($driverSetup) {
     $sig = Get-AuthenticodeSignature $driverSetup.FullName
     if ($sig.Status -ne "Valid") {
+        if ($StrictSignature) {
+            throw "Driver setup signature is '$($sig.Status)', expected 'Valid'. Refusing to bundle an unverified driver in a release build."
+        }
         Write-Warning "Driver setup signature is '$($sig.Status)', expected 'Valid'. Bundling anyway — verify the source."
     }
     $driverStage = Join-Path $staging "driver"
     New-Item -ItemType Directory -Path $driverStage | Out-Null
     Copy-Item $driverSetup.FullName (Join-Path $driverStage "vdd-setup-x64.exe")
+    # Redistribute the driver's license alongside it (it's a separate MIT
+    # project we bundle, not code we link).
+    Get-ChildItem $vddDir -Filter "LICENSE*" -ErrorAction SilentlyContinue |
+        ForEach-Object { Copy-Item $_.FullName $driverStage }
     $includeDriver = $true
     Write-Host "      Bundling driver: $($driverSetup.Name)  [signature: $($sig.Status)]"
 } else {
