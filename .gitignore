@@ -1,5 +1,6 @@
 .claude/
 CLAUDE.md
+CODEBASE.md
 ROADMAP.md
 .cargo/
 .cargo-home/
@@ -20,3 +21,6 @@ GIT_POLICY.md
 
 # iOS archive/export artifacts
 ios/build/
+
+# Generated Xcode project — project.yml is the source of truth (run `xcodegen generate` in ios/)
+ios/EternalMonitor.xcodeproj/
