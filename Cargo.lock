@@ -1071,7 +1071,7 @@ name = "eternal-host"
 version = "0.1.2"
 dependencies = [
  "eframe",
- "eternal-proto",
+ "eternal-wire",
  "ffmpeg-next",
  "libc",
  "mdns-sd",
@@ -1088,10 +1088,11 @@ dependencies = [
 ]
 
 [[package]]
-name = "eternal-proto"
-version = "0.1.0"
+name = "eternal-wire"
+version = "0.2.0"
 dependencies = [
  "flatbuffers",
+ "tracing",
 ]
 
 [[package]]

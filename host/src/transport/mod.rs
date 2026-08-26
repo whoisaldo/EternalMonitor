@@ -1,5 +1,3 @@
-pub mod fragment;
-
 use std::net::SocketAddr;
 use std::sync::mpsc as std_mpsc;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -12,7 +10,7 @@ use tracing::{debug, info, warn};
 use crate::control::{SharedControl, SupervisorCommand};
 use crate::encoder::NALUnit;
 use crate::stats::PIPELINE_STATS;
-use fragment::{FragmentHeader, HEADER_SIZE, MAX_PAYLOAD_SIZE};
+use eternal_wire::v1_fragment::{FragmentHeader, HEADER_SIZE, MAX_PAYLOAD_SIZE};
 
 /// Magic bytes that the iPad sends to register itself as a receiver.
 const HELLO_MAGIC: &[u8] = b"ETERNALHELLO";
@@ -119,7 +117,7 @@ pub async fn start_sender(
                     (w.max(1), h.max(1))
                 };
 
-                let fb_bytes = eternal_proto::frame::serialize_frame_packet(
+                let fb_bytes = eternal_wire::frame::serialize_frame_packet(
                     seq,
                     timestamp_us,
                     &nal.data,

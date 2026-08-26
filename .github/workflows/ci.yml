@@ -20,8 +20,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: Swatinem/rust-cache@v2
+      - name: Check formatting
+        run: cargo fmt --check -p eternal-wire
       - name: Test pure crates
-        run: cargo test -p eternal-proto --locked
+        run: cargo test -p eternal-wire --locked
 
   rust-windows:
     name: Rust (windows, full host)
@@ -74,12 +76,19 @@ jobs:
       - name: Generate Xcode project
         working-directory: ios
         run: xcodegen generate
-      - name: Build for iOS Simulator
+      - name: Create iPad simulator
+        id: sim
+        run: |
+          DEVICE_TYPE=$(xcrun simctl list devicetypes | grep -oE 'com\.apple\.CoreSimulator\.SimDeviceType\.iPad[A-Za-z0-9-]*' | head -1)
+          echo "Using device type: $DEVICE_TYPE"
+          UDID=$(xcrun simctl create citest "$DEVICE_TYPE")
+          echo "udid=$UDID" >> "$GITHUB_OUTPUT"
+      - name: Build and test on iOS Simulator
         working-directory: ios
         run: |
           set -o pipefail
-          xcodebuild build \
+          xcodebuild test \
             -project EternalMonitor.xcodeproj \
             -scheme EternalMonitor \
-            -destination 'generic/platform=iOS Simulator' \
-            CODE_SIGNING_ALLOWED=NO | tail -50
+            -destination "platform=iOS Simulator,id=${{ steps.sim.outputs.udid }}" \
+            CODE_SIGNING_ALLOWED=NO | tail -80
