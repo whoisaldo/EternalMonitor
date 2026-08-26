@@ -54,11 +54,18 @@ const STORM_LIMIT: usize = 6;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SupervisorState {
-    Running { generation: u64 },
+    Running {
+        generation: u64,
+    },
     /// Waiting out a backoff before the next automatic restart.
-    BackingOff { until: Instant, attempt: u32 },
+    BackingOff {
+        until: Instant,
+        attempt: u32,
+    },
     /// Too many automatic restarts in the window; a manual Start is required.
-    Failed { reason: String },
+    Failed {
+        reason: String,
+    },
     Stopped,
     ShutDown,
 }
@@ -160,7 +167,8 @@ impl Machine {
     }
 
     fn auto_restart(&mut self, stage: Stage, reason: &str, now: Instant) -> Effect {
-        self.restarts.retain(|at| now.duration_since(*at) < STORM_WINDOW);
+        self.restarts
+            .retain(|at| now.duration_since(*at) < STORM_WINDOW);
         if self.restarts.len() >= STORM_LIMIT {
             let message = format!(
                 "{stage:?} failed repeatedly ({} restarts in {}s): {reason}",
@@ -228,16 +236,31 @@ impl HealthReporter {
     }
 }
 
-/// The runtime loop. Replaces `pipeline::supervisor_loop` with health-driven
-/// auto-restarts, bounded joins, and Start/Stop support.
+/// The runtime loop: health-driven auto-restarts, bounded joins, watchdogs,
+/// and Start/Stop support. Consumes the public `SupervisorCommand` channel
+/// (GUI + transport) by forwarding it into the internal health channel.
 pub fn run(
     listen_port: u16,
     shared: SharedControl,
     gpu_info: GpuInfo,
-    sup_tx: mpsc::Sender<SupMsg>,
-    sup_rx: mpsc::Receiver<SupMsg>,
     command_tx: mpsc::Sender<SupervisorCommand>,
+    command_rx: mpsc::Receiver<SupervisorCommand>,
 ) {
+    let (sup_tx, sup_rx) = mpsc::channel::<SupMsg>();
+    {
+        let forward = sup_tx.clone();
+        std::thread::Builder::new()
+            .name("supervisor-cmd-forwarder".into())
+            .spawn(move || {
+                for command in command_rx {
+                    if forward.send(SupMsg::Command(command)).is_err() {
+                        break;
+                    }
+                }
+            })
+            .expect("spawn command forwarder");
+    }
+
     let mut generation = CURRENT_GENERATION.fetch_add(1, Ordering::SeqCst) + 1;
     let mut machine = Machine::new(generation);
     let mut pipeline = Some(spawn_generation(
@@ -269,7 +292,16 @@ pub fn run(
                 stage,
                 outcome,
             }) => machine.on_stage_exit(g, stage, &outcome, now),
-            Err(mpsc::RecvTimeoutError::Timeout) => machine.on_tick(now),
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                let ticked = machine.on_tick(now);
+                if ticked != Effect::None {
+                    ticked
+                } else if let Some(reason) = wedge_reason(&shared, &machine) {
+                    machine.on_wedged(&reason, now)
+                } else {
+                    Effect::None
+                }
+            }
             Err(mpsc::RecvTimeoutError::Disconnected) => break,
         };
 
@@ -308,6 +340,54 @@ pub fn run(
         }
     }
     info!("Supervisor loop ended");
+}
+
+/// Watchdog rules over the heartbeat atomics. Only meaningful while Running
+/// and after the pipeline has had a moment to warm up.
+fn wedge_reason(shared: &SharedControl, machine: &Machine) -> Option<String> {
+    if !matches!(machine.state, SupervisorState::Running { .. }) {
+        return None;
+    }
+    let now_ms = crate::clock::host_now_us() / 1000;
+    let loop_ms = shared.hb_capture_loop_ms.load(Ordering::Relaxed);
+    let frame_ms = shared.hb_capture_frame_ms.load(Ordering::Relaxed);
+    let encode_ms = shared.hb_encode_frame_ms.load(Ordering::Relaxed);
+
+    // Capture loop stopped iterating entirely (a wedged AcquireNextFrame /
+    // driver call): the loop stamps every iteration including idle timeouts.
+    if loop_ms > 0 && now_ms.saturating_sub(loop_ms) > 3_000 {
+        return Some(format!(
+            "capture loop silent for {}ms",
+            now_ms.saturating_sub(loop_ms)
+        ));
+    }
+
+    // A client is connected but no frame has been produced for 5s. Sound
+    // because the idle keepalive guarantees a frame at least every ~750ms
+    // while a client is registered.
+    let client_connected = {
+        let addr = *shared.target_addr.lock();
+        !addr.ip().is_unspecified() && addr.port() != 0
+    };
+    if client_connected && frame_ms > 0 && now_ms.saturating_sub(frame_ms) > 5_000 {
+        return Some(format!(
+            "no captured frame for {}ms with a client connected",
+            now_ms.saturating_sub(frame_ms)
+        ));
+    }
+
+    // Frames flow but nothing comes out of the encoder: encoder wedged.
+    if frame_ms > 0
+        && encode_ms > 0
+        && frame_ms.saturating_sub(encode_ms) > 3_000
+        && now_ms.saturating_sub(encode_ms) > 3_000
+    {
+        return Some(format!(
+            "encoder silent for {}ms while capture advances",
+            now_ms.saturating_sub(encode_ms)
+        ));
+    }
+    None
 }
 
 fn spawn_generation(
@@ -358,7 +438,9 @@ fn spawn_generation(
 /// poisoned the zombie (its health reports are filtered and its channel sends
 /// fail as the new generation's stages replace the endpoints).
 fn bounded_join(pipeline: &mut Option<std::thread::JoinHandle<()>>, generation: u64) {
-    let Some(handle) = pipeline.take() else { return };
+    let Some(handle) = pipeline.take() else {
+        return;
+    };
     let deadline = Instant::now() + Duration::from_secs(5);
     while !handle.is_finished() {
         if Instant::now() >= deadline {
@@ -393,9 +475,15 @@ mod tests {
         assert!(matches!(machine.state, SupervisorState::BackingOff { .. }));
 
         // Before the backoff elapses: no start.
-        assert_eq!(machine.on_tick(t0 + Duration::from_millis(100)), Effect::None);
+        assert_eq!(
+            machine.on_tick(t0 + Duration::from_millis(100)),
+            Effect::None
+        );
         // After: start.
-        assert_eq!(machine.on_tick(t0 + Duration::from_millis(600)), Effect::Start);
+        assert_eq!(
+            machine.on_tick(t0 + Duration::from_millis(600)),
+            Effect::Start
+        );
         machine.note_started(2);
         assert!(matches!(
             machine.state,
@@ -435,10 +523,7 @@ mod tests {
 
         // Ticks do nothing in Failed; a manual Start recovers.
         assert_eq!(machine.on_tick(t0 + Duration::from_secs(600)), Effect::None);
-        assert_eq!(
-            machine.on_command(&SupervisorCommand::Start),
-            Effect::Start
-        );
+        assert_eq!(machine.on_command(&SupervisorCommand::Start), Effect::Start);
     }
 
     #[test]
@@ -454,10 +539,7 @@ mod tests {
             machine.on_stage_exit(1, Stage::Capture, &failed("late"), Instant::now()),
             Effect::None
         );
-        assert_eq!(
-            machine.on_command(&SupervisorCommand::Start),
-            Effect::Start
-        );
+        assert_eq!(machine.on_command(&SupervisorCommand::Start), Effect::Start);
     }
 
     #[test]

@@ -78,6 +78,16 @@ struct ParsedBitstream {
     units: Vec<Vec<u8>>,
 }
 
+/// Access-unit facts computed during normalization, so callers never
+/// re-parse the packet to answer "is this a keyframe?".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AuInfo {
+    pub contains_idr: bool,
+    /// All-intra AU without an IDR NAL (AMF's forced periodic intra) — still a
+    /// random-access point.
+    pub intra_only: bool,
+}
+
 /// Rewrites one encoded packet into clean Annex B, injecting cached SPS/PPS
 /// according to the per-encoder rules the iPad decoder depends on.
 pub fn normalize_h264_payload(
@@ -86,6 +96,18 @@ pub fn normalize_h264_payload(
     state: &mut H264BitstreamState,
     encoder_name: &str,
 ) -> Vec<u8> {
+    normalize_h264_payload_with_info(data, packet_is_key, state, encoder_name).0
+}
+
+/// Single-pass variant: the NAL units are parsed ONCE and the keyframe facts
+/// come back alongside the normalized payload (the old hot path re-parsed the
+/// packet up to three more times per frame to recompute them).
+pub fn normalize_h264_payload_with_info(
+    data: &[u8],
+    packet_is_key: bool,
+    state: &mut H264BitstreamState,
+    encoder_name: &str,
+) -> (Vec<u8>, AuInfo) {
     let parsed = parse_h264_bitstream(data);
     if is_amf_encoder(encoder_name) && state.amf_packet_logs < 10 {
         let nal_types: Vec<String> = parsed
@@ -123,7 +145,13 @@ pub fn normalize_h264_payload(
     }
 
     if parsed.units.is_empty() {
-        return data.to_vec();
+        return (
+            data.to_vec(),
+            AuInfo {
+                contains_idr: false,
+                intra_only: false,
+            },
+        );
     }
 
     state.update_parameter_sets_from_units(&parsed.units);
@@ -137,7 +165,10 @@ pub fn normalize_h264_payload(
     // `contains_idr` are both false. The iPad still treats an intra-only access unit as a
     // random-access point and recreates its decoder on it, so it must carry SPS/PPS too;
     // otherwise a decoder that lost its parameter sets can never resync on these frames.
-    let intra_only = is_amf && units_are_intra_only(&parsed.units);
+    // Computed for ALL encoders here (cheap Exp-Golomb over slice headers) so the
+    // caller's keyframe decision matches the old semantics without a re-parse.
+    let intra_only_any = units_are_intra_only(&parsed.units);
+    let intra_only = is_amf && intra_only_any;
 
     // For AMF, prepend cached SPS/PPS on every random-access access unit, even if the encoder
     // already emitted them inline. iPad VideoToolbox is sensitive to GOP-boundary parameter
@@ -197,7 +228,13 @@ pub fn normalize_h264_payload(
         );
     }
 
-    output
+    (
+        output,
+        AuInfo {
+            contains_idr,
+            intra_only: intra_only_any,
+        },
+    )
 }
 
 fn parse_h264_bitstream(data: &[u8]) -> ParsedBitstream {
@@ -728,6 +765,35 @@ mod tests {
         let payload = [0, 0, 0, 1, 0x09, 0x30, 0, 0, 0, 1, 0x41, 0xB8];
 
         assert!(access_unit_is_intra_only(&payload));
+    }
+
+    #[test]
+    fn with_info_matches_separate_queries() {
+        // The single-pass facts must agree with the standalone helpers for
+        // every interesting shape.
+        let idr = vec![0u8, 0, 0, 1, 0x65, 0x88, 0x84];
+        let intra = vec![0u8, 0, 0, 1, 0x09, 0x30, 0, 0, 0, 1, 0x41, 0xB8];
+        let inter = vec![0u8, 0, 0, 1, 0x41, 0xE0];
+        for (payload, is_key) in [(&idr, true), (&intra, false), (&inter, false)] {
+            for encoder in ["h264_nvenc", "h264_amf", "libx264"] {
+                let mut a = H264BitstreamState::default();
+                let mut b = H264BitstreamState::default();
+                let old = normalize_h264_payload(payload, is_key, &mut a, encoder);
+                let (new, info) =
+                    normalize_h264_payload_with_info(payload, is_key, &mut b, encoder);
+                assert_eq!(old, new, "payload mismatch for {encoder}");
+                assert_eq!(
+                    info.contains_idr,
+                    contains_nal_type(&new, 5),
+                    "contains_idr mismatch for {encoder}"
+                );
+                assert_eq!(
+                    info.intra_only,
+                    access_unit_is_intra_only(&new),
+                    "intra_only mismatch for {encoder} on {payload:?}"
+                );
+            }
+        }
     }
 
     #[test]

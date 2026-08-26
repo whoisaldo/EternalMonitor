@@ -12,6 +12,7 @@ pub mod logging;
 pub mod pipeline;
 pub mod settings;
 pub mod stats;
+pub mod supervisor;
 pub mod transport;
 pub mod vdd;
 

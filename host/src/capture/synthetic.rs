@@ -11,12 +11,12 @@
 //! frames and assert real progression through the entire stack.
 
 use std::sync::atomic::Ordering;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use tokio::sync::mpsc;
 use tracing::info;
 
-use super::{frame_budget_for, RawFrame};
+use super::{frame_budget_for, heartbeat, FrameSlot, RawFrame};
 use crate::control::SharedControl;
 use crate::stats::PIPELINE_STATS;
 
@@ -48,12 +48,16 @@ fn synthetic_size() -> (u32, u32) {
 /// Mirrors the DXGI loop's contract: paced by `target_fps`, records capture
 /// stats, ships BGRA `RawFrame`s.
 pub fn run_capture_loop(
-    tx: mpsc::Sender<RawFrame>,
+    slot: &FrameSlot,
     shared: SharedControl,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let (width, height) = synthetic_size();
     let row_bytes = (width * 4) as usize;
-    let mut pixel_buf = vec![0u8; row_bytes * height as usize];
+    let frame_bytes = row_bytes * height as usize;
+    // Buffer recycling: after publishing, keep our Arc; once the encoder drops
+    // its clone, try_unwrap succeeds and the allocation is reused. Steady state
+    // is zero full-frame allocations.
+    let mut spare: Option<Arc<Vec<u8>>> = None;
     let mut frame_number: u64 = 0;
 
     info!(width, height, "Synthetic capture source active");
@@ -76,22 +80,27 @@ pub fn run_capture_loop(
         let frame_start = Instant::now();
         let frame_budget = frame_budget_for(shared.target_fps.load(Ordering::SeqCst));
 
+        heartbeat(&shared.hb_capture_loop_ms);
+
         frame_number += 1;
+        let mut pixel_buf = match spare.take().and_then(|arc| Arc::try_unwrap(arc).ok()) {
+            Some(buf) if buf.len() == frame_bytes => buf,
+            _ => vec![0u8; frame_bytes],
+        };
         render_synthetic_frame(&mut pixel_buf, width, height, frame_number);
 
         PIPELINE_STATS.lock().record_capture(width, height);
+        heartbeat(&shared.hb_capture_frame_ms);
 
-        let raw_frame = RawFrame {
+        let data = Arc::new(pixel_buf);
+        slot.publish(RawFrame {
             frame_number,
             timestamp: frame_start,
-            data: pixel_buf.clone(),
+            data: Arc::clone(&data),
             width,
             height,
-        };
-        if tx.blocking_send(raw_frame).is_err() {
-            info!("Channel closed, stopping capture");
-            break;
-        }
+        });
+        spare = Some(data);
 
         next_deadline += frame_budget;
         let now = Instant::now();

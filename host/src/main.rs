@@ -1,7 +1,7 @@
 use std::sync::mpsc;
 
 use eternal_host::control::{GuiControl, SharedControl};
-use eternal_host::pipeline::{self, DEFAULT_BITRATE_BPS};
+use eternal_host::pipeline::DEFAULT_BITRATE_BPS;
 use eternal_host::{capture, clock, discovery, gpu, gui, logging, stats, vdd};
 use tracing::{error, info};
 use tracing_subscriber::fmt::writer::MakeWriterExt;
@@ -127,7 +127,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     let supervisor_thread = std::thread::spawn(move || {
-        pipeline::supervisor_loop(listen_port, shared, gpu_info, supervisor_tx, supervisor_rx);
+        eternal_host::supervisor::run(listen_port, shared, gpu_info, supervisor_tx, supervisor_rx);
     });
 
     let _mdns = discovery::advertise_service(listen_port);

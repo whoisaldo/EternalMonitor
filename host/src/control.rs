@@ -1,5 +1,5 @@
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc};
 
 use parking_lot::Mutex;
@@ -31,6 +31,18 @@ pub struct SharedControl {
     /// Live status of the managed virtual extended display, surfaced in the GUI so a tester
     /// can see when an Extended-display request silently fell back to the primary monitor.
     pub vdd_status: Arc<Mutex<VddStatus>>,
+    /// Watchdog heartbeats (ms on the process clock, relaxed): the capture
+    /// loop's aliveness, the last produced frame, and the last encoded frame.
+    /// The supervisor detects wedged/starved stages from these.
+    pub hb_capture_loop_ms: Arc<AtomicU64>,
+    pub hb_capture_frame_ms: Arc<AtomicU64>,
+    pub hb_encode_frame_ms: Arc<AtomicU64>,
+    /// The client session. Lives here (not in the transport task) so a
+    /// pipeline restart — crash recovery, virtual-display toggle, settings
+    /// change — does NOT force the iPad through a fresh handshake: the new
+    /// transport resumes streaming to the same session and the epoch bump
+    /// resets the client's reassembly.
+    pub session: Arc<Mutex<crate::transport::session::Session>>,
 }
 
 /// Runtime state of the managed virtual extended display.
@@ -73,6 +85,15 @@ impl SharedControl {
             encoder_override: Arc::new(Mutex::new(None)),
             capture_target: Arc::new(Mutex::new(CaptureTarget::PrimaryAuto)),
             vdd_status: Arc::new(Mutex::new(VddStatus::Inactive)),
+            hb_capture_loop_ms: Arc::new(AtomicU64::new(0)),
+            hb_capture_frame_ms: Arc::new(AtomicU64::new(0)),
+            hb_encode_frame_ms: Arc::new(AtomicU64::new(0)),
+            session: Arc::new(Mutex::new(crate::transport::session::Session::new({
+                use std::hash::{BuildHasher, Hasher};
+                std::collections::hash_map::RandomState::new()
+                    .build_hasher()
+                    .finish() as u32
+            }))),
         }
     }
 
@@ -81,9 +102,14 @@ impl SharedControl {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SupervisorCommand {
+    /// Tear the current pipeline down and start a fresh generation.
     Restart,
+    /// Stop streaming (pipeline down, GUI stays). `Start` resumes.
+    Stop,
+    /// Start a fresh pipeline from Stopped/Failed.
+    Start,
     Shutdown,
 }
 
@@ -97,6 +123,18 @@ impl GuiControl {
     pub fn request_restart(&self) {
         if let Err(error) = self.supervisor_tx.send(SupervisorCommand::Restart) {
             warn!(error = %error, "Failed to send restart command");
+        }
+    }
+
+    pub fn request_stop(&self) {
+        if let Err(error) = self.supervisor_tx.send(SupervisorCommand::Stop) {
+            warn!(error = %error, "Failed to send stop command");
+        }
+    }
+
+    pub fn request_start(&self) {
+        if let Err(error) = self.supervisor_tx.send(SupervisorCommand::Start) {
+            warn!(error = %error, "Failed to send start command");
         }
     }
 

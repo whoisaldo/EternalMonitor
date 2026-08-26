@@ -18,7 +18,7 @@ use crate::encoder::NALUnit;
 use crate::stats::PIPELINE_STATS;
 use abr::AbrController;
 use pacer::FramePacer;
-use session::{Actions, ConfigSource, Session, HEARTBEAT_INTERVAL};
+use session::{Actions, ConfigSource, HEARTBEAT_INTERVAL};
 
 /// Monotonic per-process counter stamped into each media header's `stream_epoch`. Every
 /// `start_sender` (i.e. every pipeline run) gets a fresh value so the iPad can detect a stream
@@ -98,14 +98,6 @@ pub async fn start_sender(
         .lock()
         .set_target_addr(shared.target_addr.lock().to_string());
 
-    // Seed the session-id generator from ambient hasher entropy (no rand dep).
-    let seed = {
-        use std::hash::{BuildHasher, Hasher};
-        std::collections::hash_map::RandomState::new()
-            .build_hasher()
-            .finish() as u32
-    };
-    let mut session = Session::new(seed);
     let config = SharedConfigSource {
         shared: &shared,
         stream_epoch,
@@ -157,7 +149,7 @@ pub async fn start_sender(
                             Classified::Control(_) => {
                                 match eternal_wire::v2::control::parse_control(datagram) {
                                     Ok((_, message)) => {
-                                        let mut actions = session.handle_control(
+                                        let mut actions = shared.session.lock().handle_control(
                                             src, message, &config, Instant::now(),
                                         );
                                         if let Some(report) = actions.report.take() {
@@ -174,7 +166,10 @@ pub async fn start_sender(
                                                     .set_bitrate(decision.target_bps);
                                                 // One immediate notify; the 1s heartbeat's
                                                 // embedded config self-heals any loss.
-                                                let notify = session.stream_config_notify(&config);
+                                                let notify = shared
+                                                    .session
+                                                    .lock()
+                                                    .stream_config_notify(&config);
                                                 for (destination, datagram) in notify {
                                                     let _ = socket
                                                         .send_to(&datagram, destination)
@@ -191,7 +186,9 @@ pub async fn start_sender(
                                     }
                                 }
                             }
-                            Classified::LegacyHello => session.note_legacy_hello(src),
+                            Classified::LegacyHello => {
+                                shared.session.lock().note_legacy_hello(src)
+                            }
                             Classified::Media { .. } | Classified::Unknown => {
                                 debug!(peer = %src, len, "Ignored unexpected datagram");
                             }
@@ -202,7 +199,7 @@ pub async fn start_sender(
             }
             nal_opt = nal_rx.recv() => {
                 let Some(nal) = nal_opt else { break; };
-                let Some(session_id) = session.session_id() else { continue; };
+                let Some(session_id) = shared.session.lock().session_id() else { continue; };
                 let target_addr = *shared.target_addr.lock();
                 if target_addr.ip().is_unspecified() || target_addr.port() == 0 {
                     continue;
@@ -286,7 +283,7 @@ pub async fn start_sender(
                 );
             }
             _ = heartbeat.tick() => {
-                let actions = session.tick(&config, true, Instant::now());
+                let actions = shared.session.lock().tick(&config, true, Instant::now());
                 execute_actions(actions, &socket, &shared, &supervisor_tx).await;
             }
             _ = liveness_tick.tick() => {
@@ -294,7 +291,7 @@ pub async fn start_sender(
                     info!("Transport loop stopping on running=false");
                     break;
                 }
-                let actions = session.tick(&config, false, Instant::now());
+                let actions = shared.session.lock().tick(&config, false, Instant::now());
                 execute_actions(actions, &socket, &shared, &supervisor_tx).await;
             }
         }

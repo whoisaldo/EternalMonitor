@@ -207,7 +207,7 @@ fn synthetic_stream_end_to_end_v2() {
     let supervisor_shared = shared.clone();
     let supervisor_tx_clone = supervisor_tx.clone();
     let supervisor = std::thread::spawn(move || {
-        pipeline::supervisor_loop(
+        eternal_host::supervisor::run(
             listen_port,
             supervisor_shared,
             gpu_info,
@@ -405,7 +405,7 @@ fn lossy_stream_recovers_and_adapts() {
     let supervisor_shared = shared.clone();
     let supervisor_tx_clone = supervisor_tx.clone();
     let supervisor = std::thread::spawn(move || {
-        pipeline::supervisor_loop(
+        eternal_host::supervisor::run(
             listen_port,
             supervisor_shared,
             gpu_info,
@@ -509,6 +509,137 @@ fn lossy_stream_recovers_and_adapts() {
 
     std::env::remove_var("ETERNAL_DROP");
 
+    shared.stop();
+    supervisor_tx
+        .send(SupervisorCommand::Shutdown)
+        .expect("send shutdown");
+    let (done_tx, done_rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = supervisor.join();
+        let _ = done_tx.send(());
+    });
+    done_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("supervisor must shut down within 5s");
+}
+
+/// An encoder crash mid-stream must be contained by the supervisor: automatic
+/// restart with backoff, a fresh stream epoch, and the SAME session resuming
+/// (the client never re-handshakes; its assembler resets on the epoch bump).
+#[test]
+fn encoder_crash_auto_restarts_and_stream_recovers() {
+    let _guard = ENV_LOCK.lock().unwrap();
+    init_test_tracing();
+    let _ = ffmpeg_next::init();
+
+    std::env::set_var("ETERNAL_SYNTH_SIZE", format!("{SYNTH_W}x{SYNTH_H}"));
+    std::env::set_var("ETERNAL_CAPTURE", "synthetic");
+    std::env::remove_var("ETERNAL_DROP");
+    std::env::set_var("ETERNAL_FAULT_ENCODER_AFTER", "45");
+
+    let listen_port = free_udp_port();
+    let shared = SharedControl::new(listen_port, pipeline::DEFAULT_BITRATE_BPS);
+    *shared.encoder_override.lock() = Some("libx264".to_string());
+    let gpu_info = GpuInfo::software_fallback();
+
+    let (supervisor_tx, supervisor_rx) = mpsc::channel();
+    let supervisor_shared = shared.clone();
+    let supervisor_tx_clone = supervisor_tx.clone();
+    let supervisor = std::thread::spawn(move || {
+        eternal_host::supervisor::run(
+            listen_port,
+            supervisor_shared,
+            gpu_info,
+            supervisor_tx_clone,
+            supervisor_rx,
+        );
+    });
+
+    let mut receiver = FakeReceiver::connect(listen_port);
+    let original_session = receiver.session_id;
+
+    let deadline = Instant::now() + DEADLINE;
+    let mut reassembler = Reassembler::new();
+    let mut decoder = H264TestDecoder::new();
+    let mut datagram = [0u8; 2048];
+
+    let mut epochs_seen: Vec<u32> = Vec::new();
+    let mut decoded_first_epoch = 0usize;
+    let mut decoded_second_epoch = 0usize;
+    let mut gap_started: Option<Instant> = None;
+    let mut recovery_gap = Duration::ZERO;
+    let mut highest_seq = 0u32;
+
+    while decoded_second_epoch < 30 {
+        assert!(
+            Instant::now() < deadline,
+            "timed out: epochs={epochs_seen:?}, first={decoded_first_epoch}, \
+             second={decoded_second_epoch}"
+        );
+        receiver.maybe_report(
+            highest_seq,
+            (decoded_first_epoch + decoded_second_epoch) as u32,
+        );
+
+        let Ok((len, _)) = receiver.socket.recv_from(&mut datagram) else {
+            if gap_started.is_none() && decoded_first_epoch >= 30 {
+                gap_started = Some(Instant::now());
+            }
+            continue;
+        };
+        let bytes = &datagram[..len];
+        let Classified::Media { .. } = classify(bytes) else {
+            continue;
+        };
+        let Ok((header, payload)) = MediaHeader::decode(bytes) else {
+            continue;
+        };
+        assert_eq!(
+            header.session_id, original_session,
+            "the session must survive the pipeline restart — no re-handshake"
+        );
+        highest_seq = highest_seq.max(header.frame_seq);
+        if !epochs_seen.contains(&header.stream_epoch) {
+            epochs_seen.push(header.stream_epoch);
+            if epochs_seen.len() == 2 {
+                if let Some(started) = gap_started {
+                    recovery_gap = started.elapsed();
+                }
+            }
+        }
+
+        if let AddOutcome::Completed(frame_bytes) = reassembler.add_fragment(
+            header.frame_seq,
+            header.frag_index,
+            header.frag_count,
+            header.stream_epoch,
+            payload,
+            Instant::now(),
+        ) {
+            let frames = decoder.decode(&frame_bytes).len();
+            if header.stream_epoch == epochs_seen[0] {
+                decoded_first_epoch += frames;
+            } else {
+                decoded_second_epoch += frames;
+            }
+        }
+    }
+
+    assert!(
+        decoded_first_epoch >= 20,
+        "should stream normally before the injected crash (got {decoded_first_epoch})"
+    );
+    assert_eq!(epochs_seen.len(), 2, "exactly one restart expected");
+    assert!(
+        epochs_seen[1] > epochs_seen[0],
+        "the new generation must carry a higher stream epoch"
+    );
+    assert!(
+        recovery_gap < Duration::from_secs(5),
+        "recovery took {recovery_gap:?} — the backoff restart should be ~0.5-2s"
+    );
+
+    std::env::remove_var("ETERNAL_FAULT_ENCODER_AFTER");
     shared.stop();
     supervisor_tx
         .send(SupervisorCommand::Shutdown)
