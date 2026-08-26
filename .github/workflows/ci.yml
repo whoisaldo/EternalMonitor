@@ -65,6 +65,20 @@ jobs:
       - name: Test workspace
         run: cargo test --workspace --locked
 
+  rust-macos:
+    name: Rust (macOS, full workspace + E2E)
+    runs-on: macos-15
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install FFmpeg 7.1 SDK
+        run: brew install ffmpeg@7 pkgconf
+      - uses: Swatinem/rust-cache@v2
+      - name: Test workspace (includes synthetic end-to-end stream)
+        env:
+          PKG_CONFIG_PATH: /opt/homebrew/opt/ffmpeg@7/lib/pkgconfig
+        run: cargo test --workspace --locked
+
   ios-build:
     name: iOS (simulator build)
     runs-on: macos-15

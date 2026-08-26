@@ -11,8 +11,7 @@ use tracing::{debug, error, info, warn};
 
 use eternal_wire::h264::{
     access_unit_is_intra_only, contains_nal_type, describe_extradata_format, hex_prefix,
-    is_amf_encoder, normalize_h264_payload, parameter_sets_from_extradata,
-    H264BitstreamState,
+    is_amf_encoder, normalize_h264_payload, parameter_sets_from_extradata, H264BitstreamState,
 };
 
 use crate::capture::RawFrame;
@@ -151,8 +150,11 @@ fn run_encode_loop(
                         stats.set_codec_name(&codec_display_name);
                         stats.set_software_fallback(true);
                     }
-                    encoder_state =
-                        Some(EncoderState::new(&encoder_name, raw_frame.width, raw_frame.height)?);
+                    encoder_state = Some(EncoderState::new(
+                        &encoder_name,
+                        raw_frame.width,
+                        raw_frame.height,
+                    )?);
                 }
                 Err(e) => return Err(e),
             }
@@ -452,7 +454,11 @@ fn prepare_frame_for_encode(
 
     if request_intra {
         *frames_since_last_idr = 0;
-        let reason = if force_hit { "force_next_idr" } else { "period" };
+        let reason = if force_hit {
+            "force_next_idr"
+        } else {
+            "period"
+        };
         if is_amf {
             info!(
                 encoder = encoder_name,

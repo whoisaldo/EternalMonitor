@@ -204,9 +204,7 @@ fn interface_bucket(message: &str) -> String {
     if let Some(idx) = message.find("interface") {
         let rest = &message[idx + "interface".len()..];
         let trimmed = rest.trim_start_matches([':', ' ']);
-        let end = trimmed
-            .find([',', '"', ')'])
-            .unwrap_or(trimmed.len());
+        let end = trimmed.find([',', '"', ')']).unwrap_or(trimmed.len());
         return trimmed[..end].trim().to_string();
     }
     if let Some(pct) = message.find('%') {

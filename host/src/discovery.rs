@@ -59,8 +59,7 @@ pub fn advertise_service(port: u16) -> Option<ServiceDaemon> {
         if let Err(error) = mdns_clone.unregister(&full_name_for_thread) {
             warn!(error = %error, "mDNS unregister before re-advertisement failed");
         }
-        let Some(info) =
-            build_service_info(port, &host_fqdn_for_thread, &instance_for_thread)
+        let Some(info) = build_service_info(port, &host_fqdn_for_thread, &instance_for_thread)
         else {
             warn!("mDNS re-advertisement: failed to rebuild ServiceInfo");
             continue;

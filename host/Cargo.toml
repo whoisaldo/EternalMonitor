@@ -31,7 +31,7 @@ once_cell = "1"
 [build-dependencies]
 winresource = "0.1"
 
-[dependencies.windows]
+[target.'cfg(windows)'.dependencies.windows]
 version = "0.58"
 features = [
     "Win32_Foundation",
