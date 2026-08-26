@@ -283,6 +283,15 @@ final class ControlChannel {
         }
     }
 
+    /// Fire-and-forget input relay event. Hot path (up to ~240 Hz while
+    /// dragging) — no logging, silently dropped before the session is up.
+    func sendInput(_ event: WireInputEvent) {
+        queue.async { [self] in
+            guard sessionId != 0 else { return }
+            sendMessage(.inputEvent(event))
+        }
+    }
+
     private func sendMessage(_ message: ControlMessage) {
         msgSeq &+= 1
         send(Wire.encodeControl(sessionId: sessionId, msgSeq: msgSeq, message: message))

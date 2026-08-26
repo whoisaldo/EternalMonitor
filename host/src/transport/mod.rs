@@ -132,6 +132,8 @@ pub async fn start_sender(
     let mut last_session_id: Option<u32> = None;
     let mut awaiting_keyframe = true;
 
+    let mut input_relay = crate::input::InputRelay::default();
+
     let mut recv_buf = [0u8; 2048];
     let mut dgram_scratch = [0u8; MAX_DGRAM_SIZE];
     let mut heartbeat = tokio::time::interval(HEARTBEAT_INTERVAL);
@@ -152,6 +154,12 @@ pub async fn start_sender(
                                         let mut actions = shared.session.lock().handle_control(
                                             src, message, &config, Instant::now(),
                                         );
+                                        if let Some((session_id, event)) = actions.input.take() {
+                                            if let Some(geometry) = *shared.capture_geometry.lock()
+                                            {
+                                                input_relay.relay(session_id, &event, geometry);
+                                            }
+                                        }
                                         if let Some(report) = actions.report.take() {
                                             let ceiling =
                                                 shared.bitrate_bps.load(Ordering::SeqCst);

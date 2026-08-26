@@ -230,6 +230,12 @@ pub fn run_capture_loop(
         .into());
     }
 
+    // Publish the output's desktop-space rect for the input relay: the iPad's
+    // normalized touches map onto exactly this rectangle. DesktopCoordinates
+    // (not ModeDesc) is authoritative — under DPI virtualization or rotation
+    // the two differ, and injected coordinates live in desktop space.
+    publish_capture_geometry(&output1, &shared);
+
     // --- Create staging texture for CPU readback (reused every frame) ---
     let mut staging_texture: ID3D11Texture2D = unsafe {
         let mut tex = None;
@@ -525,6 +531,9 @@ pub fn run_capture_loop(
                         tex.expect("CreateTexture2D returned None")
                     };
                 }
+                // A resolution/topology change usually moves the output's
+                // desktop rect too — keep the input mapping in sync.
+                publish_capture_geometry(&output1, &shared);
                 continue;
             }
             Err(e) => {
@@ -550,6 +559,20 @@ pub fn run_capture_loop(
 
 /// Build the BGRA staging-texture descriptor for CPU readback at the given dimensions. Factored
 /// out so the capture loop can recreate it after a mid-stream resolution change.
+/// Push the captured output's desktop-space rect into shared state so the
+/// input relay maps the client's normalized touches onto the right monitor.
+fn publish_capture_geometry(output: &IDXGIOutput1, shared: &SharedControl) {
+    if let Ok(desc) = unsafe { output.GetDesc() } {
+        let r = desc.DesktopCoordinates;
+        *shared.capture_geometry.lock() = Some(crate::input::CaptureGeometry {
+            left: r.left,
+            top: r.top,
+            width: (r.right - r.left).max(1) as u32,
+            height: (r.bottom - r.top).max(1) as u32,
+        });
+    }
+}
+
 fn make_staging_desc(width: u32, height: u32) -> D3D11_TEXTURE2D_DESC {
     D3D11_TEXTURE2D_DESC {
         Width: width,

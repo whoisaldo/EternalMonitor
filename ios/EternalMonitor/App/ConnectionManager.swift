@@ -75,6 +75,12 @@ final class ConnectionManager: ObservableObject {
     @Published private(set) var signalLost = false
     /// Nonzero while an automatic reconnect cycle is running.
     @Published private(set) var reconnectAttempt = 0
+    /// Decoded video dimensions in pixels — the touch relay maps gestures
+    /// through the same aspect-fit rect the renderer draws.
+    @Published private(set) var videoSize: CGSize = .zero
+    /// Whether this session asked the host to relay input (the Settings
+    /// toggle, latched at HELLO2 time — mid-session flips need a reconnect).
+    @Published private(set) var sessionWantsInput = false
 
     private var udpReceiver: UDPReceiver?
     private var frameAssembler: FrameAssembler?
@@ -110,6 +116,14 @@ final class ConnectionManager: ObservableObject {
         frameSlot.take()
     }
 
+    // MARK: - Input relay
+
+    /// Relay one input event to the host (hot path — the channel hops to its
+    /// own queue; dropped silently when no session is up).
+    func sendInput(_ event: WireInputEvent) {
+        controlChannelBox.value?.sendInput(event)
+    }
+
     // MARK: - Connect / Disconnect
 
     func connect(host: String, port: UInt16) {
@@ -125,6 +139,9 @@ final class ConnectionManager: ObservableObject {
         prevCounters = FrameAssembler.Counters()
         diagnostics.removeAll()
         didExtendTimeout = false
+        videoSize = .zero
+        let wantsInput = UserDefaults.standard.object(forKey: "controlPC") as? Bool ?? true
+        sessionWantsInput = wantsInput
         debugState = ConnectionDebugState(host: normalizedHost, port: port)
         record(.info, "connection", "Starting connection to \(normalizedHost):\(port)")
 
@@ -176,6 +193,9 @@ final class ConnectionManager: ObservableObject {
                 }
                 self.signalLost = false
                 self.degradedSinceUs = nil
+                if Int(self.videoSize.width) != frameWidth || Int(self.videoSize.height) != frameHeight {
+                    self.videoSize = CGSize(width: frameWidth, height: frameHeight)
+                }
                 if ts > 0,
                    let offset = self.controlChannelBox.value?.clockSnapshot.withLock({ $0.offsetUs }) {
                     let nowUs = ControlChannel.clientNowUs()
@@ -308,7 +328,8 @@ final class ConnectionManager: ObservableObject {
                     screenPxH: UInt16(clamping: Int(UIScreen.main.nativeBounds.height)),
                     screenPtW: UInt16(clamping: Int(UIScreen.main.bounds.width)),
                     screenPtH: UInt16(clamping: Int(UIScreen.main.bounds.height)),
-                    refreshHz: UInt8(clamping: UIScreen.main.maximumFramesPerSecond)
+                    refreshHz: UInt8(clamping: UIScreen.main.maximumFramesPerSecond),
+                    featureCaps: wantsInput ? Hello2.featureWantsInput : 0
                 )
             )
             Task { @MainActor in
@@ -679,6 +700,10 @@ final class AppSettings: ObservableObject {
     @Published var showHUD: Bool {
         didSet { UserDefaults.standard.set(showHUD, forKey: "showHUD") }
     }
+    /// Relay touches/pencil to the PC as mouse input (negotiated at connect).
+    @Published var controlPC: Bool {
+        didSet { UserDefaults.standard.set(controlPC, forKey: "controlPC") }
+    }
     @Published var autoReconnect: Bool {
         didSet { UserDefaults.standard.set(autoReconnect, forKey: "autoReconnect") }
     }
@@ -700,6 +725,7 @@ final class AppSettings: ObservableObject {
         let defaults = UserDefaults.standard
         self.preferUSB = defaults.object(forKey: "preferUSB") as? Bool ?? true
         self.showHUD = defaults.object(forKey: "showHUD") as? Bool ?? true
+        self.controlPC = defaults.object(forKey: "controlPC") as? Bool ?? true
         self.autoReconnect = defaults.object(forKey: "autoReconnect") as? Bool ?? true
         self.targetFPS = defaults.object(forKey: "targetFPS") as? Int ?? 60
         self.promotionEnabled = defaults.object(forKey: "promotionEnabled") as? Bool ?? true

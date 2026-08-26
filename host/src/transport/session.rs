@@ -11,7 +11,8 @@ use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 
 use eternal_wire::v2::control::{
-    ByeReason, ControlMessage, HelloAck, HelloStatus, KeyframeRequest, ReceiverReport, StreamConfig,
+    ByeReason, ControlMessage, HelloAck, HelloStatus, InputEvent, KeyframeRequest, ReceiverReport,
+    StreamConfig, FEATURE_WANTS_INPUT,
 };
 use tracing::{info, warn};
 
@@ -37,6 +38,10 @@ pub struct Actions {
     pub client_lost: bool,
     /// A fresh receiver report arrived (feeds the ABR controller).
     pub report: Option<ReceiverReport>,
+    /// A validated `(session_id, event)` from the connected client (only
+    /// produced when that client's HELLO2 asked for input relay). The
+    /// transport dedupes per session and injects.
+    pub input: Option<(u32, InputEvent)>,
 }
 
 #[derive(Debug, Clone)]
@@ -132,9 +137,29 @@ impl Session {
             ControlMessage::KeyframeRequest(request) => self.handle_keyframe(source, request, now),
             ControlMessage::ReceiverReport(report) => self.handle_report(source, report, now),
             ControlMessage::Ping(ping) => self.handle_ping(source, ping, now),
+            ControlMessage::InputEvent(event) => self.handle_input(source, event, now),
             // Host-outbound types arriving inbound: ignore.
             _ => Actions::default(),
         }
+    }
+
+    fn handle_input(&mut self, source: SocketAddr, event: InputEvent, now: Instant) -> Actions {
+        let mut actions = Actions::default();
+        let Some(session) = self.active.as_mut() else {
+            return actions;
+        };
+        if !session_peer_matches(session, source) {
+            return actions;
+        }
+        // Only relay input the client declared it wants to send — a session
+        // that connected view-only stays view-only until it re-handshakes.
+        if session.info.feature_caps & FEATURE_WANTS_INPUT == 0 {
+            return actions;
+        }
+        // A stream of touches is proof of life as good as any report.
+        session.liveness_deadline = now + LIVENESS_TIMEOUT;
+        actions.input = Some((session.session_id, event));
+        actions
     }
 
     fn handle_hello(
@@ -650,6 +675,74 @@ mod tests {
         let granted_again =
             session.handle_control(peer, request, &TestConfig, now + Duration::from_millis(600));
         assert!(granted_again.force_idr);
+    }
+
+    fn input_event(event_id: u32) -> ControlMessage {
+        ControlMessage::InputEvent(InputEvent {
+            input_ver: 1,
+            kind: 0,
+            phase: 0,
+            buttons: 1,
+            event_id,
+            x_norm: 100,
+            y_norm: 100,
+            pressure_x1000: 0,
+            scroll_dx: 0,
+            scroll_dy: 0,
+            keycode: 0,
+            modifiers: 0,
+            client_time_us: 0,
+        })
+    }
+
+    #[test]
+    fn input_relayed_only_for_sessions_that_asked() {
+        let mut session = Session::new(1234);
+        let now = Instant::now();
+        let peer = addr([10, 0, 0, 5], 50000);
+
+        // View-only session: input is dropped.
+        session.handle_control(peer, hello(1, 50000), &TestConfig, now);
+        let dropped = session.handle_control(peer, input_event(1), &TestConfig, now);
+        assert!(
+            dropped.input.is_none(),
+            "view-only sessions must not inject"
+        );
+
+        // Re-handshake asking for input relay.
+        let mut wants = match hello(2, 50000) {
+            ControlMessage::Hello2(h) => h,
+            _ => unreachable!(),
+        };
+        wants.feature_caps = FEATURE_WANTS_INPUT;
+        session.handle_control(peer, ControlMessage::Hello2(wants), &TestConfig, now);
+
+        let relayed = session.handle_control(peer, input_event(2), &TestConfig, now);
+        assert!(relayed.input.is_some());
+
+        // A different IP can't inject into this session.
+        let intruder = addr([10, 0, 0, 9], 40000);
+        let foreign = session.handle_control(intruder, input_event(3), &TestConfig, now);
+        assert!(foreign.input.is_none());
+    }
+
+    #[test]
+    fn input_extends_liveness() {
+        let mut session = Session::new(1234);
+        let now = Instant::now();
+        let peer = addr([10, 0, 0, 5], 50000);
+        let mut wants = match hello(1, 50000) {
+            ControlMessage::Hello2(h) => h,
+            _ => unreachable!(),
+        };
+        wants.feature_caps = FEATURE_WANTS_INPUT;
+        session.handle_control(peer, ControlMessage::Hello2(wants), &TestConfig, now);
+
+        // A drag mid-window keeps the session alive past the original deadline.
+        let later = now + Duration::from_millis(2500);
+        session.handle_control(peer, input_event(1), &TestConfig, later);
+        let ticked = session.tick(&TestConfig, false, now + Duration::from_millis(4000));
+        assert!(!ticked.client_lost);
     }
 
     #[test]

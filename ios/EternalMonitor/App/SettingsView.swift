@@ -40,6 +40,21 @@ struct SettingsView: View {
                     footnote("Triple-tap the video to toggle the HUD while streaming.")
                 }
 
+                // Control (input relay)
+                Section {
+                    Toggle(isOn: $settings.controlPC) {
+                        Label("Control PC with touch", systemImage: "hand.point.up.left")
+                    }
+                } header: {
+                    sectionHeader("Control")
+                } footer: {
+                    footnote(
+                        "Tap to click, drag to move the mouse, two fingers to scroll, "
+                            + "hold for a right-click. Takes effect on the next connect. "
+                            + "While control is on, tap with three fingers to toggle the HUD."
+                    )
+                }
+
                 // Connection
                 Section {
                     Toggle(isOn: $settings.preferUSB) {

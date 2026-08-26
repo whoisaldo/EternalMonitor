@@ -8,6 +8,7 @@ pub mod control;
 pub mod discovery;
 pub mod encoder;
 pub mod gui;
+pub mod input;
 pub mod logging;
 pub mod pipeline;
 pub mod settings;
