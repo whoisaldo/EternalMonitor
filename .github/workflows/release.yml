@@ -113,14 +113,30 @@ jobs:
         run: |
           $tag = $env:GITHUB_REF_NAME
           $sha = "${{ steps.hash.outputs.sha256 }}"
+          # A semver pre-release tag (v0.2.0-rc1, v0.2.0-beta2) publishes as a
+          # GitHub pre-release: testers get a real download link, while
+          # /releases/latest — which the website reads — keeps pointing at the
+          # newest stable build instead of advertising an RC to everyone.
+          $isPrerelease = $tag -match "-"
           $lines = @(
               "EternalMonitor $tag — see [RELEASE_NOTES.md](https://github.com/whoisaldo/EternalMonitor/blob/main/RELEASE_NOTES.md) for what's new.",
+              "",
+              "**The Windows host and the iPad app must be from the same release.** Protocol v2 is a clean break: a v0.1.x app cannot stream from a v0.2.x host, or the reverse. Each side says so rather than showing broken video.",
               "",
               "**EternalMonitor-Setup.exe SHA-256:**",
               '```',
               $sha,
               '```'
           )
-          gh release create $tag "build\out\EternalMonitor-Setup.exe" `
-              --title "EternalMonitor $tag" `
-              --notes ($lines -join "`n")
+          # NOT $args — that is a PowerShell automatic variable.
+          $releaseArgs = @(
+              $tag,
+              "build\out\EternalMonitor-Setup.exe",
+              "--title", "EternalMonitor $tag",
+              "--notes", ($lines -join "`n")
+          )
+          if ($isPrerelease) {
+              Write-Host "Tag $tag is a pre-release; it will not become /releases/latest."
+              $releaseArgs += "--prerelease"
+          }
+          gh release create @releaseArgs

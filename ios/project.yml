@@ -29,7 +29,13 @@ targets:
         CODE_SIGN_STYLE: Automatic
         ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
         ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME: AccentColor
-        MTL_ENABLE_DEBUG_INFO: INCLUDE_SOURCE
+      configs:
+        # Shader source and Metal debug info belong in local builds only —
+        # under `base` this shipped inside every TestFlight/App Store build.
+        debug:
+          MTL_ENABLE_DEBUG_INFO: INCLUDE_SOURCE
+        release:
+          MTL_ENABLE_DEBUG_INFO: NO
 
   EternalMonitorTests:
     type: bundle.unit-test
