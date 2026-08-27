@@ -408,32 +408,39 @@ final class ConnectionManager: ObservableObject {
                 try? await Task.sleep(nanoseconds: 250_000_000)
                 guard let self, !Task.isCancelled else { return }
                 let snapshot = self.streamCounters.drain()
-                guard snapshot.datagrams > 0 || snapshot.assembled > 0 else { continue }
 
-                let firstDatagrams = self.debugState.datagramsReceived == 0 && snapshot.datagrams > 0
-                let firstAssembled = self.debugState.assembledFrames == 0 && snapshot.assembled > 0
-                self.debugState.datagramsReceived += snapshot.datagrams
-                self.debugState.datagramBytesReceived += snapshot.datagramBytes
-                self.debugState.assembledFrames += snapshot.assembled
-                self.debugState.assembledFrameBytes += snapshot.assembledBytes
-                self.debugState.decodePackets += snapshot.parsed
+                if snapshot.datagrams > 0 || snapshot.assembled > 0 {
+                    let firstDatagrams =
+                        self.debugState.datagramsReceived == 0 && snapshot.datagrams > 0
+                    let firstAssembled =
+                        self.debugState.assembledFrames == 0 && snapshot.assembled > 0
+                    self.debugState.datagramsReceived += snapshot.datagrams
+                    self.debugState.datagramBytesReceived += snapshot.datagramBytes
+                    self.debugState.assembledFrames += snapshot.assembled
+                    self.debugState.assembledFrameBytes += snapshot.assembledBytes
+                    self.debugState.decodePackets += snapshot.parsed
 
-                if firstDatagrams {
-                    self.record(
-                        .info, "udp",
-                        "UDP data flowing (\(snapshot.datagrams) datagrams, \(snapshot.datagramBytes) bytes in first batch)"
-                    )
-                    // Data is flowing — grant a fresh full window (once) so a slow/jittery
-                    // network gets time to finish reassembly + decode instead of being cut
-                    // off mid-handshake.
-                    if self.state == .connecting && !self.didExtendTimeout {
-                        self.didExtendTimeout = true
-                        self.armConnectTimeout(seconds: Self.connectionTimeoutSeconds)
+                    if firstDatagrams {
+                        self.record(
+                            .info, "udp",
+                            "UDP data flowing (\(snapshot.datagrams) datagrams, \(snapshot.datagramBytes) bytes in first batch)"
+                        )
+                        // Data is flowing — grant a fresh full window (once) so a slow/jittery
+                        // network gets time to finish reassembly + decode instead of being cut
+                        // off mid-handshake.
+                        if self.state == .connecting && !self.didExtendTimeout {
+                            self.didExtendTimeout = true
+                            self.armConnectTimeout(seconds: Self.connectionTimeoutSeconds)
+                        }
+                    }
+                    if firstAssembled {
+                        self.record(.info, "assembly", "First frame payload assembled (\(snapshot.assembledBytes) bytes)")
                     }
                 }
-                if firstAssembled {
-                    self.record(.info, "assembly", "First frame payload assembled (\(snapshot.assembledBytes) bytes)")
-                }
+
+                // Runs on EVERY tick, including silent ones: a dead host sends
+                // neither media nor heartbeats, so skipping this when nothing
+                // arrived is exactly when the liveness watchdog is needed.
                 self.refreshStatsAndWatchdog()
             }
         }
@@ -451,8 +458,17 @@ final class ConnectionManager: ObservableObject {
         if let rtt = clock.rttUs { next.rttMs = Double(rtt) / 1000.0 }
         if clock.offsetUs != nil { next.e2eMs = lagMs }
         if let counters = frameAssembler?.counters.withLock({ $0 }) {
-            let deltaReceived = counters.fragsReceived &- prevCounters.fragsReceived
-            let deltaLost = counters.fragsLost &- prevCounters.fragsLost
+            // The assembler zeroes its counters whenever it resets (host
+            // pipeline restart bumps the stream epoch). A value BELOW last
+            // tick's therefore means "restarted", not "wrapped" — re-baseline,
+            // because subtracting through zero produced two ~2^64 deltas whose
+            // sum overflowed and killed the app on every host restart.
+            if counters.fragsReceived < prevCounters.fragsReceived
+                || counters.fragsLost < prevCounters.fragsLost {
+                prevCounters = FrameAssembler.Counters()
+            }
+            let deltaReceived = counters.fragsReceived - prevCounters.fragsReceived
+            let deltaLost = counters.fragsLost - prevCounters.fragsLost
             prevCounters = counters
             let total = deltaReceived + deltaLost
             next.lossPercent = total == 0 ? 0 : Double(deltaLost) * 100.0 / Double(total)
@@ -692,15 +708,33 @@ final class PixelBufferBox: @unchecked Sendable {
 
 final class FrameSlot: @unchecked Sendable {
     private let lock = os.OSAllocatedUnfairLock<PixelBufferBox?>(initialState: nil)
+
+    /// Holder so the redraw callback can be swapped under a lock. The Metal
+    /// view attaches and detaches it on the MainActor while the VideoToolbox
+    /// decode thread is calling it; an unguarded stored closure raced on its
+    /// own retain/release there, which crashes on connect and on teardown.
+    private struct CallbackHolder: @unchecked Sendable {
+        var callback: (() -> Void)?
+    }
+    private let stored = os.OSAllocatedUnfairLock<CallbackHolder>(
+        initialState: CallbackHolder()
+    )
+
     /// Fired (on the storing thread — the VideoToolbox callback) every time a
-    /// frame lands, so the renderer can schedule an on-demand redraw. Assigned
-    /// once by the Metal view before streaming starts.
-    var onFrameStored: (() -> Void)?
+    /// frame lands, so the renderer can schedule an on-demand redraw.
+    var onFrameStored: (() -> Void)? {
+        get { stored.withLock { $0.callback } }
+        set { stored.withLock { $0.callback = newValue } }
+    }
 
     func set(_ buffer: CVPixelBuffer) {
         let box = PixelBufferBox(buffer)
         lock.withLock { $0 = box }
-        onFrameStored?()
+        // Copy the closure out under the lock, then call it outside: holding
+        // the lock across arbitrary caller code invites deadlock, and a local
+        // strong reference keeps a concurrent detach from freeing it mid-call.
+        let callback = stored.withLock { $0.callback }
+        callback?()
     }
 
     func take() -> CVPixelBuffer? {
