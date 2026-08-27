@@ -41,8 +41,9 @@ pub fn run_encode_stage(
     tx: mpsc::Sender<NALUnit>,
     shared: SharedControl,
     gpu: GpuInfo,
+    generation: u64,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let result = run_encode_loop(frames, tx, shared, gpu);
+    let result = run_encode_loop(frames, tx, shared, gpu, generation);
     if let Err(ref e) = result {
         error!(error = %e, "Encode loop exited with error");
     }
@@ -58,6 +59,7 @@ fn run_encode_loop(
     tx: mpsc::Sender<NALUnit>,
     shared: SharedControl,
     gpu: GpuInfo,
+    generation: u64,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Apply GUI encoder override at pipeline start. The override is consulted only here;
     // mid-stream changes don't take effect until the user requests a Restart.
@@ -130,8 +132,10 @@ fn run_encode_loop(
         .and_then(|v| v.trim().parse().ok());
 
     while let Some(raw_frame) = frames.blocking_take() {
-        if !shared.running.load(Ordering::SeqCst) {
-            info!("Encoder loop stopping on running=false");
+        if !shared.running.load(Ordering::SeqCst)
+            || !crate::supervisor::generation_is_current(generation)
+        {
+            info!("Encoder loop stopping (stop requested or generation superseded)");
             break;
         }
 

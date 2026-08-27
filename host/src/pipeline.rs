@@ -46,11 +46,15 @@ pub async fn run_pipeline_supervised(
     let capture_thread = std::thread::Builder::new()
         .name(format!("capture-g{generation}"))
         .spawn(move || {
-            let outcome =
-                match capture::run_capture_stage(frame_producer, capture_shared, adapter_index) {
-                    Ok(()) => StageOutcome::Completed,
-                    Err(e) => StageOutcome::Failed(e.to_string()),
-                };
+            let outcome = match capture::run_capture_stage(
+                frame_producer,
+                capture_shared,
+                adapter_index,
+                generation,
+            ) {
+                Ok(()) => StageOutcome::Completed,
+                Err(e) => StageOutcome::Failed(e.to_string()),
+            };
             capture_reporter.stage_exited(Stage::Capture, outcome);
         });
     if let Err(e) = capture_thread {
@@ -69,6 +73,7 @@ pub async fn run_pipeline_supervised(
                 nal_tx,
                 encoder_shared,
                 encoder_gpu,
+                generation,
             ) {
                 Ok(()) => StageOutcome::Completed,
                 Err(e) => StageOutcome::Failed(e.to_string()),

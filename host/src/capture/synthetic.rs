@@ -50,6 +50,7 @@ fn synthetic_size() -> (u32, u32) {
 pub fn run_capture_loop(
     slot: &FrameSlot,
     shared: SharedControl,
+    generation: u64,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let (width, height) = synthetic_size();
     let row_bytes = (width * 4) as usize;
@@ -78,8 +79,10 @@ pub fn run_capture_loop(
     let mut next_deadline = Instant::now();
 
     loop {
-        if !shared.running.load(Ordering::SeqCst) {
-            info!("Capture loop stopping on running=false");
+        if !shared.running.load(Ordering::SeqCst)
+            || !crate::supervisor::generation_is_current(generation)
+        {
+            info!("Capture loop stopping (stop requested or generation superseded)");
             break;
         }
 

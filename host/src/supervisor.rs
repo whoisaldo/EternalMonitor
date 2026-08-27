@@ -21,6 +21,19 @@ use crate::stats::PIPELINE_STATS;
 /// zombie thread can never confuse the supervisor about the live pipeline).
 pub static CURRENT_GENERATION: AtomicU64 = AtomicU64::new(0);
 
+/// True while `generation` is still the live one.
+///
+/// Stage threads are detached, so one blocked in a long driver call (the
+/// virtual-display attach poll, the ACCESS_LOST retry ladder) can outlive its
+/// generation. `shared.running` is process-wide and gets re-armed for the NEXT
+/// generation, so a straggler that only checked that flag would wake up and
+/// keep running forever — two capture loops fighting over a DXGI duplication
+/// only one can own, while its heartbeats masked the watchdog that would have
+/// noticed.
+pub fn generation_is_current(generation: u64) -> bool {
+    CURRENT_GENERATION.load(Ordering::SeqCst) == generation
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Stage {
     Capture,
@@ -365,10 +378,7 @@ fn wedge_reason(shared: &SharedControl, machine: &Machine) -> Option<String> {
     // A client is connected but no frame has been produced for 5s. Sound
     // because the idle keepalive guarantees a frame at least every ~750ms
     // while a client is registered.
-    let client_connected = {
-        let addr = *shared.target_addr.lock();
-        !addr.ip().is_unspecified() && addr.port() != 0
-    };
+    let client_connected = shared.client_connected();
     if client_connected && frame_ms > 0 && now_ms.saturating_sub(frame_ms) > 5_000 {
         return Some(format!(
             "no captured frame for {}ms with a client connected",
@@ -399,6 +409,19 @@ fn spawn_generation(
     command_tx: mpsc::Sender<SupervisorCommand>,
 ) -> std::thread::JoinHandle<()> {
     shared.running.store(true, Ordering::SeqCst);
+    // Give the new generation a full watchdog window. These atomics carry the
+    // PREVIOUS generation's timestamps, so without this the wedge check judges
+    // a thread that hasn't started yet: capture needing more than 3s to reach
+    // its first heartbeat (attaching the virtual display polls for up to 10s,
+    // and DXGI init is not instant on every driver) was declared wedged,
+    // restarted, and declared wedged again until the storm brake parked the
+    // supervisor in Failed — so the extended display could never come up.
+    {
+        let now_ms = crate::clock::host_now_us() / 1000;
+        shared.hb_capture_loop_ms.store(now_ms, Ordering::Relaxed);
+        shared.hb_capture_frame_ms.store(now_ms, Ordering::Relaxed);
+        shared.hb_encode_frame_ms.store(now_ms, Ordering::Relaxed);
+    }
     {
         let mut stats = PIPELINE_STATS.lock();
         stats.mark_pipeline_started();

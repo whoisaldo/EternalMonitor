@@ -163,8 +163,18 @@ pub async fn start_sender(
                                         if let Some(report) = actions.report.take() {
                                             let ceiling =
                                                 shared.bitrate_bps.load(Ordering::SeqCst);
-                                            let _ = abr.set_ceiling(ceiling);
-                                            let decision = abr.on_report(&report, Instant::now());
+                                            // A lowered ceiling clamps the rung
+                                            // immediately; that decision must be
+                                            // honored, or dragging the slider
+                                            // down changes the label and nothing
+                                            // else for the life of the pipeline.
+                                            let clamped = abr.set_ceiling(ceiling);
+                                            let reported =
+                                                abr.on_report(&report, Instant::now());
+                                            let decision = abr::AbrDecision {
+                                                target_bps: reported.target_bps,
+                                                changed: clamped.changed || reported.changed,
+                                            };
                                             if decision.changed {
                                                 shared
                                                     .abr_current_bps

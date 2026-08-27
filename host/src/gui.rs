@@ -1,5 +1,3 @@
-use std::net::SocketAddr;
-
 use eframe::egui;
 use qrcode::{Color as QrModuleColor, QrCode};
 use tracing::{info, warn};
@@ -145,8 +143,9 @@ pub struct AnalyzerApp {
     current_tab: AppTab,
     settings_bitrate_mbps: f32,
     settings_fps_target: u32,
-    settings_target_ip: String,
-    settings_target_error: Option<String>,
+    /// Last settings error worth showing (currently only the autostart
+    /// registry write).
+    settings_error: Option<String>,
     settings_start_on_boot: bool,
     settings_hevc_enabled: bool,
     settings_vdd_match: bool,
@@ -198,21 +197,6 @@ impl AnalyzerApp {
             .shared
             .target_fps
             .store(fps_target, std::sync::atomic::Ordering::SeqCst);
-
-        let settings_target_ip = if let Some(ip) = persisted.target_ip.clone() {
-            if let Ok(addr) = ip.parse::<SocketAddr>() {
-                *control.shared.target_addr.lock() = addr;
-                PIPELINE_STATS.lock().set_target_addr(addr.to_string());
-            }
-            ip
-        } else {
-            let target_addr = *control.shared.target_addr.lock();
-            if target_addr.ip().is_unspecified() || target_addr.port() == 0 {
-                String::new()
-            } else {
-                target_addr.to_string()
-            }
-        };
 
         let encoder_choice = if let Some(name) = persisted.encoder_override.as_deref() {
             *control.shared.encoder_override.lock() = Some(name.to_string());
@@ -271,8 +255,7 @@ impl AnalyzerApp {
             current_tab: AppTab::Stream,
             settings_bitrate_mbps: bitrate_mbps,
             settings_fps_target: fps_target,
-            settings_target_ip,
-            settings_target_error: None,
+            settings_error: None,
             settings_start_on_boot: start_on_boot,
             settings_hevc_enabled: persisted.hevc_enabled,
             settings_vdd_match: persisted.vdd_match_resolution,
@@ -282,24 +265,6 @@ impl AnalyzerApp {
             available_outputs,
             show_qr_modal: false,
             qr_cache: None,
-        }
-    }
-
-    fn apply_target_addr(&mut self) {
-        match self.settings_target_ip.trim().parse::<SocketAddr>() {
-            Ok(target_addr) => {
-                *self.control.shared.target_addr.lock() = target_addr;
-                PIPELINE_STATS
-                    .lock()
-                    .set_target_addr(target_addr.to_string());
-                self.settings_target_error = None;
-                info!(target = %target_addr, "Transport target updated from GUI");
-                self.persist_settings();
-            }
-            Err(error) => {
-                self.settings_target_error = Some("Enter host:port".to_string());
-                warn!(error = %error, target = %self.settings_target_ip, "Invalid target address");
-            }
         }
     }
 
@@ -317,11 +282,9 @@ impl AnalyzerApp {
         let file = SettingsFile {
             bitrate_mbps: self.settings_bitrate_mbps,
             target_fps: self.settings_fps_target,
-            target_ip: if self.settings_target_ip.trim().is_empty() {
-                None
-            } else {
-                Some(self.settings_target_ip.trim().to_string())
-            },
+            // v2 has no manual target; the field stays in the file only so
+            // older settings.json still parse.
+            target_ip: None,
             encoder_override,
             capture_display: if self.settings_capture_display.is_empty() {
                 None
@@ -381,13 +344,6 @@ impl eframe::App for AnalyzerApp {
         ctx.set_visuals(visuals);
 
         let snap = StatsSnapshot::take();
-        if self.settings_target_ip.is_empty()
-            && !snap.target_addr.is_empty()
-            && snap.target_addr != "0.0.0.0:9876"
-        {
-            self.settings_target_ip = snap.target_addr.clone();
-        }
-
         self.draw_sidebar(ctx, &snap);
 
         egui::CentralPanel::default()
@@ -762,23 +718,12 @@ impl AnalyzerApp {
 
             ui.add_space(12.0);
 
-            // --- Target IP --------------------------------------------------------
-            ui.horizontal(|ui| {
-                ui.label(egui::RichText::new("Target IP").color(TEXT).size(13.0));
-                let response = ui.add(
-                    egui::TextEdit::singleline(&mut self.settings_target_ip).desired_width(220.0),
-                );
-                let enter_pressed =
-                    response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-                if amber_button(ui, "Apply").clicked() || enter_pressed {
-                    self.apply_target_addr();
-                }
-            });
-            if let Some(error) = &self.settings_target_error {
-                ui.label(egui::RichText::new(error).color(RED).size(11.0));
-            }
-
-            ui.add_space(12.0);
+            // Protocol v2 has no manual target: media carries the session id
+            // minted by the HELLO2 handshake, so an address typed here could
+            // never receive a stream. The old field also wrote target_addr,
+            // which the capture loop read as "a client is watching" — enough
+            // to hold the virtual display up and keep capture at full rate
+            // with nobody connected.
 
             // --- Encoder override dropdown ---------------------------------------
             let detected = PIPELINE_STATS.lock().codec_name.clone();
@@ -962,11 +907,14 @@ impl AnalyzerApp {
                 if self.settings_start_on_boot != prev_boot {
                     if let Err(error) = set_startup_registry(self.settings_start_on_boot) {
                         self.settings_start_on_boot = prev_boot;
-                        self.settings_target_error = Some(error);
+                        self.settings_error = Some(error);
                     } else {
-                        self.settings_target_error = None;
+                        self.settings_error = None;
                         self.persist_settings();
                     }
+                }
+                if let Some(error) = &self.settings_error {
+                    ui.label(egui::RichText::new(error).color(RED).size(11.0));
                 }
             }
         });
