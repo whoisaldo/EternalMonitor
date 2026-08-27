@@ -3,6 +3,25 @@
 (function () {
   'use strict';
 
+  /* --- macOS Notice --- */
+  // iPadOS reports platform 'MacIntel' too, so require a non-touch device.
+  var isMac = /Mac/.test(navigator.platform) && navigator.maxTouchPoints <= 1;
+  if (isMac && sessionStorage.getItem('mac-notice-dismissed') !== '1') {
+    var notice = document.createElement('div');
+    notice.className = 'mac-notice';
+    notice.innerHTML =
+      '<p><strong>Looks like you\'re on a Mac.</strong>' +
+      'EternalMonitor is Windows-only for now. The good news: macOS already does this ' +
+      'for free with <a href="https://support.apple.com/en-us/102386" target="_blank" rel="noopener">Sidecar</a>, ' +
+      'which turns your iPad into a second display natively and works well.</p>' +
+      '<button type="button" class="mac-notice-close" aria-label="Dismiss">&times;</button>';
+    notice.querySelector('.mac-notice-close').addEventListener('click', function () {
+      sessionStorage.setItem('mac-notice-dismissed', '1');
+      notice.remove();
+    });
+    document.body.appendChild(notice);
+  }
+
   /* --- Scroll Reveal (IntersectionObserver) --- */
   var reveals = document.querySelectorAll('.reveal');
   if (reveals.length && 'IntersectionObserver' in window) {
