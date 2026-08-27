@@ -3,7 +3,12 @@ EternalMonitor - Quick Start (Windows host)
 
 This turns your Windows PC into a second screen for your iPad over your
 local Wi-Fi. This is the WINDOWS side only. You also need the EternalMonitor
-app on an iPad (the sender will give you a separate invite for that).
+app on the iPad, which arrives as a TestFlight invite link: install Apple's
+free "TestFlight" app from the App Store first, then open the link.
+
+IMPORTANT: the Windows host and the iPad app must be from the SAME version.
+If they are not, the app will tell you to update one of them instead of
+showing video.
 
 What you need
 -------------

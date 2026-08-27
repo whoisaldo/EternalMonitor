@@ -13,6 +13,76 @@ steps. To bundle the driver, drop the signed setup into `installer/vendor/vdd/` 
 that folder's `README.txt`); without it the build still works but produces an app-only
 installer and the extended-display option won't appear.
 
+## Getting a tester onto the iPad app (TestFlight)
+
+A tester needs no Xcode and no developer account. They need the TestFlight
+app from the App Store and a link from you.
+
+### One-time, on your Mac
+
+Build number must be higher than anything already uploaded. `ios/project.yml`
+carries `CURRENT_PROJECT_VERSION`; builds 3 and 4 are used, so 0.2.0 ships as
+build 5. If you upload twice for the same version, bump it again.
+
+The simplest path is Xcode:
+
+1. `cd ios && xcodegen generate`, then open `EternalMonitor.xcodeproj`.
+2. Select "Any iOS Device" as the destination, then Product, then Archive.
+3. In the Organizer window that opens: Distribute App, then TestFlight and
+   App Store Connect, then Upload. Signing is automatic against team
+   `9X79V37Q89`.
+
+The same thing without the GUI, if you have an App Store Connect API key:
+
+```bash
+cd ios
+xcodegen generate
+xcodebuild -project EternalMonitor.xcodeproj -scheme EternalMonitor \
+  -configuration Release -destination 'generic/platform=iOS' \
+  -archivePath build/EternalMonitor.xcarchive archive
+xcodebuild -exportArchive \
+  -archivePath build/EternalMonitor.xcarchive \
+  -exportOptionsPlist exportOptions.plist \
+  -exportPath build/export \
+  -authenticationKeyPath ~/private_keys/AuthKey_XXXXXX.p8 \
+  -authenticationKeyID XXXXXX -authenticationKeyIssuerID <issuer-uuid>
+```
+
+`exportOptions.plist` is already set to `app-store-connect` with
+`destination: upload`, so the export step performs the upload.
+
+### Then, in App Store Connect
+
+1. TestFlight tab, wait for the build to finish processing (usually a few
+   minutes; you get an email).
+2. Export compliance is already answered in the app
+   (`ITSAppUsesNonExemptEncryption` is false), so it will not ask per build.
+3. Create an external testing group, add the build, and fill in "What to
+   Test" (see the AMD notes below).
+4. Submit for Beta App Review. The first build for external testers is
+   reviewed by Apple, usually inside a day.
+5. Once approved, enable the group's public link and send that to your
+   tester. Anyone with the link can install; you can cap the number of
+   testers on the same screen.
+
+Internal testers skip review entirely and get builds immediately, but they
+must be users on your App Store Connect team, so that route only makes sense
+for people you want inside the developer account.
+
+### What to send the tester
+
+Two links, and they must match:
+
+- The Windows installer for the same version. While a build is still in
+  testing it is published as a GitHub pre-release and appears on
+  eternalmonitor.dev/download.html under "Preview build for testers",
+  marked as a test build.
+- The TestFlight public link for the matching iPad build.
+
+Protocol v2 is a clean break, so a preview host with a release app (or the
+reverse) will not stream. Both sides say so plainly rather than showing
+broken video, but it still wastes a tester's evening.
+
 ## Extended display vs mirror
 
 By default the iPad mirrors the primary screen. To test the iPad as a real extended desktop:
