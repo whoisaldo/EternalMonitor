@@ -100,6 +100,11 @@ struct TouchRelayMachine {
     var videoPixelSize: CGSize = .zero
 
     private var mode: Mode = .idle
+    /// The last touch position that fell inside the video. Releases outside it
+    /// (a drag that ends on a letterbox bar, which is the default layout on a
+    /// 4:3 iPad showing a 16:9 desktop) reuse this instead of jumping to the
+    /// middle of the desktop and dropping whatever was being dragged there.
+    private var lastInsidePoint: Point?
     private var touchCount = 0
     private var nextEventId: UInt32 = 0
     private var lastMoveSentUs: UInt64 = 0
@@ -135,6 +140,7 @@ struct TouchRelayMachine {
     mutating func touchBegan(
         at point: Point?, isPencil: Bool, timeUs: UInt64
     ) -> [Output] {
+        if let point { lastInsidePoint = point }
         touchCount += 1
         switch (mode, touchCount) {
         case (.idle, 1):
@@ -151,14 +157,14 @@ struct TouchRelayMachine {
             return []
         case (.pending, 2):
             // Second finger before commit: this is a scroll, not a click.
-            mode = .scrolling(lastCentroid: point ?? Point(x: 32767, y: 32767))
+            mode = .scrolling(lastCentroid: point ?? lastInsidePoint ?? Point(x: 32767, y: 32767))
             scrollRemainder = .zero
             return []
         case (.leftDown(let isPencil), 2) where !isPencil:
             // Finger drag joined by a second finger: release, then scroll.
             let release = edge(Phase.ended, kind: Kind.touch, buttons: 1,
-                               at: point ?? Point(x: 32767, y: 32767), timeUs: timeUs)
-            mode = .scrolling(lastCentroid: point ?? Point(x: 32767, y: 32767))
+                               at: point ?? lastInsidePoint ?? Point(x: 32767, y: 32767), timeUs: timeUs)
+            mode = .scrolling(lastCentroid: point ?? lastInsidePoint ?? Point(x: 32767, y: 32767))
             scrollRemainder = .zero
             return release
         case (.scrolling, _):
@@ -174,6 +180,7 @@ struct TouchRelayMachine {
     mutating func touchMoved(
         to point: Point?, centroid: Point?, isPencil: Bool, force: CGFloat, timeUs: UInt64
     ) -> [Output] {
+        if let point { lastInsidePoint = point }
         switch mode {
         case .pending(let start, _):
             guard let point else { return [] }
@@ -225,6 +232,7 @@ struct TouchRelayMachine {
     }
 
     mutating func touchEnded(at point: Point?, cancelled: Bool, timeUs: UInt64) -> [Output] {
+        if let point { lastInsidePoint = point }
         touchCount = max(0, touchCount - 1)
         let releasePhase = cancelled ? Phase.cancelled : Phase.ended
         switch mode {
@@ -238,11 +246,11 @@ struct TouchRelayMachine {
             mode = .idle
             let kind = isPencil ? Kind.pencil : Kind.touch
             return edge(releasePhase, kind: kind, buttons: 1,
-                        at: point ?? Point(x: 32767, y: 32767), timeUs: timeUs)
+                        at: point ?? lastInsidePoint ?? Point(x: 32767, y: 32767), timeUs: timeUs)
         case .rightDown:
             mode = .idle
             return edge(releasePhase, kind: Kind.touch, buttons: 0b10,
-                        at: point ?? Point(x: 32767, y: 32767), timeUs: timeUs)
+                        at: point ?? lastInsidePoint ?? Point(x: 32767, y: 32767), timeUs: timeUs)
         case .scrolling:
             if touchCount == 0 { mode = .idle }
             return []
@@ -275,10 +283,10 @@ struct TouchRelayMachine {
         switch mode {
         case .leftDown(let isPencil):
             outputs = edge(Phase.cancelled, kind: isPencil ? Kind.pencil : Kind.touch,
-                           buttons: 1, at: Point(x: 32767, y: 32767), timeUs: timeUs)
+                           buttons: 1, at: lastInsidePoint ?? Point(x: 32767, y: 32767), timeUs: timeUs)
         case .rightDown:
             outputs = edge(Phase.cancelled, kind: Kind.touch, buttons: 0b10,
-                           at: Point(x: 32767, y: 32767), timeUs: timeUs)
+                           at: lastInsidePoint ?? Point(x: 32767, y: 32767), timeUs: timeUs)
         case .pending, .scrolling, .idle, .suppressed:
             break
         }

@@ -45,6 +45,10 @@ pub enum DropReason {
     ZeroCount,
     /// fragment_index >= fragment_count.
     IndexOutOfRange,
+    /// Fragment count disagrees with the live frame's; first-seen count wins.
+    CountMismatch,
+    /// This index of this frame was already stored.
+    DuplicateFragment,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -62,6 +66,16 @@ struct PendingFrame {
     fragment_count: u16,
     fragments: HashMap<u16, Vec<u8>>,
     created_at: Instant,
+}
+
+impl PendingFrame {
+    /// Fragments that never arrived. THIS is what loss means: counting the
+    /// ones that did arrive (as this mirror used to) reported a frame missing
+    /// one fragment out of ten as nine lost, so the host ABR saw roughly nine
+    /// times the real loss and stepped down on a healthy link.
+    fn missing_fragments(&self) -> u64 {
+        u64::from(self.fragment_count).saturating_sub(self.fragments.len() as u64)
+    }
 }
 
 /// Cumulative counters for loss accounting (feeds receiver reports in v2).
@@ -169,32 +183,43 @@ impl Reassembler {
             return AddOutcome::Dropped(DropReason::IndexOutOfRange);
         }
 
-        self.counters.frags_received += 1;
-
-        let recreate = match self.pending.get(&seq) {
-            Some(frame) => frame.fragment_count != count,
-            None => true,
-        };
-        if recreate {
-            if let Some(old) = self.pending.remove(&seq) {
-                // Fragment count changed mid-frame: restart that frame.
-                self.counters.frags_lost += old.fragments.len() as u64;
+        match self.pending.get(&seq) {
+            // Conflicting metadata for a live frame: the FIRST-seen count wins.
+            // Rebuilding the frame here (as this mirror used to) let one late
+            // duplicate or spoofed datagram throw away every fragment already
+            // buffered for it.
+            Some(frame) if frame.fragment_count != count => {
+                return AddOutcome::Dropped(DropReason::CountMismatch);
             }
-            self.pending.insert(
-                seq,
-                PendingFrame {
-                    fragment_count: count,
-                    fragments: HashMap::new(),
-                    created_at: now,
-                },
-            );
+            Some(_) => {}
+            None => {
+                self.pending.insert(
+                    seq,
+                    PendingFrame {
+                        fragment_count: count,
+                        fragments: HashMap::new(),
+                        created_at: now,
+                    },
+                );
+            }
         }
 
         let frame = self
             .pending
             .get_mut(&seq)
-            .expect("pending frame just inserted");
+            .expect("pending frame present or just inserted");
+        // First write wins, and only a first write counts as received: a
+        // replayed fragment must not overwrite good bytes or inflate the
+        // receive count the loss math is derived from.
+        if frame.fragments.contains_key(&index) {
+            return AddOutcome::Dropped(DropReason::DuplicateFragment);
+        }
         frame.fragments.insert(index, payload.to_vec());
+        self.counters.frags_received += 1;
+        let frame = self
+            .pending
+            .get_mut(&seq)
+            .expect("pending frame present or just inserted");
 
         let mut outcome = AddOutcome::Stored;
         if frame.fragments.len() == usize::from(frame.fragment_count) {
@@ -219,7 +244,7 @@ impl Reassembler {
                 let keep = pending_seq > seq;
                 if !keep {
                     dropped_frames += 1;
-                    dropped_frags += frame.fragments.len() as u64;
+                    dropped_frags += frame.missing_fragments();
                 }
                 keep
             });
@@ -247,7 +272,7 @@ impl Reassembler {
     fn reset_internal(&mut self) {
         for (_, frame) in self.pending.drain() {
             self.counters.frames_dropped += 1;
-            self.counters.frags_lost += frame.fragments.len() as u64;
+            self.counters.frags_lost += frame.missing_fragments();
         }
         self.latest_completed_seq = 0;
         self.cleanup_counter = 0;
@@ -259,7 +284,7 @@ impl Reassembler {
             let fresh = now.duration_since(frame.created_at) < STALE_FRAME_TIMEOUT;
             if !fresh {
                 counters.frames_dropped += 1;
-                counters.frags_lost += frame.fragments.len() as u64;
+                counters.frags_lost += frame.missing_fragments();
             }
             fresh
         });
@@ -422,6 +447,7 @@ mod tests {
         );
         assert_eq!(r.pending_frames(), 0);
         assert_eq!(r.counters().frames_dropped, 1);
+        // One fragment of the two-fragment frame never arrived.
         assert_eq!(r.counters().frags_lost, 1);
 
         // The evicted frame's late fragment is now stale.
@@ -432,16 +458,58 @@ mod tests {
     }
 
     #[test]
-    fn fragment_count_change_restarts_that_frame() {
+    fn first_seen_fragment_count_wins_and_progress_survives() {
         let now = Instant::now();
         let mut r = Reassembler::new();
         feed(&mut r, 1, 0, 3, 1, 0xA, now);
-        // Same seq arrives claiming 2 fragments: previous progress discarded.
-        feed(&mut r, 1, 0, 2, 1, 0xB, now);
+
+        // A fragment claiming a different count for a live frame is ignored;
+        // it must not discard what has already been buffered.
         assert_eq!(
-            feed(&mut r, 1, 1, 2, 1, 0xC, now),
-            AddOutcome::Completed(vec![0xB, 0xC])
+            feed(&mut r, 1, 1, 2, 1, 0xB, now),
+            AddOutcome::Dropped(DropReason::CountMismatch)
         );
+
+        assert_eq!(feed(&mut r, 1, 1, 3, 1, 0xB, now), AddOutcome::Stored);
+        assert_eq!(
+            feed(&mut r, 1, 2, 3, 1, 0xC, now),
+            AddOutcome::Completed(vec![0xA, 0xB, 0xC]),
+            "the original fragments must still be there"
+        );
+    }
+
+    #[test]
+    fn replayed_fragment_neither_overwrites_nor_counts_twice() {
+        let now = Instant::now();
+        let mut r = Reassembler::new();
+        feed(&mut r, 1, 0, 2, 1, 0xA, now);
+        assert_eq!(
+            feed(&mut r, 1, 0, 2, 1, 0xFF, now),
+            AddOutcome::Dropped(DropReason::DuplicateFragment)
+        );
+        assert_eq!(r.counters().frags_received, 1, "a replay is not a receipt");
+        assert_eq!(
+            feed(&mut r, 1, 1, 2, 1, 0xB, now),
+            AddOutcome::Completed(vec![0xA, 0xB]),
+            "the first write must win"
+        );
+    }
+
+    #[test]
+    fn loss_counts_the_fragments_that_never_arrived() {
+        let now = Instant::now();
+        let mut r = Reassembler::new();
+        // Frame 1 gets 9 of 10 fragments, then a newer frame completes and
+        // evicts it: exactly ONE fragment was lost, not nine.
+        for index in 0..9u16 {
+            feed(&mut r, 1, index, 10, 1, 0xA, now);
+        }
+        assert_eq!(
+            feed(&mut r, 2, 0, 1, 1, 0xB, now),
+            AddOutcome::Completed(vec![0xB])
+        );
+        assert_eq!(r.counters().frames_dropped, 1);
+        assert_eq!(r.counters().frags_lost, 1);
     }
 
     #[test]

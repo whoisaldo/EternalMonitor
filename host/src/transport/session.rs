@@ -132,14 +132,31 @@ impl Session {
         }
     }
 
-    /// Feed one inbound control message. `now` is injected for testability.
+    /// Feed one inbound control message. `header_session_id` is the id the
+    /// datagram claims; every message except HELLO2 must match the live
+    /// session's. `now` is injected for testability.
     pub fn handle_control(
         &mut self,
         source: SocketAddr,
+        header_session_id: u32,
         message: ControlMessage,
         config: &impl ConfigSource,
         now: Instant,
     ) -> Actions {
+        // HELLO2 is the only message that legitimately carries no session id
+        // (it is asking for one). Everything else is authenticated by the id
+        // the handshake minted, not just by source IP: an IP is shared by
+        // every process on the device and by anything behind the same NAT, and
+        // is trivially spoofed on the local link. Without this, a stray
+        // INPUT_EVENT moved the mouse and clicked, a stray RECEIVER_REPORT
+        // steered the bitrate, and a late BYE from a superseded session tore
+        // down the one that replaced it.
+        if !matches!(message, ControlMessage::Hello2(_)) {
+            match self.active.as_ref() {
+                Some(session) if session.session_id == header_session_id => {}
+                _ => return Actions::default(),
+            }
+        }
         match message {
             ControlMessage::Hello2(hello) => self.handle_hello(source, hello, config, now),
             ControlMessage::Bye(reason) => self.handle_bye(source, reason),
@@ -150,6 +167,19 @@ impl Session {
             // Host-outbound types arriving inbound: ignore.
             _ => Actions::default(),
         }
+    }
+
+    /// Test helper: send as the currently-connected client.
+    #[cfg(test)]
+    fn handle_control_authed(
+        &mut self,
+        source: SocketAddr,
+        message: ControlMessage,
+        config: &impl ConfigSource,
+        now: Instant,
+    ) -> Actions {
+        let id = self.session_id().unwrap_or(0);
+        self.handle_control(source, id, message, config, now)
     }
 
     fn handle_input(&mut self, source: SocketAddr, event: InputEvent, now: Instant) -> Actions {
@@ -510,7 +540,7 @@ mod tests {
         let now = Instant::now();
         let peer = addr([10, 0, 0, 5], 50000);
 
-        let actions = session.handle_control(peer, hello(1, 50000), &TestConfig, now);
+        let actions = session.handle_control_authed(peer, hello(1, 50000), &TestConfig, now);
 
         assert_eq!(actions.replies.len(), 1);
         let ack = parse_ack(&actions.replies[0].1);
@@ -535,10 +565,10 @@ mod tests {
         let now = Instant::now();
         let peer = addr([10, 0, 0, 5], 50000);
 
-        let first = session.handle_control(peer, hello(1, 50000), &TestConfig, now);
+        let first = session.handle_control_authed(peer, hello(1, 50000), &TestConfig, now);
         let first_id = parse_ack(&first.replies[0].1).session_id;
 
-        let dup = session.handle_control(peer, hello(1, 50000), &TestConfig, now);
+        let dup = session.handle_control_authed(peer, hello(1, 50000), &TestConfig, now);
         assert_eq!(parse_ack(&dup.replies[0].1).session_id, first_id);
         assert!(dup.new_target.is_none(), "retransmit must not re-target");
         assert!(!dup.force_idr);
@@ -549,12 +579,12 @@ mod tests {
         let mut session = Session::new(1234);
         let now = Instant::now();
         let peer = addr([10, 0, 0, 5], 50000);
-        let first = session.handle_control(peer, hello(1, 50000), &TestConfig, now);
+        let first = session.handle_control_authed(peer, hello(1, 50000), &TestConfig, now);
         let first_id = parse_ack(&first.replies[0].1).session_id;
 
         // App relaunched: new ephemeral source port, new nonce.
         let relaunched = addr([10, 0, 0, 5], 50101);
-        let second = session.handle_control(relaunched, hello(2, 50101), &TestConfig, now);
+        let second = session.handle_control_authed(relaunched, hello(2, 50101), &TestConfig, now);
         let second_id = parse_ack(&second.replies[0].1).session_id;
 
         assert_ne!(
@@ -569,7 +599,7 @@ mod tests {
     fn different_ip_is_rejected_busy_while_active() {
         let mut session = Session::new(1234);
         let now = Instant::now();
-        session.handle_control(
+        session.handle_control_authed(
             addr([10, 0, 0, 5], 50000),
             hello(1, 50000),
             &TestConfig,
@@ -577,7 +607,7 @@ mod tests {
         );
 
         let intruder = addr([10, 0, 0, 9], 40000);
-        let actions = session.handle_control(intruder, hello(9, 40000), &TestConfig, now);
+        let actions = session.handle_control_authed(intruder, hello(9, 40000), &TestConfig, now);
         let ack = parse_ack(&actions.replies[0].1);
         assert_eq!(ack.status, HelloStatus::Busy);
         assert_eq!(ack.session_id, 0);
@@ -604,7 +634,7 @@ mod tests {
             refresh_hz: 60,
             device_name: String::new(),
         });
-        let actions = session.handle_control(peer, msg, &TestConfig, now);
+        let actions = session.handle_control_authed(peer, msg, &TestConfig, now);
         assert_eq!(
             parse_ack(&actions.replies[0].1).status,
             HelloStatus::VersionUnsupported
@@ -617,9 +647,9 @@ mod tests {
         let mut session = Session::new(1234);
         let now = Instant::now();
         let peer = addr([10, 0, 0, 5], 50000);
-        session.handle_control(peer, hello(1, 50000), &TestConfig, now);
+        session.handle_control_authed(peer, hello(1, 50000), &TestConfig, now);
 
-        let bye = session.handle_control(
+        let bye = session.handle_control_authed(
             peer,
             ControlMessage::Bye(ByeReason::UserDisconnect),
             &TestConfig,
@@ -629,7 +659,7 @@ mod tests {
         assert!(!session.is_active());
 
         // Re-establish, then let liveness lapse.
-        session.handle_control(peer, hello(2, 50000), &TestConfig, now);
+        session.handle_control_authed(peer, hello(2, 50000), &TestConfig, now);
         let expired = session.tick(&TestConfig, false, now + LIVENESS_TIMEOUT);
         assert!(expired.client_lost);
         assert!(!session.is_active());
@@ -640,12 +670,12 @@ mod tests {
         let mut session = Session::new(1234);
         let now = Instant::now();
         let peer = addr([10, 0, 0, 5], 50000);
-        session.handle_control(peer, hello(1, 50000), &TestConfig, now);
+        session.handle_control_authed(peer, hello(1, 50000), &TestConfig, now);
 
         let later = now + Duration::from_millis(2500);
         let mut report = ReceiverReport::default();
         report.frames_complete = 99;
-        session.handle_control(
+        session.handle_control_authed(
             peer,
             ControlMessage::ReceiverReport(report),
             &TestConfig,
@@ -667,7 +697,7 @@ mod tests {
         let mut session = Session::new(1234);
         let now = Instant::now();
         let peer = addr([10, 0, 0, 5], 50000);
-        session.handle_control(peer, hello(1, 50000), &TestConfig, now);
+        session.handle_control_authed(peer, hello(1, 50000), &TestConfig, now);
 
         let request = ControlMessage::KeyframeRequest(KeyframeRequest {
             stream_epoch: 7,
@@ -675,10 +705,10 @@ mod tests {
             reason: KeyframeReason::GapLoss,
         });
 
-        let first = session.handle_control(peer, request.clone(), &TestConfig, now);
+        let first = session.handle_control_authed(peer, request.clone(), &TestConfig, now);
         assert!(first.force_idr);
 
-        let spammed = session.handle_control(
+        let spammed = session.handle_control_authed(
             peer,
             request.clone(),
             &TestConfig,
@@ -689,8 +719,12 @@ mod tests {
             "requests inside the window are coalesced"
         );
 
-        let granted_again =
-            session.handle_control(peer, request, &TestConfig, now + Duration::from_millis(600));
+        let granted_again = session.handle_control_authed(
+            peer,
+            request,
+            &TestConfig,
+            now + Duration::from_millis(600),
+        );
         assert!(granted_again.force_idr);
     }
 
@@ -719,8 +753,8 @@ mod tests {
         let peer = addr([10, 0, 0, 5], 50000);
 
         // View-only session: input is dropped.
-        session.handle_control(peer, hello(1, 50000), &TestConfig, now);
-        let dropped = session.handle_control(peer, input_event(1), &TestConfig, now);
+        session.handle_control_authed(peer, hello(1, 50000), &TestConfig, now);
+        let dropped = session.handle_control_authed(peer, input_event(1), &TestConfig, now);
         assert!(
             dropped.input.is_none(),
             "view-only sessions must not inject"
@@ -732,15 +766,66 @@ mod tests {
             _ => unreachable!(),
         };
         wants.feature_caps = FEATURE_WANTS_INPUT;
-        session.handle_control(peer, ControlMessage::Hello2(wants), &TestConfig, now);
+        session.handle_control_authed(peer, ControlMessage::Hello2(wants), &TestConfig, now);
 
-        let relayed = session.handle_control(peer, input_event(2), &TestConfig, now);
+        let relayed = session.handle_control_authed(peer, input_event(2), &TestConfig, now);
         assert!(relayed.input.is_some());
 
         // A different IP can't inject into this session.
         let intruder = addr([10, 0, 0, 9], 40000);
-        let foreign = session.handle_control(intruder, input_event(3), &TestConfig, now);
+        let foreign = session.handle_control_authed(intruder, input_event(3), &TestConfig, now);
         assert!(foreign.input.is_none());
+    }
+
+    #[test]
+    fn control_messages_need_the_negotiated_session_id() {
+        let mut session = Session::new(1234);
+        let now = Instant::now();
+        let peer = addr([10, 0, 0, 5], 50000);
+        let mut wants = match hello(1, 50000) {
+            ControlMessage::Hello2(h) => h,
+            _ => unreachable!(),
+        };
+        wants.feature_caps = FEATURE_WANTS_INPUT;
+        session.handle_control(peer, 0, ControlMessage::Hello2(wants), &TestConfig, now);
+        let live = session.session_id().unwrap();
+
+        // Same source address, wrong session id: another process on that
+        // device, or a spoofed packet on the local link. It must not move the
+        // mouse, steer the bitrate, or end the session.
+        let wrong = live.wrapping_add(1);
+        assert!(session
+            .handle_control(peer, wrong, input_event(1), &TestConfig, now)
+            .input
+            .is_none());
+        assert!(session
+            .handle_control(
+                peer,
+                wrong,
+                ControlMessage::ReceiverReport(ReceiverReport::default()),
+                &TestConfig,
+                now
+            )
+            .report
+            .is_none());
+        let bye = session.handle_control(
+            peer,
+            wrong,
+            ControlMessage::Bye(ByeReason::UserDisconnect),
+            &TestConfig,
+            now,
+        );
+        assert!(
+            !bye.client_lost,
+            "a foreign BYE must not tear the session down"
+        );
+        assert!(session.is_active());
+
+        // The real client still works.
+        assert!(session
+            .handle_control(peer, live, input_event(2), &TestConfig, now)
+            .input
+            .is_some());
     }
 
     #[test]
@@ -753,11 +838,11 @@ mod tests {
             _ => unreachable!(),
         };
         wants.feature_caps = FEATURE_WANTS_INPUT;
-        session.handle_control(peer, ControlMessage::Hello2(wants), &TestConfig, now);
+        session.handle_control_authed(peer, ControlMessage::Hello2(wants), &TestConfig, now);
 
         // A drag mid-window keeps the session alive past the original deadline.
         let later = now + Duration::from_millis(2500);
-        session.handle_control(peer, input_event(1), &TestConfig, later);
+        session.handle_control_authed(peer, input_event(1), &TestConfig, later);
         let ticked = session.tick(&TestConfig, false, now + Duration::from_millis(4000));
         assert!(!ticked.client_lost);
     }
@@ -769,7 +854,7 @@ mod tests {
         assert!(session.tick(&TestConfig, true, now).replies.is_empty());
 
         let peer = addr([10, 0, 0, 5], 50000);
-        session.handle_control(peer, hello(1, 50000), &TestConfig, now);
+        session.handle_control_authed(peer, hello(1, 50000), &TestConfig, now);
         let ticked = session.tick(&TestConfig, true, now + Duration::from_millis(100));
         assert_eq!(ticked.replies.len(), 1);
         let (_, message) = eternal_wire::v2::control::parse_control(&ticked.replies[0].1).unwrap();

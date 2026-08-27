@@ -121,6 +121,21 @@ final class TouchRelayMachineTests: XCTestCase {
         XCTAssertEqual(outputs[0].phase, TouchRelayMachine.Phase.began)
     }
 
+    func testReleaseOutsideTheVideoUsesTheLastPointInside() {
+        // 16:9 desktop on a 4:3 iPad means letterbox bars: a drag that ends
+        // with the finger on a bar has no valid coordinate. Releasing at the
+        // screen centre there drops the dragged window in the middle of the
+        // desktop.
+        _ = machine.touchBegan(at: P(x: 40000, y: 40000), isPencil: false, timeUs: t)
+        _ = machine.touchMoved(
+            to: P(x: 50000, y: 50000), centroid: nil, isPencil: false, force: 0, timeUs: t + 20_000
+        )
+        let release = sends(machine.touchEnded(at: nil, cancelled: false, timeUs: t + 40_000))
+        XCTAssertEqual(release.first?.xNorm, 50000)
+        XCTAssertEqual(release.first?.yNorm, 50000)
+        XCTAssertNotEqual(release.first?.xNorm, 32767, "must not fall back to screen centre")
+    }
+
     func testSmallJitterStaysATap() {
         let start = P(x: 10000, y: 10000)
         _ = machine.touchBegan(at: start, isPencil: false, timeUs: t)
