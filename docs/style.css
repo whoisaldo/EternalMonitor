@@ -1041,3 +1041,41 @@ section {
 .mac-notice-close:hover {
   color: var(--text);
 }
+
+/* --- Preview build (pre-release, testers only) --- */
+.preview-section {
+  padding: 0 0 40px;
+}
+
+.preview-card {
+  background: rgba(var(--accent-rgb), 0.03);
+  border: 1px solid rgba(var(--accent-rgb), 0.1);
+  border-left: 3px solid var(--accent);
+  border-radius: var(--radius-md);
+  padding: 28px;
+}
+
+.preview-head {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  flex-wrap: wrap;
+  margin-bottom: 16px;
+}
+
+.preview-head h2 {
+  font-size: 1.25rem;
+  margin: 0;
+}
+
+.preview-warning {
+  color: var(--text);
+  font-size: 0.95rem;
+  margin-bottom: 10px;
+}
+
+.preview-parity {
+  color: var(--muted);
+  font-size: 0.9rem;
+  margin-bottom: 22px;
+}

@@ -91,6 +91,38 @@
     </div>
   </section>
 
+  <!-- ===== Preview build (revealed only when a pre-release exists) ===== -->
+  <section class="preview-section" id="preview-section" hidden>
+    <div class="container">
+      <div class="preview-card">
+        <div class="preview-head">
+          <span class="limitations-badge" id="preview-version">preview</span>
+          <h2>Preview build for testers</h2>
+        </div>
+        <p class="preview-warning">
+          <strong>This is a test build, not a release.</strong> It is here so testers can try
+          new hardware paths before they are signed off. Expect rough edges, and please report
+          what breaks.
+        </p>
+        <p class="preview-parity">
+          The Windows host and the iPad app must both come from <em>this same preview</em>.
+          Mixing a preview host with a release app (or the reverse) will not stream &mdash; each
+          side will tell you to update the other. The matching iPad build is distributed through
+          TestFlight; ask for an invite.
+        </p>
+        <div class="download-btn-wrap">
+          <a href="https://github.com/whoisaldo/EternalMonitor/releases" id="preview-btn"
+             class="btn-ghost" target="_blank" rel="noopener">Download preview for Windows</a>
+          <p class="download-meta" id="preview-meta"></p>
+        </div>
+        <div class="sha256">
+          <span class="sha256-label">SHA-256</span>
+          <code id="preview-sha256">Available on the release page</code>
+        </div>
+      </div>
+    </div>
+  </section>
+
   <!-- ===== Build from Source ===== -->
   <section class="build-section">
     <div class="container">

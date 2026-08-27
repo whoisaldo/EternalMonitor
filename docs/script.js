@@ -95,4 +95,49 @@
       downloadBtn.textContent = 'View Releases on GitHub';
       if (metaEl) metaEl.textContent = 'Visit GitHub for the latest release';
     });
+
+  /* --- Preview build ---
+     /releases/latest above deliberately skips pre-releases, so testers would
+     never see a build that has not shipped yet. Look for the newest one and
+     reveal the preview card only if it exists; once a stable release
+     supersedes it, the card disappears on its own. */
+  var previewSection = document.getElementById('preview-section');
+  if (!previewSection) return;
+
+  fetch('https://api.github.com/repos/whoisaldo/EternalMonitor/releases?per_page=10', {
+    headers: { 'Accept': 'application/vnd.github.v3+json' }
+  })
+    .then(function (res) {
+      if (!res.ok) throw new Error('HTTP ' + res.status);
+      return res.json();
+    })
+    .then(function (releases) {
+      var preview = releases.find(function (r) {
+        return r.prerelease && !r.draft;
+      });
+      if (!preview) return; // nothing in testing right now
+
+      var asset = preview.assets.find(function (a) {
+        return a.name.endsWith('.exe') || a.name.endsWith('.zip') || a.name.endsWith('.msi');
+      });
+      if (!asset) return;
+
+      var btn = document.getElementById('preview-btn');
+      var version = document.getElementById('preview-version');
+      var meta = document.getElementById('preview-meta');
+      var sha = document.getElementById('preview-sha256');
+
+      btn.href = asset.browser_download_url;
+      btn.textContent = 'Download ' + asset.name;
+      if (version) version.textContent = preview.tag_name;
+      if (meta) meta.textContent = asset.name + ' \u00B7 ' + formatBytes(asset.size);
+      if (sha && preview.body) {
+        var match = preview.body.match(/[a-fA-F0-9]{64}/);
+        if (match) sha.textContent = match[0];
+      }
+      previewSection.hidden = false;
+    })
+    .catch(function () {
+      /* No preview, or the API is unreachable: leave the card hidden. */
+    });
 })();
