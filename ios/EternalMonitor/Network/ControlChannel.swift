@@ -239,13 +239,26 @@ final class ControlChannel {
     }
 
     /// Fire-and-forget goodbye, sent a few times for loss tolerance.
+    /// Say goodbye so the host stops streaming at once instead of waiting out
+    /// its liveness timeout.
+    ///
+    /// The first copy goes out SYNCHRONOUSLY. Callers tear the socket down on
+    /// the very next line, so anything merely enqueued here was still sitting
+    /// on the queue when the connection was cancelled — the host saw no BYE,
+    /// kept sending into a dead peer for the full three seconds, held the
+    /// virtual display up for the same three seconds, and answered an
+    /// immediate reconnect with "busy".
     func sendBye(_ reason: ByeReason) {
-        queue.async { [self] in
+        queue.sync { [self] in
             guard sessionId != 0 else { return }
-            for delay in [0, 50, 100] {
-                queue.asyncAfter(deadline: .now() + .milliseconds(delay)) { [weak self] in
-                    self?.sendMessage(.bye(reason))
-                }
+            sendMessage(.bye(reason))
+        }
+        // Two more for loss tolerance; these are best-effort and become no-ops
+        // once the socket is gone.
+        for delay in [50, 100] {
+            queue.asyncAfter(deadline: .now() + .milliseconds(delay)) { [weak self] in
+                guard let self, self.sessionId != 0 else { return }
+                self.sendMessage(.bye(reason))
             }
         }
     }

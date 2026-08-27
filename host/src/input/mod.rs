@@ -110,11 +110,19 @@ pub fn scroll_to_wheel(delta_px: i16) -> i32 {
     i32::from(delta_px) * 3
 }
 
-/// Drops duplicate began/ended events (the client sends edges twice for loss
-/// tolerance) while letting distinct events through in order.
+/// Number of recent edge ids remembered. The client sends each press/release
+/// twice for loss tolerance, and Wi-Fi aggregation reorders freely, so the two
+/// copies of one edge routinely arrive with other edges between them. A single
+/// remembered id could not survive that: began(N), ended(N+1), began(N) walked
+/// the slot N -> N+1 -> N and let the replayed press through, injecting a
+/// double click where the user tapped once.
+const RECENT_EDGE_IDS: usize = 8;
+
+/// Drops duplicate began/ended events while letting distinct events through.
 #[derive(Debug, Default)]
 pub struct EventDeduper {
-    last_edge_id: Option<u32>,
+    recent: [Option<u32>; RECENT_EDGE_IDS],
+    next: usize,
 }
 
 impl EventDeduper {
@@ -122,12 +130,12 @@ impl EventDeduper {
     pub fn accept(&mut self, event: &InputEvent) -> bool {
         match event.phase {
             PHASE_BEGAN | PHASE_ENDED | PHASE_CANCELLED => {
-                if self.last_edge_id == Some(event.event_id) {
-                    false
-                } else {
-                    self.last_edge_id = Some(event.event_id);
-                    true
+                if self.recent.contains(&Some(event.event_id)) {
+                    return false;
                 }
+                self.recent[self.next] = Some(event.event_id);
+                self.next = (self.next + 1) % RECENT_EDGE_IDS;
+                true
             }
             // Moves are idempotent-ish; duplicates are harmless.
             _ => true,
@@ -386,6 +394,26 @@ mod tests {
         relay.relay(7, &e, OUTPUT); // duplicate edge: dropped
         relay.relay(8, &e, OUTPUT); // new session, same event_id: injected
         assert_eq!(recorder::take().len(), 4);
+    }
+
+    #[test]
+    fn reordered_duplicate_edges_still_dedupe() {
+        // The wire sends each edge twice; the network may interleave them.
+        // began(7), ended(8), began(7), ended(8) must inject one press and
+        // one release, not two of each.
+        let mut dedupe = EventDeduper::default();
+        let mut began = event(KIND_TOUCH, PHASE_BEGAN, 0, 0);
+        began.event_id = 7;
+        let mut ended = event(KIND_TOUCH, PHASE_ENDED, 0, 0);
+        ended.event_id = 8;
+
+        assert!(dedupe.accept(&began));
+        assert!(dedupe.accept(&ended));
+        assert!(
+            !dedupe.accept(&began),
+            "the replayed press must not click again"
+        );
+        assert!(!dedupe.accept(&ended));
     }
 
     #[test]

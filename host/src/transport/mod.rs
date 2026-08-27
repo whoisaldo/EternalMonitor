@@ -150,9 +150,13 @@ pub async fn start_sender(
                         match classify(datagram) {
                             Classified::Control(_) => {
                                 match eternal_wire::v2::control::parse_control(datagram) {
-                                    Ok((_, message)) => {
+                                    Ok((header, message)) => {
                                         let mut actions = shared.session.lock().handle_control(
-                                            src, message, &config, Instant::now(),
+                                            src,
+                                            header.session_id,
+                                            message,
+                                            &config,
+                                            Instant::now(),
                                         );
                                         if let Some((session_id, event)) = actions.input.take() {
                                             if let Some(geometry) = *shared.capture_geometry.lock()
