@@ -131,6 +131,16 @@ impl SharedControl {
     pub fn stop(&self) {
         self.running.store(false, Ordering::SeqCst);
     }
+
+    /// Is a client actually watching? Protocol v2 makes the session the only
+    /// truth: media needs a session id, so a target address on its own (a
+    /// persisted `target_ip`, a stale value from a previous client) must never
+    /// read as "someone is connected" — that would keep the capture loop at
+    /// full rate with nobody watching and bring the virtual display up with no
+    /// viewer.
+    pub fn client_connected(&self) -> bool {
+        self.session.lock().is_active()
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -173,5 +183,23 @@ impl GuiControl {
         if let Err(error) = self.supervisor_tx.send(SupervisorCommand::Shutdown) {
             warn!(error = %error, "Failed to send shutdown command");
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn client_connected_requires_a_session_not_just_an_address() {
+        let shared = SharedControl::new(9876, 15_000_000);
+        assert!(!shared.client_connected(), "no session, no client");
+
+        // A target address on its own — a persisted setting, or a leftover
+        // from a client that has since gone — must not read as "connected".
+        // It used to, which held the virtual display up and kept the capture
+        // loop at full rate with nobody watching.
+        *shared.target_addr.lock() = "192.168.1.50:9876".parse().unwrap();
+        assert!(!shared.client_connected());
     }
 }

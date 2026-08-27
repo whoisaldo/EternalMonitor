@@ -100,6 +100,7 @@ pub fn run_capture_loop(
     slot: &FrameSlot,
     shared: SharedControl,
     adapter_index: u32,
+    generation: u64,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // --- Create DXGI factory and select the output to capture ---
     let factory: IDXGIFactory1 = unsafe { CreateDXGIFactory1()? };
@@ -272,7 +273,9 @@ pub fn run_capture_loop(
     let mut cursor_y: i32 = 0;
 
     loop {
-        if !shared.running.load(Ordering::SeqCst) {
+        if !shared.running.load(Ordering::SeqCst)
+            || !crate::supervisor::generation_is_current(generation)
+        {
             info!("Capture loop stopping on running=false");
             break;
         }
@@ -445,7 +448,9 @@ pub fn run_capture_loop(
             }
             Err(e) if e.code() == DXGI_ERROR_WAIT_TIMEOUT => {
                 // Desktop unchanged — not an error.
-                if !shared.running.load(Ordering::SeqCst) {
+                if !shared.running.load(Ordering::SeqCst)
+                    || !crate::supervisor::generation_is_current(generation)
+                {
                     info!("Capture loop stopping after timeout on running=false");
                     break;
                 }
@@ -489,7 +494,9 @@ pub fn run_capture_loop(
                 let mut reinit = None;
                 let delays_ms = [100u64, 250, 500, 1000, 2000];
                 for attempt in 0..15 {
-                    if !shared.running.load(Ordering::SeqCst) {
+                    if !shared.running.load(Ordering::SeqCst)
+                        || !crate::supervisor::generation_is_current(generation)
+                    {
                         break;
                     }
                     // Keep the watchdog quiet: this wait IS the recovery.

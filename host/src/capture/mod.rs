@@ -205,8 +205,7 @@ fn vdd_attach_timeout() -> Duration {
 /// a client is connected, so an idle PC never shows a phantom second monitor.
 #[cfg(windows)]
 pub(crate) fn client_connected(shared: &SharedControl) -> bool {
-    let addr = *shared.target_addr.lock();
-    !addr.ip().is_unspecified() && addr.port() != 0
+    shared.client_connected()
 }
 
 /// Reconcile the virtual display device to the requested target and return the concrete
@@ -310,6 +309,7 @@ pub fn run_capture_stage(
     slot: FrameSlot,
     shared: SharedControl,
     adapter_index: u32,
+    generation: u64,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     struct CloseOnExit(FrameSlot);
     impl Drop for CloseOnExit {
@@ -318,7 +318,7 @@ pub fn run_capture_stage(
         }
     }
     let guard = CloseOnExit(slot.handle());
-    let result = run_platform_loop(&guard.0, shared, adapter_index);
+    let result = run_platform_loop(&guard.0, shared, adapter_index, generation);
     if let Err(ref e) = result {
         error!(error = %e, "Capture loop exited with error");
     }
@@ -337,13 +337,14 @@ fn run_platform_loop(
     slot: &FrameSlot,
     shared: SharedControl,
     adapter_index: u32,
+    generation: u64,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let synthetic_requested =
         std::env::var("ETERNAL_CAPTURE").is_ok_and(|v| v.trim().eq_ignore_ascii_case("synthetic"));
     if synthetic_requested {
-        synthetic::run_capture_loop(slot, shared)
+        synthetic::run_capture_loop(slot, shared, generation)
     } else {
-        dxgi::run_capture_loop(slot, shared, adapter_index)
+        dxgi::run_capture_loop(slot, shared, adapter_index, generation)
     }
 }
 
@@ -352,8 +353,9 @@ fn run_platform_loop(
     slot: &FrameSlot,
     shared: SharedControl,
     _adapter_index: u32,
+    generation: u64,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    synthetic::run_capture_loop(slot, shared)
+    synthetic::run_capture_loop(slot, shared, generation)
 }
 
 /// Choose the freshly-attached virtual output: the first non-primary output whose device name was
