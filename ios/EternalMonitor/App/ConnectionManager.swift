@@ -327,6 +327,11 @@ final class ConnectionManager: ObservableObject {
                 self?.hostStreamConfig = heartbeat.streamConfig
             }
         }
+        channel.onStreamConfig = { [weak self] config in
+            Task { @MainActor in
+                self?.hostStreamConfig = config
+            }
+        }
 
         receiver.onControlDatagram = { [weak channel] data in
             channel?.handleControl(data)

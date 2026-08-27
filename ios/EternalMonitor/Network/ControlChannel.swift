@@ -24,6 +24,8 @@ final class ControlChannel {
     var onHandshakeTimeout: (() -> Void)?
     var onHelloAttempt: ((Int, Int) -> Void)?
     var onHeartbeat: ((Heartbeat) -> Void)?
+    /// Out-of-band stream-parameter change (bitrate, codec, resolution).
+    var onStreamConfig: ((StreamConfig) -> Void)?
     var onBye: ((ByeReason) -> Void)?
     var onDiagnostic: ((String) -> Void)?
     /// Snapshot provider for periodic receiver reports.
@@ -165,8 +167,13 @@ final class ControlChannel {
             clockSnapshot.withLock {
                 $0 = ClockSnapshot(offsetUs: estimator.offsetUs, rttUs: estimator.rttUs)
             }
-        case .streamConfig:
-            break
+        case .streamConfig(let config):
+            // The host sends this the moment the stream changes (an ABR step,
+            // a codec switch) so the UI doesn't wait up to a heartbeat to
+            // catch up. Dropping it made the host's immediate notify dead
+            // traffic.
+            guard header.sessionId == sessionId, sessionId != 0 else { return }
+            onStreamConfig?(config)
         default:
             break
         }

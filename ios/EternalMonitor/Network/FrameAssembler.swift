@@ -50,6 +50,18 @@ final class FrameAssembler {
     /// dropped forever — the app appears frozen until it's force-quit.
     private static let streamRestartGap: UInt32 = 256
 
+    /// Consecutive stale-epoch drops, and the count after which the epoch we are
+    /// holding is treated as bogus and re-synced to whatever is arriving.
+    ///
+    /// One corrupted or spoofed fragment carrying a high epoch would otherwise
+    /// latch an epoch the host will never reach, and every real fragment would
+    /// be dropped for the rest of the session. Nothing would notice: control
+    /// heartbeats keep flowing, so the liveness watchdog stays happy while the
+    /// video is frozen. Genuine stragglers from a previous run can't trip this,
+    /// because the new run's fragments interleave and reset the streak.
+    private var staleEpochStreak: UInt32 = 0
+    private static let epochResyncThreshold: UInt32 = 512
+
     struct PendingFrame {
         let fragmentCount: UInt16
         let isKeyframe: Bool
@@ -84,7 +96,19 @@ final class FrameAssembler {
                 reset()
                 currentEpoch = epoch
             } else if epoch < current {
-                return
+                staleEpochStreak += 1
+                guard staleEpochStreak >= Self.epochResyncThreshold else { return }
+                // Nothing has been accepted across a long run of drops, so the
+                // epoch we are holding can't be the live one. Re-sync to the
+                // stream that is actually arriving rather than stay frozen.
+                onDiagnostic?(
+                    "Epoch \(current) never resumed after \(staleEpochStreak) dropped fragments"
+                        + " — re-syncing to epoch \(epoch)"
+                )
+                reset()
+                currentEpoch = epoch
+            } else {
+                staleEpochStreak = 0
             }
         } else {
             currentEpoch = epoch
@@ -192,6 +216,7 @@ final class FrameAssembler {
         latestCompletedSeq = 0
         cleanupCounter = 0
         currentEpoch = nil
+        staleEpochStreak = 0
         counters.withLock { $0 = Counters() }
     }
 
