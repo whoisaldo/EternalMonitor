@@ -177,9 +177,12 @@ struct TouchRelayMachine {
         switch mode {
         case .pending(let start, _):
             guard let point else { return [] }
-            let dx = Int32(point.x) - Int32(start.x)
-            let dy = Int32(point.y) - Int32(start.y)
-            if dx * dx + dy * dy > Self.dragSlop * Self.dragSlop {
+            // Int64: the coordinates span 0...65535, so squaring a large flick
+            // overflows Int32 and Swift traps rather than wrapping.
+            let dx = Int64(point.x) - Int64(start.x)
+            let dy = Int64(point.y) - Int64(start.y)
+            let slop = Int64(Self.dragSlop)
+            if dx * dx + dy * dy > slop * slop {
                 // Committed to a drag: press at the start point, catch up.
                 mode = .leftDown(isPencil: false)
                 var outputs = edge(Phase.began, kind: Kind.touch, buttons: 1, at: start, timeUs: timeUs)

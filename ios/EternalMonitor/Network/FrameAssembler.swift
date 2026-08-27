@@ -14,10 +14,14 @@ final class FrameAssembler {
     var onFrameAssembled: ((Data, _ seq: UInt32, _ captureTimestampUs: UInt64, _ isKeyframe: Bool) -> Void)?
     var onDiagnostic: ((String) -> Void)?
 
-    /// A frame may span at most this many fragments (~1.4 MB at 1384-byte
-    /// payloads). The u16 field allows 65535 (≈90 MB) — a memory bomb, not a
-    /// video frame.
-    static let maxFragmentCount: UInt16 = 1024
+    /// A frame may span at most this many fragments. This MUST match the
+    /// protocol cap the host fragments against and the wire parser enforces:
+    /// a tighter value here silently discards legitimately large access units
+    /// (a 1440p/4K scene-change IDR runs past 1024 fragments), and because the
+    /// decoder then never receives a sync sample, every later frame is dropped
+    /// too — a permanent freeze with healthy heartbeats. `maxPendingBytes` is
+    /// the real memory guard; the u16 field alone would allow ≈90 MB.
+    static let maxFragmentCount: UInt16 = MediaHeader.maxFragCount
     /// At most this many partial frames in flight; the oldest is dropped first.
     static let maxPendingFrames = 8
     /// Hard ceiling on buffered fragment bytes across all partial frames.

@@ -57,6 +57,25 @@ final class FrameAssemblerTests: XCTestCase {
         XCTAssertEqual(completed.count, 2, "stale-epoch fragment must be dropped")
     }
 
+    func testAcceptsFramesUpToTheProtocolFragmentCap() {
+        // A 1440p/4K scene-change IDR runs past 1024 fragments. The host
+        // fragments against the protocol cap and the wire parser accepts up to
+        // it, so an assembler cap below that silently dropped every fragment
+        // of such a frame — and with no sync sample the decoder then discarded
+        // everything after it too.
+        XCTAssertEqual(
+            FrameAssembler.maxFragmentCount, MediaHeader.maxFragCount,
+            "the assembler cap must match the protocol cap the host sends against"
+        )
+
+        let count: UInt16 = 2000
+        for index in 0..<count {
+            add(seq: 1, index: index, count: count, byte: 0xA)
+        }
+        XCTAssertEqual(completed.count, 1, "a large but legal frame must assemble")
+        XCTAssertEqual(completed.first?.count, Int(count))
+    }
+
     func testOneBogusEpochCannotStrandTheStream() {
         add(seq: 10, index: 0, count: 1, epoch: 5, byte: 0xA)
         XCTAssertEqual(completed.count, 1)

@@ -18,25 +18,15 @@ struct DisplayView: View {
                 // PC; a three-finger tap (via the relay layer) drives the HUD.
                 MetalView()
                     .ignoresSafeArea()
-                TouchRelayView(onToggleHUD: {
-                    showHUD.toggle()
-                    scheduleHUDDismiss()
-                })
-                .ignoresSafeArea()
+                TouchRelayView(onToggleHUD: { toggleHUD() })
+                    .ignoresSafeArea()
             } else {
                 // One gesture, one meaning: tap toggles the HUD. (The old
                 // single-tap-hide + triple-tap-toggle pair made every triple
                 // tap race its own first tap.)
                 MetalView()
                     .ignoresSafeArea()
-                    .onTapGesture {
-                        if showHUD {
-                            hudDismissTask?.cancel()
-                            withAnimation(.easeOut(duration: 0.25)) { showHUD = false }
-                        } else {
-                            scheduleHUDDismiss()
-                        }
-                    }
+                    .onTapGesture { toggleHUD() }
             }
 
             // Viewfinder registration marks frame the picture (fade with the HUD).
@@ -235,6 +225,19 @@ struct DisplayView: View {
     }
 
     // MARK: - Auto-hide HUD
+
+    /// Show the HUD (auto-hiding after a few seconds) or hide it now. Both the
+    /// plain tap and the three-finger relay tap route here: calling
+    /// `scheduleHUDDismiss()` to "toggle" could only ever show it, since that
+    /// function unconditionally sets `showHUD = true`.
+    private func toggleHUD() {
+        if showHUD {
+            hudDismissTask?.cancel()
+            withAnimation(.easeOut(duration: 0.25)) { showHUD = false }
+        } else {
+            scheduleHUDDismiss()
+        }
+    }
 
     private func scheduleHUDDismiss() {
         hudDismissTask?.cancel()

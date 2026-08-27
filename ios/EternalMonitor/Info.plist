@@ -24,7 +24,7 @@
     <true/>
     <key>UIAppFonts</key>
     <array>
-        <string>Syne-Variable.ttf</string>
+        <string>Syne-Bold.ttf</string>
         <string>JetBrainsMono-Regular.ttf</string>
         <string>JetBrainsMono-Medium.ttf</string>
     </array>

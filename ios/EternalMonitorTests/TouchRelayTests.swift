@@ -109,6 +109,18 @@ final class TouchRelayMachineTests: XCTestCase {
         XCTAssertEqual(release[0].phase, TouchRelayMachine.Phase.ended)
     }
 
+    func testFullScreenFlickDoesNotOverflow() {
+        // Coordinates span 0...65535, so squaring the delta of a large flick
+        // overflows Int32 — and Swift traps rather than wrapping, killing the
+        // app mid-gesture. One corner to the other is the worst case.
+        _ = machine.touchBegan(at: P(x: 0, y: 0), isPencil: false, timeUs: t)
+        let outputs = sends(machine.touchMoved(
+            to: P(x: 65535, y: 65535), centroid: nil, isPencil: false, force: 0, timeUs: t + 20_000
+        ))
+        XCTAssertEqual(outputs.count, 3, "a flick past the slop commits a drag")
+        XCTAssertEqual(outputs[0].phase, TouchRelayMachine.Phase.began)
+    }
+
     func testSmallJitterStaysATap() {
         let start = P(x: 10000, y: 10000)
         _ = machine.touchBegan(at: start, isPencil: false, timeUs: t)
