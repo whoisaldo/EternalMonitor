@@ -20,6 +20,16 @@ pub const STREAM_RESTART_GAP: u32 = 256;
 /// Partial frames older than this are evicted during periodic cleanup.
 pub const STALE_FRAME_TIMEOUT: Duration = Duration::from_millis(100);
 
+/// After this many CONSECUTIVE stale-epoch drops, the current epoch is treated
+/// as bogus and re-synced to whatever is actually arriving.
+///
+/// Without this, one corrupted or spoofed fragment carrying a high epoch
+/// latches an epoch the sender will never reach, and every real fragment is
+/// dropped forever — video freezes while the control channel stays healthy, so
+/// nothing notices. Genuine stragglers from a previous run can't trip it: the
+/// new run's fragments interleave and are accepted, which resets the streak.
+pub const EPOCH_RESYNC_THRESHOLD: u32 = 512;
+
 /// Cleanup runs every this-many fragments.
 const CLEANUP_INTERVAL: u32 = 100;
 
@@ -72,6 +82,8 @@ pub struct Reassembler {
     latest_completed_seq: u32,
     cleanup_counter: u32,
     current_epoch: Option<u32>,
+    /// Consecutive stale-epoch drops; see [`EPOCH_RESYNC_THRESHOLD`].
+    stale_epoch_streak: u32,
     counters: ReassemblyCounters,
 }
 
@@ -112,12 +124,25 @@ impl Reassembler {
             Some(current) if epoch > current => {
                 self.reset_internal();
                 self.current_epoch = Some(epoch);
+                self.stale_epoch_streak = 0;
             }
             Some(current) if epoch < current => {
-                return AddOutcome::Dropped(DropReason::StaleEpoch);
+                self.stale_epoch_streak += 1;
+                if self.stale_epoch_streak < EPOCH_RESYNC_THRESHOLD {
+                    return AddOutcome::Dropped(DropReason::StaleEpoch);
+                }
+                // Nothing has been accepted for a long run of drops, so the
+                // epoch we are holding can't be the live one. Re-sync to the
+                // stream that is actually arriving.
+                self.reset_internal();
+                self.current_epoch = Some(epoch);
+                self.stale_epoch_streak = 0;
             }
-            Some(_) => {}
-            None => self.current_epoch = Some(epoch),
+            Some(_) => self.stale_epoch_streak = 0,
+            None => {
+                self.current_epoch = Some(epoch);
+                self.stale_epoch_streak = 0;
+            }
         }
 
         if self.latest_completed_seq > 0 {
@@ -216,6 +241,7 @@ impl Reassembler {
     pub fn reset(&mut self) {
         self.reset_internal();
         self.current_epoch = None;
+        self.stale_epoch_streak = 0;
     }
 
     fn reset_internal(&mut self) {
@@ -329,6 +355,59 @@ mod tests {
             feed(&mut r, 901, 0, 1, 5, 0xD, now),
             AddOutcome::Dropped(DropReason::StaleEpoch)
         );
+    }
+
+    #[test]
+    fn one_bogus_epoch_cannot_strand_the_stream() {
+        let now = Instant::now();
+        let mut r = Reassembler::new();
+        feed(&mut r, 10, 0, 1, 5, 0xA, now);
+
+        // One corrupted/spoofed fragment claiming the maximum epoch.
+        feed(&mut r, 11, 0, 1, u32::MAX, 0xFF, now);
+
+        // The real stream is now "stale" against an epoch it can never reach.
+        for i in 0..(EPOCH_RESYNC_THRESHOLD - 1) {
+            assert_eq!(
+                feed(&mut r, 100 + i, 0, 1, 5, 0xB, now),
+                AddOutcome::Dropped(DropReason::StaleEpoch),
+                "fragment {i} should still be dropped before the resync threshold"
+            );
+        }
+
+        // Crossing the threshold re-syncs to the stream that is really there.
+        assert_eq!(
+            feed(&mut r, 900, 0, 1, 5, 0xC, now),
+            AddOutcome::Completed(vec![0xC]),
+            "the receiver must recover instead of staying bricked forever"
+        );
+        // And it keeps flowing afterwards.
+        assert_eq!(
+            feed(&mut r, 901, 0, 1, 5, 0xD, now),
+            AddOutcome::Completed(vec![0xD])
+        );
+    }
+
+    #[test]
+    fn interleaved_stragglers_never_trip_the_resync() {
+        let now = Instant::now();
+        let mut r = Reassembler::new();
+        feed(&mut r, 1, 0, 1, 7, 0xA, now);
+
+        // A real restart: epoch 8 is live, epoch 7 stragglers keep arriving
+        // alongside it. Far more stale drops than the threshold, but the
+        // accepted fragments in between must keep resetting the streak.
+        for i in 0..(EPOCH_RESYNC_THRESHOLD * 2) {
+            assert_eq!(
+                feed(&mut r, 1000 + i, 0, 1, 8, 0xB, now),
+                AddOutcome::Completed(vec![0xB])
+            );
+            assert_eq!(
+                feed(&mut r, 500 + i, 0, 1, 7, 0xC, now),
+                AddOutcome::Dropped(DropReason::StaleEpoch),
+                "old-run straggler {i} must stay dropped"
+            );
+        }
     }
 
     #[test]
